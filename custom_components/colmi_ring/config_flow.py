@@ -6,7 +6,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.helpers import selector
-from slugify import slugify
+from homeassistant.helpers.device_registry import format_mac
 
 from .api import (
     ColmiRingApiClient,
@@ -44,11 +44,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 _errors["base"] = "unknown"
             else:
                 await self.async_set_unique_id(
-                    # TODO
-                    ## Do NOT use this in production code
-                    ## The unique_id should never be something that can change
-                    ## https://developers.home-assistant.io/docs/config_entries_config_flow_handler#unique-ids
-                    unique_id=slugify(user_input[CONF_ADDRESS])
+                    format_mac(user_input[CONF_ADDRESS])
                 )
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
@@ -73,6 +69,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def _test_credentials(self, ring_address: str) -> None:
         """Validate credentials."""
         client = ColmiRingApiClient(
+            hass=self.hass,
             ring_address=ring_address,
         )
         await client.async_get_data()

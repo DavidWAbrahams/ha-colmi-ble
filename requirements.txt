@@ -1,5 +1,6 @@
-colorlog==6.9.0
-homeassistant==2025.2.4
+colorlog==6.12.0
+homeassistant==2026.10.4
 pip>=21.3.1
-ruff==0.9.9
-colmi_r02_client @ git+https://github.com/tahnok/colmi_r02_client@9e08383f6315e3211395edc64e5097333f1a42a5
+ruff==0.17.2
+colmi_r02_client @ git+https://github.com/tahnok/colmi_r02_client@19e70aa502749b87d57e3dba0156dfd67ddc0d4a
+bleak-retry-connector>=4.7.1

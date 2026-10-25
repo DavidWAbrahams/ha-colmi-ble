@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 
-from .const import LOGGER
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -21,6 +20,7 @@ ENTITY_DESCRIPTIONS = (
         key="colmi_ring_sensor",
         name="Heart Rate",
         icon="mdi:heart-pulse",
+        native_unit_of_measurement="bpm",
     ),
 )
 
@@ -53,7 +53,9 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
         self.entity_description = entity_description
 
     @property
-    def native_value(self) -> str | None:
+    def native_value(self) -> int | None:
         """Return the native value of the sensor."""
-        LOGGER.warning(self.coordinator.data)
-        return self.coordinator.data.get("heart_rate")
+        data = self.coordinator.data
+        if not data:
+            return None
+        return data.get("heart_rate")

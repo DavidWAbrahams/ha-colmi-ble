@@ -11,6 +11,7 @@ from .api import (
     ColmiRingApiClientAuthenticationError,
     ColmiRingApiClientError,
 )
+from .const import LOGGER
 
 if TYPE_CHECKING:
     from .data import ColmiRingConfigEntry
@@ -29,4 +30,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         except ColmiRingApiClientAuthenticationError as exception:
             raise ConfigEntryAuthFailed(exception) from exception
         except ColmiRingApiClientError as exception:
+            raise UpdateFailed(exception) from exception
+        except Exception as exception:  # noqa: BLE001
+            LOGGER.exception("Unexpected error updating Colmi ring")
             raise UpdateFailed(exception) from exception

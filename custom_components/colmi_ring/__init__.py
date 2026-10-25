@@ -44,7 +44,7 @@ async def async_setup_entry(
         update_interval=timedelta(minutes=5),
     )
     entry.runtime_data = ColmiRingData(
-        client=ColmiRingApiClient(ring_address=entry.data[CONF_ADDRESS]),
+        client=ColmiRingApiClient(hass=hass, ring_address=entry.data[CONF_ADDRESS]),
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,
     )
