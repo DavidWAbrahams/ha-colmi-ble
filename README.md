@@ -1,5 +1,5 @@
 # What?
-This is a VERY early attempt to integrate the Colmi line of smart rings with Home Assistant. It is an incomplete work in progress.
+Integrate the Colmi line of smart rings with Home Assistant.
 Colmi rings (like the R02, R06, R10 etc) can be found for udner $20 on AliExpress.
 
 # How?
@@ -23,8 +23,17 @@ Install HACS. Add this repo to your Custom Repositories. Install "Colmi Ring" fr
 If for some reason autodiscovery doesn't work, try going to Settings -> Devices and Services -> Add Integration -> Colmi Ring
 
 # A note on SpO2
-The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware never samples it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant at your own risk (expect reduced battery life if you do so frequently).
+The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware doesn't sample it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant at your own risk (expect reduced battery life if you do it frequently).
+
+# Filling in the gaps (backfill)
+The ring only reports data while it is within Bluetooth range of Home Assistant. The moment you leave the house and walk out of range, the BLE connection drops and Home Assistant stops receiving anything new.
+
+The ring doesn't stop measuring, though. It keeps logging heart rate and activity to internal memory. When you come home and the ring reconnects, this integration reads that stored log and tries to backfill the missing time.
+
+- **Heart rate** is backfilled automatically (on by default). Because it is a plain measurement, it shows up correctly in both the raw history graph and long-term statistics.
+- **Steps, distance, and calories** backfill is optional and experimental (off by default). These are total-increasing sensors, so I don't know if backfilled data points will play nicely with statistics (min/max/avg). Enable it from the integration's options ("Experimental: also backfill steps/distance/calories history") if are ok with that and want their history graphs filled in anyway.
+
+You can toggle these behaviors under Settings -> Devices and Services -> Colmi Ring -> Configure.
 
 # TODO
-1) Add dubious metrics like blood pressure, blood sugar, ECG, HRV, stress and "fatigue" scores. The protocol (and some hardware) can technically provide these, but on a $20 optical ring they are almost certainly pseudo-random nonsense, so we deliberately don't expose them.
-2) Fill in gaps when you were out of the house
+1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
