@@ -1,5 +1,6 @@
 {
     "config": {
+        "flow_title": "{name}",
         "step": {
             "user": {
                 "description": "Address of your ring. This can by found a few different ways, but the easiest are visiting (your home assistant URL)/config/bluetooth/advertisement-monitor and finding something with a Name like R02_XXXX (for an R02 ring) OR using Gadgetbridge on Android.",

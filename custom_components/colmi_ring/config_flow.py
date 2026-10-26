@@ -8,6 +8,7 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.bluetooth import BluetoothServiceInfo
 
 from .api import (
     ColmiRingApiClient,
@@ -22,6 +23,22 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for Blueprint."""
 
     VERSION = 1
+
+    # MAC of a ring we were started from (Bluetooth discovery), if any; used
+    # to pre-populate the address field so the user just clicks Submit.
+    _discovered_address: str | None = None
+
+    async def async_step_bluetooth(
+        self, discovery_info: BluetoothServiceInfo
+    ) -> config_entries.ConfigFlowResult:
+        """Handle a flow initialized by Bluetooth discovery."""
+        await self.async_set_unique_id(format_mac(discovery_info.address))
+        self._abort_if_unique_id_configured()
+        self._discovered_address = discovery_info.address
+        self.context["title_placeholders"] = {
+            "name": discovery_info.name or discovery_info.address
+        }
+        return await self.async_step_user()
 
     async def async_step_user(
         self,
@@ -57,7 +74,9 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_ADDRESS): selector.TextSelector(
+                    vol.Required(
+                        CONF_ADDRESS, default=self._discovered_address
+                    ): selector.TextSelector(
                         selector.TextSelectorConfig(
                             type=selector.TextSelectorType.TEXT
                         ),
