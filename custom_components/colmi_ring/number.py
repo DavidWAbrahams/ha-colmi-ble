@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from homeassistant.components.number import NumberEntity, NumberEntityDescription
+from homeassistant.components.number import (
+    NumberEntity,
+    NumberEntityDescription,
+    NumberMode,
+)
 from homeassistant.const import UnitOfTime
 
 from .api import ColmiRingApiClientError
@@ -25,9 +29,15 @@ ENTITY_DESCRIPTIONS = (
         name="Heart Rate Sample Interval",
         icon="mdi:heart-pulse",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        native_min_value=1,
+        # The ring's daily HR log is a 288-slot grid with one entry per
+        # 5 minutes, so samples taken more often than that cannot all be
+        # stored anyway; the firmware collapses them at write time. Values
+        # below 5 minutes therefore only cost battery.
+        native_min_value=5,
         native_max_value=255,
         native_step=1,
+        # A 5..255 range is awkward as a slider; use a plain number box.
+        mode=NumberMode.BOX,
     ),
 )
 
