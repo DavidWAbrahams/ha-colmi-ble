@@ -311,6 +311,10 @@ class ColmiRingApiClient:
         heart_rate: int | None = None
         heart_rate_timestamp: datetime | None = None
         settings: hr_settings.HeartRateLogSettings | None = None
+        # True when the ring's most recently filled HR log slot reads 0 bpm:
+        # direct evidence the optical sensor is not on skin right now, even
+        # if the newest *non-zero* sample is still within the staleness grace.
+        hr_zero_reading = False
         async with _RingConnection(self._hass, self._ring_address) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
@@ -377,6 +381,14 @@ class ColmiRingApiClient:
                     date_utils.start_of_day(date_utils.now()).isoformat(),
                 )
             else:
+                # If the newest slot the ring actually transmitted reads 0 bpm,
+                # the optical sensor saw no pulse at its most recent sample:
+                # treat as "off finger" evidence that must override the
+                # staleness grace on the On Finger sensor.
+                all_slots = log.heart_rates_with_times()
+                filled = min(max(log.index, 0), len(all_slots))
+                if filled > 0 and all_slots[filled - 1][0] == 0:
+                    hr_zero_reading = True
                 # Heart rate is sampled at the ring's logging interval but logged
                 # in 5-min slots, so most slots are 0 and must be filtered out
                 # before picking the latest.
@@ -399,6 +411,7 @@ class ColmiRingApiClient:
         return {
             "heart_rate": heart_rate,
             "heart_rate_timestamp": heart_rate_timestamp,
+            "hr_zero_reading": hr_zero_reading,
             "hr_settings": settings,
             "battery_level": battery_level,
             "battery_charging": battery_charging,

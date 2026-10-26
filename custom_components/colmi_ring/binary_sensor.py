@@ -49,13 +49,10 @@ class ColmiRingOnFingerBinarySensor(ColmiRingEntity, BinarySensorEntity):
 
     Fusion rule:
     - Off while the ring is charging (it is on the charger, not a finger).
-    - Else On when the most recent poll produced a heart-rate sample > 0.
+    - Else Off when the ring's most recent HR log slot read 0 bpm. This is
+      direct off-finger evidence and bypasses the heart-rate staleness grace.
+    - Else On when the most recent poll produced a fresh heart-rate sample > 0.
     - Else Off.
-
-    Because heart rate is already cleared to None once the newest sample goes
-    stale (see the coordinator staleness check), this sensor turns Off about
-    one logging interval after the ring leaves the finger without any extra
-    BLE traffic.
     """
 
     _attr_has_entity_name = True
@@ -81,6 +78,12 @@ class ColmiRingOnFingerBinarySensor(ColmiRingEntity, BinarySensorEntity):
         # Charging wins: a ring on the charger is not on a finger, even if
         # the last (pre-removal) heart-rate sample is still fresh.
         if data.get("battery_charging"):
+            return False
+        # A 0-bpm reading in the ring's newest log slot means the optical
+        # sensor saw no pulse at its most recent sample. This is stronger
+        # than the staleness grace: even while the last non-zero sample is
+        # still "fresh", the ring is demonstrably off the finger now.
+        if data.get("hr_zero_reading"):
             return False
         heart_rate = data.get("heart_rate")
         return heart_rate is not None and heart_rate > 0
