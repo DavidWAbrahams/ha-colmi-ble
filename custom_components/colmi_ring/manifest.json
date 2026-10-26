@@ -2,12 +2,12 @@
   "domain": "colmi_ring",
   "name": "Colmi Ring",
   "codeowners": [
-    "@ludeeus"
+    "@DavidWAbrahams"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/ludeeus/integration_blueprint",
+  "documentation": "https://github.com/DavidWAbrahams/ha-colmi-ble",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/ludeeus/integration_blueprint/issues",
+  "issue_tracker": "https://github.com/DavidWAbrahams/ha-colmi-ble/issues",
   "version": "0.1.0",
   "integration_type": "device",
   "dependencies": [
