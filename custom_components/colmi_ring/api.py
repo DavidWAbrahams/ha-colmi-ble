@@ -241,14 +241,37 @@ class ColmiRingApiClient:
     async def async_get_data(self) -> dict[str, Any] | None:
         """Return the most recent heart rate recorded by the ring (today's log)."""
         async with _RingConnection(self._hass, self._ring_address) as conn:
+            # The ring indexes its heart-rate log by its *own* internal clock,
+            # and we request "today" in UTC. If the ring's clock is wrong (e.g.
+            # never synced since pairing) the requested day does not exist on the
+            # ring, so it returns no data. Sync the ring clock to UTC first so the
+            # day we ask for matches the day the ring logs to (the upstream
+            # library likewise requires set-time before reading logs).
+            await conn.set_time(date_utils.now())
+            await asyncio.sleep(0.5)
             log = await conn.get_heart_rate_log()
             if not isinstance(log, hr.HeartRateLog):
+                LOGGER.info(
+                    "Colmi ring %s returned no heart-rate log (NoData) for "
+                    "requested UTC day %s - ring clock/day mismatch?",
+                    self._ring_address,
+                    date_utils.start_of_day(date_utils.now()).isoformat(),
+                )
                 return None
 
             # Heart rate is sampled every ~15 min but logged in 5-min slots, so
             # most slots are 0 and must be filtered out before picking the latest.
             entries = [r for r in log.heart_rates_with_times() if r[0] > 0]
             if not entries:
+                LOGGER.info(
+                    "Colmi ring %s returned a heart-rate log but every slot was "
+                    "0/empty (log day=%s, raw slots=%d, filled=%d) - ring has not "
+                    "recorded HR today or its clock is off",
+                    self._ring_address,
+                    log.timestamp.isoformat(),
+                    len(log.heart_rates),
+                    log.index,
+                )
                 return None
 
             latest_heart_rate, timestamp = max(entries, key=lambda x: x[1])
