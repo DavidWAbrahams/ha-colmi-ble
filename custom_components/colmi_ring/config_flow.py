@@ -102,7 +102,7 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Optional(
                         CONF_HR_STALE_POLLS,
                         default=self.config_entry.options.get(
-                            CONF_HR_STALE_POLLS, 0
+                            CONF_HR_STALE_POLLS, 3
                         ),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(

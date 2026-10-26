@@ -104,7 +104,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             return False
         try:
             stale_polls = int(
-                self.config_entry.options.get(CONF_HR_STALE_POLLS, 0)
+                self.config_entry.options.get(CONF_HR_STALE_POLLS, 3)
             )
         except (TypeError, ValueError):
             stale_polls = 0
