@@ -30,7 +30,7 @@ async def async_setup_entry(
                 coordinator=entry.runtime_data.coordinator,
                 entity_description=ButtonEntityDescription(
                     key="colmi_ring_blink_button",
-                    name="Blink Twice",
+                    name="Blink LED",
                     icon="mdi:eye-outline",
                 ),
             ),
@@ -46,7 +46,7 @@ async def async_setup_entry(
                 coordinator=entry.runtime_data.coordinator,
                 entity_description=ButtonEntityDescription(
                     key="colmi_ring_spo2_button",
-                    name="Take SpO2 Reading",
+                    name="Read SpO2",
                     icon="mdi:drop",
                 ),
             ),
@@ -54,7 +54,7 @@ async def async_setup_entry(
                 coordinator=entry.runtime_data.coordinator,
                 entity_description=ButtonEntityDescription(
                     key="colmi_ring_heart_rate_button",
-                    name="Take Heart Rate Reading",
+                    name="Read Heart Rate",
                     icon="mdi:heart-pulse",
                 ),
             ),
@@ -112,8 +112,6 @@ class ColmiRingRebootButton(ColmiRingEntity, ButtonEntity):
 
 class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
     """Trigger an on-demand SpO2 measurement on the ring."""
-
-    _attr_name = "Take SpO2 Reading"
 
     def __init__(
         self,
