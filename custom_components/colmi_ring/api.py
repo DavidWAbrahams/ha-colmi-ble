@@ -286,6 +286,24 @@ class ColmiRingApiClient:
                     self._ring_address,
                 )
 
+            steps_total: int | None = None
+            distance_total: int | None = None
+            calories_total: int | None = None
+            try:
+                # The ring logs sport detail in 15-min bins keyed to its own
+                # clock, which we just synced to UTC above, so ask for offset 0
+                # ("today"). Sum the bins for a daily total.
+                sport = await conn.get_steps(date_utils.start_of_day(date_utils.now()))
+                if isinstance(sport, list):
+                    steps_total = sum(d.steps for d in sport)
+                    distance_total = sum(d.distance for d in sport)
+                    calories_total = sum(d.calories for d in sport)
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not answer steps query",
+                    self._ring_address,
+                )
+
             # The ring indexes its heart-rate log by its *own* internal clock,
             # and we request "today" in UTC. If the ring's clock is wrong (e.g.
             # never synced since pairing) the requested day does not exist on the
@@ -328,6 +346,9 @@ class ColmiRingApiClient:
             "hr_settings": settings,
             "battery_level": battery_level,
             "battery_charging": battery_charging,
+            "steps": steps_total,
+            "distance": distance_total,
+            "calories": calories_total,
         }
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
