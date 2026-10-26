@@ -50,6 +50,14 @@ async def async_setup_entry(
                     icon="mdi:drop",
                 ),
             ),
+            ColmiRingHeartRateButton(
+                coordinator=entry.runtime_data.coordinator,
+                entity_description=ButtonEntityDescription(
+                    key="colmi_ring_heart_rate_button",
+                    name="Take Heart Rate Reading",
+                    icon="mdi:heart-pulse",
+                ),
+            ),
         ]
     )
 
@@ -137,3 +145,38 @@ class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
                 "(is the ring worn snugly on a finger?)"
             )
         self.coordinator.apply_spo2(reading)
+
+
+class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
+    """Trigger an on-demand real-time heart-rate measurement on the ring."""
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        entity_description: ButtonEntityDescription,
+    ) -> None:
+        """Initialize the button class."""
+        super().__init__(coordinator)
+        self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{entity_description.key}"
+        )
+
+    def press(self) -> None:
+        """Press the button (measurement takes ~30s; run it in the background)."""
+        self.hass.async_create_task(self.async_press())
+
+    async def async_press(self) -> None:
+        """Take an on-demand live HR reading and publish it to the sensor."""
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            reading = await client.async_take_heart_rate()
+        except ColmiRingApiClientError as err:
+            LOGGER.warning("Colmi ring heart-rate measurement failed: %s", err)
+            raise
+        if reading.get("heart_rate") is None:
+            LOGGER.warning(
+                "Colmi ring heart-rate measurement produced no valid reading "
+                "(is the ring worn snugly on a finger?)"
+            )
+        self.coordinator.apply_heart_rate(reading)

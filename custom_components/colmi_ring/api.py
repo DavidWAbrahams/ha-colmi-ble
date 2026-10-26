@@ -456,3 +456,23 @@ class ColmiRingApiClient:
             "spo2": median,
             "spo2_timestamp": datetime.now(tz=timezone.utc),
         }
+
+    async def async_take_heart_rate(self) -> dict[str, Any]:
+        """Take an on-demand real-time heart-rate measurement.
+
+        Returns a dict with ``heart_rate`` (int bpm) and ``heart_rate_timestamp``
+        (aware datetime), or ``heart_rate`` = None if the ring produced no
+        valid reading.
+        """
+        async with _RingConnection(self._hass, self._ring_address) as conn:
+            samples = await conn.poll_real_time_reading(
+                real_time.RealTimeReading.HEART_RATE
+            )
+        if not samples:
+            return {"heart_rate": None, "heart_rate_timestamp": None}
+        samples.sort()
+        median = samples[len(samples) // 2]
+        return {
+            "heart_rate": median,
+            "heart_rate_timestamp": datetime.now(tz=timezone.utc),
+        }
