@@ -68,8 +68,15 @@ def _latest_sample_is_zero(
     """True if the ring's newest *sample* read 0 bpm (off-finger evidence).
 
     Slots between samples are also 0 ("no sample taken yet"), so a zero in the
-    newest slot only counts when it is a full logging interval newer than the
-    newest non-zero sample.
+    newest slot only counts when the newest filled slot is clearly newer than
+    the newest non-zero sample. A *worn* ring can legitimately show a gap of
+    one logging interval plus one 5-min slot: the ring's log index advances
+    slot-by-slot (every 5 min) while samples land only once per interval, so
+    right after the index steps past a sample the newest filled slot sits
+    exactly interval + 5 minutes ahead. Only a gap *beyond* that means the
+    ring actually recorded a zero (and then kept advancing), i.e. it saw no
+    pulse. Requiring ``> interval + 5`` instead of ``>= interval`` fixes the
+    intermittent false "Away" seen at interval boundaries.
     """
     if filled <= 0:
         return False
@@ -79,8 +86,8 @@ def _latest_sample_is_zero(
         return True
     newest_slot_ts = all_slots[filled - 1][1]
     latest_sample_ts = max(ts for _, ts in entries)
-    return newest_slot_ts - latest_sample_ts >= timedelta(
-        minutes=interval_minutes
+    return newest_slot_ts - latest_sample_ts > timedelta(
+        minutes=interval_minutes + 5
     )
 
 
@@ -434,9 +441,13 @@ class ColmiRingApiClient:
                 # of slots and the parser's is-today cleanup zeroes (but does
                 # not shrink) the future ones.
                 interval = settings.interval if settings else 15
+                # Slots started so far today (slot k covers minutes 5k..5k+4).
+                # minutes_so_far() is "minutes + 1", so subtract it back before
+                # dividing: otherwise the clamp can admit a not-yet-started
+                # slot, inflating the zero-evidence gap by a spurious 5 min.
                 slots_now = (
-                    date_utils.minutes_so_far(date_utils.now()) // 5 + 1
-                )
+                    date_utils.minutes_so_far(date_utils.now()) - 1
+                ) // 5 + 1
                 filled = min(max(log.index, 0), len(all_slots), slots_now)
                 hr_zero_reading = _latest_sample_is_zero(
                     all_slots, entries, filled, interval
