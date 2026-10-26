@@ -19,7 +19,9 @@ from .api import (
 from .const import (
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
+    CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
+    DEFAULT_POLL_MAX_INTERVAL,
     DOMAIN,
     LOGGER,
 )
@@ -133,6 +135,19 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         selector.NumberSelectorConfig(
                             min=0,
                             max=24,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_POLL_MAX_INTERVAL,
+                        default=self.config_entry.options.get(
+                            CONF_POLL_MAX_INTERVAL, DEFAULT_POLL_MAX_INTERVAL
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=5,
+                            max=180,
                             step=1,
                             mode=selector.NumberSelectorMode.BOX,
                         )
