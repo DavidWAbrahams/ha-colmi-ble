@@ -13,9 +13,15 @@ from .api import (
     ColmiRingApiClientError,
 )
 from .colmi_codec.hr_settings import HeartRateLogSettings
-from .const import CONF_HR_STALE_POLLS, LOGGER
+from .const import (
+    CONF_HR_BACKFILL,
+    CONF_HR_STALE_POLLS,
+    CONF_STEPS_BACKFILL,
+    LOGGER,
+)
 
 if TYPE_CHECKING:
+    from .backfill import BackfillManager
     from .data import ColmiRingConfigEntry
 
 
@@ -25,9 +31,13 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     config_entry: ColmiRingConfigEntry
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, backfill: BackfillManager | None = None, **kwargs: Any
+    ) -> None:
         """Track the latest on-demand readings across normal polls."""
         super().__init__(*args, **kwargs)
+        # Imports off-ring HR/activity samples into the recorder each poll.
+        self.backfill = backfill
         # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
         self.spo2_reading: dict[str, Any] | None = None
         # {"heart_rate": int | None, "heart_rate_timestamp": datetime | None}
@@ -87,6 +97,22 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             data["heart_rate"] = None
             data["heart_rate_timestamp"] = None
             self.hr_live = None
+        # Independent of the live-state logic above: samples the ring recorded
+        # while out of range belong in the history even when the live sensor is
+        # currently stale/unknown.
+        if self.backfill is not None:
+            try:
+                await self.backfill.async_sync(
+                    data,
+                    hr_enabled=bool(
+                        self.config_entry.options.get(CONF_HR_BACKFILL, True)
+                    ),
+                    steps_enabled=bool(
+                        self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring history backfill errored")
         return data
 
     def _heart_rate_is_stale(self, data: dict[str, Any]) -> bool:

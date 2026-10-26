@@ -16,7 +16,13 @@ from .api import (
     ColmiRingApiClientCommunicationError,
     ColmiRingApiClientError,
 )
-from .const import CONF_HR_STALE_POLLS, DOMAIN, LOGGER
+from .const import (
+    CONF_HR_BACKFILL,
+    CONF_HR_STALE_POLLS,
+    CONF_STEPS_BACKFILL,
+    DOMAIN,
+    LOGGER,
+)
 
 
 class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
@@ -131,6 +137,18 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
+                    vol.Optional(
+                        CONF_HR_BACKFILL,
+                        default=self.config_entry.options.get(
+                            CONF_HR_BACKFILL, True
+                        ),
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_STEPS_BACKFILL,
+                        default=self.config_entry.options.get(
+                            CONF_STEPS_BACKFILL, False
+                        ),
+                    ): selector.BooleanSelector(),
                 }
             ),
         )

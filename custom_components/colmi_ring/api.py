@@ -17,7 +17,7 @@ library does -- but it additionally works when the ring is reached via a proxy.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +57,31 @@ UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 # The upstream library uses a fixed 2s which is too tight over a Bluetooth
 # proxy, so we raise it.
 REPLY_TIMEOUT = 10.0
+
+
+def _latest_sample_is_zero(
+    all_slots: list[tuple[int, datetime]],
+    entries: list[tuple[int, datetime]],
+    filled: int,
+    interval_minutes: int,
+) -> bool:
+    """True if the ring's newest *sample* read 0 bpm (off-finger evidence).
+
+    Slots between samples are also 0 ("no sample taken yet"), so a zero in the
+    newest slot only counts when it is a full logging interval newer than the
+    newest non-zero sample.
+    """
+    if filled <= 0:
+        return False
+    if not entries:
+        # The ring has slots but nothing but zeros: it is logging and sees no
+        # pulse at all.
+        return True
+    newest_slot_ts = all_slots[filled - 1][1]
+    latest_sample_ts = max(ts for _, ts in entries)
+    return newest_slot_ts - latest_sample_ts >= timedelta(
+        minutes=interval_minutes
+    )
 
 
 class ColmiRingApiClientError(Exception):
@@ -311,6 +336,11 @@ class ColmiRingApiClient:
         heart_rate: int | None = None
         heart_rate_timestamp: datetime | None = None
         settings: hr_settings.HeartRateLogSettings | None = None
+        # Time series for the recorder backfill (see backfill.py):
+        # hr_entries: (timestamp, bpm) for each non-zero slot of today's log;
+        # sport_bins: (timestamp, steps, meters, kcal) per 15-min bin of today.
+        hr_entries: list[tuple[datetime, int]] = []
+        sport_bins: list[tuple[datetime, int, int, float]] = []
         # True when the ring's most recently filled HR log slot reads 0 bpm:
         # direct evidence the optical sensor is not on skin right now, even
         # if the newest *non-zero* sample is still within the staleness grace.
@@ -358,6 +388,15 @@ class ColmiRingApiClient:
                     steps_total = sum(d.steps for d in sport)
                     distance_total = sum(d.distance for d in sport)
                     calories_total = round(sum(d.calories for d in sport) / 1000)
+                    # Keep the raw bins too so the backfill manager can insert
+                    # the per-bin history for time spent out of BLE range.
+                    sport_bins = sorted(
+                        (
+                            (d.timestamp, d.steps, d.distance, d.calories / 1000)
+                            for d in sport
+                        ),
+                        key=lambda row: row[0],
+                    )
             except ColmiRingApiClientError:
                 LOGGER.debug(
                     "Colmi ring %s did not answer steps query",
@@ -381,18 +420,27 @@ class ColmiRingApiClient:
                     date_utils.start_of_day(date_utils.now()).isoformat(),
                 )
             else:
-                # If the newest slot the ring actually transmitted reads 0 bpm,
-                # the optical sensor saw no pulse at its most recent sample:
-                # treat as "off finger" evidence that must override the
-                # staleness grace on the On Finger sensor.
-                all_slots = log.heart_rates_with_times()
-                filled = min(max(log.index, 0), len(all_slots))
-                if filled > 0 and all_slots[filled - 1][0] == 0:
-                    hr_zero_reading = True
                 # Heart rate is sampled at the ring's logging interval but logged
                 # in 5-min slots, so most slots are 0 and must be filtered out
                 # before picking the latest.
-                entries = [r for r in log.heart_rates_with_times() if r[0] > 0]
+                all_slots = log.heart_rates_with_times()
+                entries = [r for r in all_slots if r[0] > 0]
+                # Whole-day (timestamp, bpm) series for the backfill manager.
+                hr_entries = sorted(
+                    ((ts, bpm) for bpm, ts in entries), key=lambda x: x[0]
+                )
+                # Off-finger evidence only from a *new* zero-bpm sample; index
+                # is clamped to now because the ring can transmit its whole day
+                # of slots and the parser's is-today cleanup zeroes (but does
+                # not shrink) the future ones.
+                interval = settings.interval if settings else 15
+                slots_now = (
+                    date_utils.minutes_so_far(date_utils.now()) // 5 + 1
+                )
+                filled = min(max(log.index, 0), len(all_slots), slots_now)
+                hr_zero_reading = _latest_sample_is_zero(
+                    all_slots, entries, filled, interval
+                )
                 if not entries:
                     LOGGER.info(
                         "Colmi ring %s returned a heart-rate log but every slot "
@@ -418,6 +466,8 @@ class ColmiRingApiClient:
             "steps": steps_total,
             "distance": distance_total,
             "calories": calories_total,
+            "hr_entries": hr_entries,
+            "sport_bins": sport_bins,
         }
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:

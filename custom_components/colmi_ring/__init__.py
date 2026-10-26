@@ -15,6 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
+from .backfill import BackfillManager
 from .const import DOMAIN, LOGGER
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
@@ -44,6 +45,7 @@ async def async_setup_entry(
         name=DOMAIN,
         # TODO: think about a good value here. This probably eats battery.
         update_interval=timedelta(minutes=5),
+        backfill=BackfillManager(hass, entry.entry_id),
     )
     entry.runtime_data = ColmiRingData(
         client=ColmiRingApiClient(hass=hass, ring_address=entry.data[CONF_ADDRESS]),

@@ -62,7 +62,7 @@ ENTITY_DESCRIPTIONS = (
     SensorEntityDescription(
         key="spo2",
         name="Blood Oxygen",
-        icon="mdi:oxygen",
+        icon="mdi:lungs",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),

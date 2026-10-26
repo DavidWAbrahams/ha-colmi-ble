@@ -47,7 +47,7 @@ async def async_setup_entry(
                 entity_description=ButtonEntityDescription(
                     key="colmi_ring_spo2_button",
                     name="Read SpO2",
-                    icon="mdi:oxygen",
+                    icon="mdi:lungs",
                 ),
             ),
             ColmiRingHeartRateButton(

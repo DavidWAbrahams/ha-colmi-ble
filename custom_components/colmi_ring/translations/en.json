@@ -21,9 +21,11 @@
     "options": {
         "step": {
             "init": {
-                "description": "Heart rate freshness options.",
+                "description": "Heart rate freshness and history backfill options.",
                 "data": {
-                    "hr_stale_after_polls": "Grace polls before Heart Rate goes unknown after the ring is removed (0 = fastest detection)"
+                    "hr_stale_after_polls": "Grace polls before Heart Rate goes unknown after the ring is removed (0 = fastest detection)",
+                    "hr_backfill": "Log heart-rate samples recorded while out of Bluetooth range into history",
+                    "steps_backfill": "Experimental: also backfill steps/distance/calories history (raw graph only, may not show in long-term statistics)"
                 }
             }
         }
