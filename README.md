@@ -20,7 +20,7 @@ bluetooth_proxy:
 # Setup
 Install HACS. Add this repo to your Custom Repositories. Install "Colmi Ring" from the HACS list.
 
-Someday I might get auto-discovery to work. Until then, go to Settings -> Devices and Services -> Add Integration -> Colmi Ring
+If for some reason autodiscovery doesn't work, try going to Settings -> Devices and Services -> Add Integration -> Colmi Ring
 
 # TODO
 1) Add more data
