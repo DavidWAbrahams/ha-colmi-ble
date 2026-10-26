@@ -1,8 +1,8 @@
 """Colmi Ring API client.
 
-This integration reuses only the *pure* packet codecs from the
-``colmi_r02_client`` library (packet builders and parsers) and owns its own
-Bluetooth transport. The transport is wired through Home Assistant's Bluetooth
+This integration uses only the *pure* packet codecs (vendored into the local
+``colmi_codec`` subpackage, originally from the ``colmi_r02_client`` project) and
+owns its own Bluetooth transport. The transport is wired through Home Assistant's Bluetooth
 stack (``homeassistant.components.bluetooth`` + ``bleak_retry_connector``) so
 connections use the device HA actually discovered and are routed to whichever
 adapter (local radio or ESPHome Bluetooth proxy) saw it, with retry handling.
@@ -27,7 +27,7 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
-from colmi_r02_client import (
+from .colmi_codec import (
     battery,
     blink_twice,
     date_utils,
@@ -36,8 +36,8 @@ from colmi_r02_client import (
     set_time as set_time_mod,
     steps,
 )
-from colmi_r02_client.hr import HeartRateLogParser
-from colmi_r02_client.steps import SportDetailParser
+from .colmi_codec.hr import HeartRateLogParser
+from .colmi_codec.steps import SportDetailParser
 
 from .const import LOGGER
 
