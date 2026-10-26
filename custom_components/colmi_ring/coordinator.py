@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -16,7 +17,9 @@ from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import (
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
+    CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
+    DEFAULT_POLL_MAX_INTERVAL,
     LOGGER,
 )
 
@@ -102,6 +105,9 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # currently stale/unknown.
         if self.backfill is not None:
             try:
+                # DIAGNOSTIC: timing + errors around the recorder import, to
+                # check whether enabling steps backfill stalls/fails refresh.
+                _t0 = time.monotonic()
                 await self.backfill.async_sync(
                     data,
                     hr_enabled=bool(
@@ -111,9 +117,55 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                         self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
                     ),
                 )
+                LOGGER.debug(
+                    "Colmi ring backfill async_sync took %.2fs",
+                    time.monotonic() - _t0,
+                )
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring history backfill errored")
+        self._apply_poll_interval(data)
         return data
+
+    # Floor for the adaptive poll interval. The ring's HR log is a 5-min
+    # slot grid, so polling faster than that can never reveal a new sample.
+    _MIN_POLL_MINUTES = 5
+
+    def _apply_poll_interval(self, data: dict[str, Any]) -> None:
+        """Match the poll cadence to the ring's sampling interval, capped.
+
+        The ring only records a new HR sample once per its configured
+        sampling interval, so polling faster just re-reads an unchanged log
+        and wastes battery. We therefore poll at ``min(ring interval,
+        configured max)``, floored at the 5-minute log grid. When the ring
+        did not answer the settings query we keep the current interval
+        rather than snapping to a default. ``DataUpdateCoordinator`` reads
+        ``update_interval`` when scheduling the next refresh, so assigning
+        it here retunes subsequent polls.
+        """
+        settings = data.get("hr_settings")
+        if not isinstance(settings, HeartRateLogSettings):
+            return
+        try:
+            max_minutes = int(
+                self.config_entry.options.get(
+                    CONF_POLL_MAX_INTERVAL, DEFAULT_POLL_MAX_INTERVAL
+                )
+            )
+        except (TypeError, ValueError):
+            max_minutes = DEFAULT_POLL_MAX_INTERVAL
+        minutes = max(
+            self._MIN_POLL_MINUTES,
+            min(settings.interval, max_minutes),
+        )
+        new_interval = timedelta(minutes=minutes)
+        if self.update_interval != new_interval:
+            LOGGER.debug(
+                "Colmi ring poll interval set to %s (sampling %s min, max %s min)",
+                new_interval,
+                settings.interval,
+                max_minutes,
+            )
+            self.update_interval = new_interval
 
     def _heart_rate_is_stale(self, data: dict[str, Any]) -> bool:
         """True if the newest HR sample is older than the staleness threshold.

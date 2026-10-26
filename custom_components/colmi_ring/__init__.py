@@ -39,11 +39,16 @@ async def async_setup_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Set up this integration using UI."""
+    # DIAGNOSTIC: watch for concurrent setup/reload (options saves can
+    # trigger BOTH HA's automatic reload and our update-listener reload).
+    LOGGER.info("colmi_ring: async_setup_entry START (state=%s)", entry.state)
     coordinator = ColmiRingDataUpdateCoordinator(
         hass=hass,
         logger=LOGGER,
         name=DOMAIN,
-        # TODO: think about a good value here. This probably eats battery.
+        # Bootstrap interval only: after the first successful poll the
+        # coordinator retunes itself to the ring's HR sampling interval,
+        # capped by the poll_max_interval option (see _apply_poll_interval).
         update_interval=timedelta(minutes=5),
         backfill=BackfillManager(hass, entry.entry_id),
     )
@@ -58,8 +63,10 @@ async def async_setup_entry(
     # from the first refresh.
     await coordinator.async_config_entry_first_refresh()
 
+    LOGGER.info("colmi_ring: async_setup_entry forwarding platforms")
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    LOGGER.info("colmi_ring: async_setup_entry DONE")
 
     return True
 
@@ -69,13 +76,24 @@ async def async_unload_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    LOGGER.info("colmi_ring: async_unload_entry START (state=%s)", entry.state)
+    result = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    LOGGER.info("colmi_ring: async_unload_entry DONE result=%s", result)
+    return result
 
 
 async def async_reload_entry(
     hass: HomeAssistant,
     entry: ColmiRingConfigEntry,
 ) -> None:
-    """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
+    """Reload config entry.
+
+    Must NOT manually unload-then-setup: that runs async_setup_entry while
+    the entry state is NOT_LOADED, so the coordinator's
+    async_config_entry_first_refresh() refuses with ConfigEntryError
+    ("Config entry is not loaded") and every entity is orphaned with
+    "no longer being provided by the integration". Delegating to HA's own
+    reload path keeps its state machine consistent, and it debounces when
+    the options flow also triggers an automatic reload.
+    """
+    entry.async_schedule_reload(hass)
