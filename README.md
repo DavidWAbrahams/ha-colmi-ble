@@ -26,5 +26,5 @@ If for some reason autodiscovery doesn't work, try going to Settings -> Devices 
 The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware never samples it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant at your own risk (expect reduced battery life if you do so frequently).
 
 # TODO
-1) Add more data
+1) Add dubious metrics like blood pressure, blood sugar, ECG, HRV, stress and "fatigue" scores. The protocol (and some hardware) can technically provide these, but on a $20 optical ring they are almost certainly pseudo-random nonsense, so we deliberately don't expose them.
 2) Fill in gaps when you were out of the house
