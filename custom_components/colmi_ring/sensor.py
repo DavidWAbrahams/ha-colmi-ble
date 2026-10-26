@@ -59,6 +59,13 @@ ENTITY_DESCRIPTIONS = (
         native_unit_of_measurement=UnitOfEnergy.KILO_CALORIE,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
+    SensorEntityDescription(
+        key="spo2",
+        name="Blood Oxygen (last reading)",
+        icon="mdi:drop",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
 )
 
 
@@ -110,13 +117,15 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator (adds charging attribute)."""
-        if (
-            self.entity_description.key == "battery_level"
-            and self.coordinator.last_update_success
-            and self.coordinator.data
-        ):
-            charging = self.coordinator.data.get("battery_charging")
-            if charging is not None:
-                self._attr_extra_state_attributes = {"charging": bool(charging)}
+        """Handle updated data (adds battery charging / spo2 timestamp attrs)."""
+        if self.coordinator.last_update_success and self.coordinator.data:
+            if self.entity_description.key == "battery_level":
+                charging = self.coordinator.data.get("battery_charging")
+                if charging is not None:
+                    self._attr_extra_state_attributes = {
+                        "charging": bool(charging)
+                    }
+            elif self.entity_description.key == "spo2":
+                timestamp = self.coordinator.data.get("spo2_timestamp")
+                self._attr_extra_state_attributes = {"timestamp": timestamp}
         super()._handle_coordinator_update()

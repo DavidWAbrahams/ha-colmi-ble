@@ -33,6 +33,7 @@ from .colmi_codec import (
     date_utils,
     hr,
     hr_settings,
+    real_time,
     reboot,
     set_time as set_time_mod,
     steps,
@@ -109,6 +110,7 @@ class _RingConnection:
             hr_settings.CMD_HEART_RATE_LOG_SETTINGS: (
                 hr_settings.parse_heart_rate_log_settings
             ),
+            real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
         }
         self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
@@ -245,6 +247,50 @@ class _RingConnection:
     ) -> None:
         """Write the ring's heart-rate logging settings (no reply expected)."""
         await self._send(hr_settings.hr_log_settings_packet(settings))
+
+    async def poll_real_time_reading(
+        self, reading_type: real_time.RealTimeReading
+    ) -> list[int]:
+        """Start an on-demand real-time measurement, collect samples, stop it.
+
+        The ring streams repeated readings (e.g. SPO2 %) after a START packet;
+        we gather a handful of non-zero samples then send STOP. Returns the
+        collected samples (possibly empty if none were valid). Mirrors the
+        upstream driver's poll loop.
+        """
+        queue = self._queues[real_time.CMD_START_REAL_TIME]
+        # Drop any stale samples from a previous measurement.
+        while not queue.empty():
+            queue.get_nowait()
+
+        await self._send(real_time.get_start_packet(reading_type))
+
+        valid: list[int] = []
+        empty_waits = 0
+        # Upstream collects 6 valid samples tolerating many empty waits; we cap
+        # consecutive empty waits so the button press finishes in bounded time
+        # even if the ring never streams (per-sample timeout stays generous for
+        # proxy latency).
+        while len(valid) < 6 and empty_waits < 5:
+            try:
+                data: real_time.Reading | real_time.ReadingError = (
+                    await asyncio.wait_for(queue.get(), timeout=REPLY_TIMEOUT)
+                )
+            except asyncio.TimeoutError:
+                empty_waits += 1
+                continue
+            empty_waits = 0
+            if isinstance(data, real_time.ReadingError):
+                await self._send(real_time.get_stop_packet(reading_type))
+                raise ColmiRingApiClientError(
+                    f"Ring returned error code {data.code} for real-time "
+                    f"reading {reading_type.name}"
+                )
+            if data.value != 0:
+                valid.append(data.value)
+
+        await self._send(real_time.get_stop_packet(reading_type))
+        return valid
 
 
 class ColmiRingApiClient:
@@ -391,3 +437,22 @@ class ColmiRingApiClient:
         """Reboot the ring."""
         async with _RingConnection(self._hass, self._ring_address) as conn:
             return await conn.reboot()
+
+    async def async_take_spo2(self) -> dict[str, Any]:
+        """Take an on-demand SpO2 measurement and return the median sample.
+
+        Returns a dict with ``spo2`` (int %) and ``spo2_timestamp`` (aware
+        datetime), or ``spo2`` = None if the ring produced no valid reading.
+        """
+        async with _RingConnection(self._hass, self._ring_address) as conn:
+            samples = await conn.poll_real_time_reading(
+                real_time.RealTimeReading.SPO2
+            )
+        if not samples:
+            return {"spo2": None, "spo2_timestamp": None}
+        samples.sort()
+        median = samples[len(samples) // 2]
+        return {
+            "spo2": median,
+            "spo2_timestamp": datetime.now(tz=timezone.utc),
+        }

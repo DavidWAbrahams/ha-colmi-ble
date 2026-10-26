@@ -23,10 +23,16 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     config_entry: ColmiRingConfigEntry
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Track the latest on-demand SpO2 reading across normal polls."""
+        super().__init__(*args, **kwargs)
+        # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
+        self.spo2_reading: dict[str, Any] | None = None
+
     async def _async_update_data(self) -> Any:
-        """Update data via library."""
+        """Update data via library (merging the persisted on-demand SpO2)."""
         try:
-            return await self.config_entry.runtime_data.client.async_get_data()
+            data = await self.config_entry.runtime_data.client.async_get_data()
         except ColmiRingApiClientAuthenticationError as exception:
             raise ConfigEntryAuthFailed(exception) from exception
         except ColmiRingApiClientError as exception:
@@ -34,3 +40,18 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as exception:  # noqa: BLE001
             LOGGER.exception("Unexpected error updating Colmi ring")
             raise UpdateFailed(exception) from exception
+        if self.spo2_reading is not None:
+            data["spo2"] = self.spo2_reading.get("spo2")
+            data["spo2_timestamp"] = self.spo2_reading.get("spo2_timestamp")
+        else:
+            data.setdefault("spo2", None)
+            data.setdefault("spo2_timestamp", None)
+        return data
+
+    def apply_spo2(self, reading: dict[str, Any]) -> None:
+        """Store a fresh SpO2 reading and push it to entities immediately."""
+        self.spo2_reading = reading
+        data = dict(self.data) if self.data else {}
+        data["spo2"] = reading.get("spo2")
+        data["spo2_timestamp"] = reading.get("spo2_timestamp")
+        self.async_set_updated_data(data)
