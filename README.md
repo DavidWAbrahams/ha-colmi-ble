@@ -23,7 +23,5 @@ Install HACS. Add this repo to your Custom Repositories. Install "Colmi Ring" fr
 Someday I might get auto-discovery to work. Until then, go to Settings -> Devices and Services -> Add Integration -> Colmi Ring
 
 # TODO
-1) Auto discovery
-2) Add more data
-3) Fill in gaps when you were out of the house
-4) Share BLE modem with other integrations more gracefully
+1) Add more data
+2) Fill in gaps when you were out of the house
