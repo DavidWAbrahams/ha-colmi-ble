@@ -11,7 +11,6 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.const import CONF_ADDRESS, Platform
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
@@ -39,9 +38,6 @@ async def async_setup_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Set up this integration using UI."""
-    # DIAGNOSTIC: watch for concurrent setup/reload (options saves can
-    # trigger BOTH HA's automatic reload and our update-listener reload).
-    LOGGER.info("colmi_ring: async_setup_entry START (state=%s)", entry.state)
     coordinator = ColmiRingDataUpdateCoordinator(
         hass=hass,
         logger=LOGGER,
@@ -63,10 +59,8 @@ async def async_setup_entry(
     # from the first refresh.
     await coordinator.async_config_entry_first_refresh()
 
-    LOGGER.info("colmi_ring: async_setup_entry forwarding platforms")
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
-    LOGGER.info("colmi_ring: async_setup_entry DONE")
 
     return True
 
@@ -76,10 +70,7 @@ async def async_unload_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
-    LOGGER.info("colmi_ring: async_unload_entry START (state=%s)", entry.state)
-    result = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    LOGGER.info("colmi_ring: async_unload_entry DONE result=%s", result)
-    return result
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
 async def async_reload_entry(

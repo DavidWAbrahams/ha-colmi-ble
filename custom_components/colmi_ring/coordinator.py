@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -105,9 +104,6 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # currently stale/unknown.
         if self.backfill is not None:
             try:
-                # DIAGNOSTIC: timing + errors around the recorder import, to
-                # check whether enabling steps backfill stalls/fails refresh.
-                _t0 = time.monotonic()
                 await self.backfill.async_sync(
                     data,
                     hr_enabled=bool(
@@ -116,10 +112,6 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                     steps_enabled=bool(
                         self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
                     ),
-                )
-                LOGGER.debug(
-                    "Colmi ring backfill async_sync took %.2fs",
-                    time.monotonic() - _t0,
                 )
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring history backfill errored")
