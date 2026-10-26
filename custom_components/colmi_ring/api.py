@@ -32,6 +32,7 @@ from .colmi_codec import (
     blink_twice,
     date_utils,
     hr,
+    hr_settings,
     reboot,
     set_time as set_time_mod,
     steps,
@@ -105,6 +106,9 @@ class _RingConnection:
         self._handlers = {
             battery.CMD_BATTERY: battery.parse_battery,
             hr.CMD_READ_HEART_RATE: HeartRateLogParser().parse,
+            hr_settings.CMD_HEART_RATE_LOG_SETTINGS: (
+                hr_settings.parse_heart_rate_log_settings
+            ),
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
         }
         self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
@@ -229,6 +233,19 @@ class _RingConnection:
         """Reboot the ring (no reply expected)."""
         await self._send(reboot.REBOOT_PACKET)
 
+    async def get_hr_log_settings(self) -> hr_settings.HeartRateLogSettings:
+        """Read the ring's heart-rate logging settings (enabled + interval)."""
+        return await self._command(
+            hr_settings.READ_HEART_RATE_LOG_SETTINGS_PACKET,
+            hr_settings.CMD_HEART_RATE_LOG_SETTINGS,
+        )
+
+    async def set_hr_log_settings(
+        self, settings: hr_settings.HeartRateLogSettings
+    ) -> None:
+        """Write the ring's heart-rate logging settings (no reply expected)."""
+        await self._send(hr_settings.hr_log_settings_packet(settings))
+
 
 class ColmiRingApiClient:
     """High level client for a Colmi ring, using HA-managed BLE connections."""
@@ -238,9 +255,25 @@ class ColmiRingApiClient:
         self._hass = hass
         self._ring_address = ring_address
 
-    async def async_get_data(self) -> dict[str, Any] | None:
-        """Return the most recent heart rate recorded by the ring (today's log)."""
+    async def async_get_data(self) -> dict[str, Any]:
+        """Return the latest heart rate plus the ring's HR logging settings.
+
+        ``heart_rate`` is ``None`` when the ring has no usable sample for
+        today; ``hr_settings`` is ``None`` if the ring did not answer the
+        settings query.
+        """
+        heart_rate: int | None = None
+        heart_rate_timestamp: datetime | None = None
+        settings: hr_settings.HeartRateLogSettings | None = None
         async with _RingConnection(self._hass, self._ring_address) as conn:
+            try:
+                settings = await conn.get_hr_log_settings()
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not answer heart-rate settings query",
+                    self._ring_address,
+                )
+
             # The ring indexes its heart-rate log by its *own* internal clock,
             # and we request "today" in UTC. If the ring's clock is wrong (e.g.
             # never synced since pairing) the requested day does not exist on the
@@ -257,28 +290,48 @@ class ColmiRingApiClient:
                     self._ring_address,
                     date_utils.start_of_day(date_utils.now()).isoformat(),
                 )
-                return None
+            else:
+                # Heart rate is sampled at the ring's logging interval but logged
+                # in 5-min slots, so most slots are 0 and must be filtered out
+                # before picking the latest.
+                entries = [r for r in log.heart_rates_with_times() if r[0] > 0]
+                if not entries:
+                    LOGGER.info(
+                        "Colmi ring %s returned a heart-rate log but every slot "
+                        "was 0/empty (log day=%s, raw slots=%d, filled=%d) - ring "
+                        "has not recorded HR today or its clock is off",
+                        self._ring_address,
+                        log.timestamp.isoformat(),
+                        len(log.heart_rates),
+                        log.index,
+                    )
+                else:
+                    heart_rate, heart_rate_timestamp = max(
+                        entries, key=lambda x: x[1]
+                    )
 
-            # Heart rate is sampled every ~15 min but logged in 5-min slots, so
-            # most slots are 0 and must be filtered out before picking the latest.
-            entries = [r for r in log.heart_rates_with_times() if r[0] > 0]
-            if not entries:
-                LOGGER.info(
-                    "Colmi ring %s returned a heart-rate log but every slot was "
-                    "0/empty (log day=%s, raw slots=%d, filled=%d) - ring has not "
-                    "recorded HR today or its clock is off",
-                    self._ring_address,
-                    log.timestamp.isoformat(),
-                    len(log.heart_rates),
-                    log.index,
-                )
-                return None
+        return {
+            "heart_rate": heart_rate,
+            "heart_rate_timestamp": heart_rate_timestamp,
+            "hr_settings": settings,
+        }
 
-            latest_heart_rate, timestamp = max(entries, key=lambda x: x[1])
-            return {
-                "heart_rate": latest_heart_rate,
-                "heart_rate_timestamp": timestamp,
-            }
+    async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
+        """Read the ring's heart-rate logging settings."""
+        async with _RingConnection(self._hass, self._ring_address) as conn:
+            return await conn.get_hr_log_settings()
+
+    async def async_set_hr_log_settings(
+        self, settings: hr_settings.HeartRateLogSettings
+    ) -> hr_settings.HeartRateLogSettings:
+        """Write the ring's HR logging settings, then read them back to verify.
+
+        Returns the settings as the ring reports them after the write.
+        """
+        async with _RingConnection(self._hass, self._ring_address) as conn:
+            await conn.set_hr_log_settings(settings)
+            await asyncio.sleep(0.5)
+            return await conn.get_hr_log_settings()
 
     async def async_get_battery(self) -> dict[str, Any]:
         """Return battery level + charging state."""
