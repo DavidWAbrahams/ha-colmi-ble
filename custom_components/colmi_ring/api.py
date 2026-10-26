@@ -274,6 +274,18 @@ class ColmiRingApiClient:
                     self._ring_address,
                 )
 
+            battery_level: int | None = None
+            battery_charging: bool | None = None
+            try:
+                battery_info = await conn.get_battery()
+                battery_level = battery_info.battery_level
+                battery_charging = battery_info.charging
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not answer battery query",
+                    self._ring_address,
+                )
+
             # The ring indexes its heart-rate log by its *own* internal clock,
             # and we request "today" in UTC. If the ring's clock is wrong (e.g.
             # never synced since pairing) the requested day does not exist on the
@@ -314,6 +326,8 @@ class ColmiRingApiClient:
             "heart_rate": heart_rate,
             "heart_rate_timestamp": heart_rate_timestamp,
             "hr_settings": settings,
+            "battery_level": battery_level,
+            "battery_charging": battery_charging,
         }
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
