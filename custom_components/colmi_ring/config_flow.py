@@ -5,6 +5,7 @@ from __future__ import annotations
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.device_registry import format_mac
 
@@ -14,7 +15,7 @@ from .api import (
     ColmiRingApiClientCommunicationError,
     ColmiRingApiClientError,
 )
-from .const import DOMAIN, LOGGER
+from .const import CONF_HR_STALE_POLLS, DOMAIN, LOGGER
 
 
 class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
@@ -66,6 +67,14 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors=_errors,
         )
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,  # noqa: ARG003
+    ) -> "ColmiRingOptionsFlowHandler":
+        """Return the options flow handler."""
+        return ColmiRingOptionsFlowHandler()
+
     async def _test_credentials(self, ring_address: str) -> None:
         """Validate credentials."""
         client = ColmiRingApiClient(
@@ -73,3 +82,36 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             ring_address=ring_address,
         )
         await client.async_get_data()
+
+
+class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
+    """Handle colmi_ring options."""
+
+    async def async_step_init(
+        self,
+        user_input: dict | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_HR_STALE_POLLS,
+                        default=self.config_entry.options.get(
+                            CONF_HR_STALE_POLLS, 0
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=24,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                }
+            ),
+        )

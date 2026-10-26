@@ -16,5 +16,15 @@
         "abort": {
             "already_configured": "This entry is already configured."
         }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "description": "Heart rate freshness options.",
+                "data": {
+                    "hr_stale_after_polls": "Grace polls before Heart Rate goes unknown after the ring is removed (0 = fastest detection)"
+                }
+            }
+        }
     }
 }

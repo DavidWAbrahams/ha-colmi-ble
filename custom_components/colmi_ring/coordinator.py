@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -11,7 +12,8 @@ from .api import (
     ColmiRingApiClientAuthenticationError,
     ColmiRingApiClientError,
 )
-from .const import LOGGER
+from .colmi_codec.hr_settings import HeartRateLogSettings
+from .const import CONF_HR_STALE_POLLS, LOGGER
 
 if TYPE_CHECKING:
     from .data import ColmiRingConfigEntry
@@ -75,7 +77,52 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 )
             else:
                 self.hr_live = None
+        if self._heart_rate_is_stale(data):
+            # The newest sample is old enough that the ring is almost certainly
+            # off the finger; report "unknown" instead of a stale value.
+            if data.get("heart_rate") is not None:
+                LOGGER.debug(
+                    "Colmi ring heart-rate sample is stale; clearing heart rate"
+                )
+            data["heart_rate"] = None
+            data["heart_rate_timestamp"] = None
+            self.hr_live = None
         return data
+
+    def _heart_rate_is_stale(self, data: dict[str, Any]) -> bool:
+        """True if the newest HR sample is older than the staleness threshold.
+
+        The threshold is ``stale_polls * poll_interval + ring sample interval +
+        5 min slack`` so a *worn* ring (whose newest sample is naturally one
+        logging interval old) is never falsely cleared: with the default of 0
+        extra polls, the sensor still goes unknown within about one logging
+        interval of the ring leaving the finger, instead of waiting until
+        midnight like the ring's daily log would.
+        """
+        timestamp = data.get("heart_rate_timestamp")
+        if data.get("heart_rate") is None or not isinstance(timestamp, datetime):
+            return False
+        try:
+            stale_polls = int(
+                self.config_entry.options.get(CONF_HR_STALE_POLLS, 0)
+            )
+        except (TypeError, ValueError):
+            stale_polls = 0
+        poll_minutes = (
+            self.update_interval.total_seconds() / 60
+            if self.update_interval is not None
+            else 5.0
+        )
+        settings = data.get("hr_settings")
+        interval_minutes = (
+            settings.interval
+            if isinstance(settings, HeartRateLogSettings)
+            else 15
+        )
+        threshold = timedelta(
+            minutes=stale_polls * poll_minutes + interval_minutes + 5
+        )
+        return datetime.now(tz=timezone.utc) - timestamp > threshold
 
     def apply_spo2(self, reading: dict[str, Any]) -> None:
         """Store a fresh SpO2 reading and push it to entities immediately."""
