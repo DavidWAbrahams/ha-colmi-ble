@@ -339,11 +339,18 @@ class ColmiRingApiClient:
                 # The ring logs sport detail in 15-min bins keyed to its own
                 # clock, which we just synced to UTC above, so ask for offset 0
                 # ("today"). Sum the bins for a daily total.
+                #
+                # The raw calorie field counts hundredths of a kcal (0.01 kcal
+                # units). Verified empirically: sitting idle accrued ~1000 raw
+                # units/hour (~10 kcal/hr of active burn for fidget/ghost steps)
+                # and a mid-morning daily total of 115,470 raw -> ~1,155 kcal,
+                # matching expected sleep+morning accrual. Plain cal or kcal do
+                # not fit those rates.
                 sport = await conn.get_steps(date_utils.start_of_day(date_utils.now()))
                 if isinstance(sport, list):
                     steps_total = sum(d.steps for d in sport)
                     distance_total = sum(d.distance for d in sport)
-                    calories_total = sum(d.calories for d in sport)
+                    calories_total = round(sum(d.calories for d in sport) / 100)
             except ColmiRingApiClientError:
                 LOGGER.debug(
                     "Colmi ring %s did not answer steps query",
