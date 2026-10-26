@@ -77,10 +77,11 @@ class BackfillManager:
         """Bind to a config entry; watermarks load lazily on first sync."""
         self._hass = hass
         self._entry_id = entry_id
+        # Store signature is Store(hass, version, key).
         self._store: Store[dict[str, str]] = Store(
+            hass,
             STORAGE_VERSION,
             f"{DOMAIN}_backfill_{entry_id}",
-            hass,
         )
         self._watermarks: dict[str, datetime] = {}
         self._loaded = False
