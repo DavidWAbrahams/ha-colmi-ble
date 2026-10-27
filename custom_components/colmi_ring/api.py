@@ -17,6 +17,7 @@ library does -- but it additionally works when the ring is reached via a proxy.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -116,25 +117,47 @@ class _RingConnection:
         self._handlers: dict[int, Callable[[bytearray], Any]] = {}
         self._queues: dict[int, asyncio.Queue] = {}
 
-    async def __aenter__(self) -> _RingConnection:
-        """Resolve + connect the device through HA's Bluetooth stack."""
-        # Resolve to HA's BLEDevice so the connection is routed to the adapter /
-        # ESPHome proxy that actually sees the ring. Falls back to the raw
-        # address only if HA has never seen the device (e.g. a local radio).
+    # Rings advertise roughly once per second, so HA's scanner normally
+    # re-lists the device within a couple of poll attempts.
+    _RESOLVE_TIMEOUT_S = 10.0
+    _RESOLVE_POLL_S = 0.5
+
+    async def _async_resolve_device(self) -> BLEDevice:
+        """Resolve the ring to HA's BLEDevice, waiting briefly for a miss.
+
+        ``establish_connection`` requires a real (HA) ``BLEDevice``: passing
+        the raw MAC string crashes bleak_retry_connector on BlueZ
+        (``'str' object has no attribute 'details'``). So when HA's scanner
+        cache does not currently list the ring, wait up to a few seconds for
+        one of its advertisements to arrive instead of falling back to the
+        address string; if it never shows up, fail with a retryable error
+        (UpdateFailed -> next scheduled poll) rather than an AttributeError.
+        """
         from homeassistant.components.bluetooth import (  # noqa: PLC0415
             async_ble_device_from_address,
         )
 
-        device: BLEDevice | None = async_ble_device_from_address(
-            self._hass, self._address, connectable=True
-        )
-        if device is None:
-            LOGGER.warning(
-                "Colmi ring %s not found by HA bluetooth; falling back to raw "
-                "address (only works with a local radio)",
-                self._address,
+        deadline = time.monotonic() + self._RESOLVE_TIMEOUT_S
+        while True:
+            device = async_ble_device_from_address(
+                self._hass, self._address, connectable=True
             )
-        target = device if device is not None else self._address
+            if device is not None:
+                return device
+            if time.monotonic() >= deadline:
+                msg = (
+                    f"Colmi ring {self._address} was not seen by HA bluetooth "
+                    f"within {self._RESOLVE_TIMEOUT_S:.0f}s (out of range or "
+                    "advertising is off)"
+                )
+                raise ColmiRingApiClientCommunicationError(msg)
+            await asyncio.sleep(self._RESOLVE_POLL_S)
+
+    async def __aenter__(self) -> _RingConnection:
+        """Resolve + connect the device through HA's Bluetooth stack."""
+        # Resolve to HA's BLEDevice so the connection is routed to the
+        # adapter / ESPHome proxy that actually sees the ring.
+        target: BLEDevice = await self._async_resolve_device()
 
         self._handlers = {
             battery.CMD_BATTERY: battery.parse_battery,
