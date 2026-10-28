@@ -86,6 +86,7 @@ class BackfillManager:
         self._watermarks: dict[str, datetime] = {}
         self._loaded = False
         self._lock = asyncio.Lock()
+        self._gates_logged = False
 
     async def async_sync(
         self,
@@ -95,7 +96,20 @@ class BackfillManager:
         steps_enabled: bool,
     ) -> None:
         """Import any backlog from this poll's ring logs for enabled metrics."""
+        # DIAGNOSTIC (one-shot): proves the new backfill.py is deployed and
+        # shows which gate would silently disable imports.
+        if not self._gates_logged:
+            self._gates_logged = True
+            LOGGER.info(
+                "Colmi backfill: sync called (hr_enabled=%s steps_enabled=%s "
+                "hr_entries=%d sport_bins=%d)",
+                hr_enabled,
+                steps_enabled,
+                len(data.get("hr_entries") or []),
+                len(data.get("sport_bins") or []),
+            )
         if not hr_enabled and not steps_enabled:
+            LOGGER.info("Colmi backfill: both metrics disabled; skipping")
             return
         recorder = self._hass.services.async_services().get(RECORDER_DOMAIN)
         if not recorder or SERVICE_IMPORT_ENTITY_HISTORY not in recorder:
@@ -113,6 +127,12 @@ class BackfillManager:
         if not hr_entries and not sport_bins:
             # Nothing to import this poll; watermarks stay as they are so the
             # first non-empty batch still imports the whole backlog.
+            # INFO (diagnostic): if this repeats all day, the ring log
+            # queries are returning empty and backfill can never see data.
+            LOGGER.info(
+                "Colmi backfill: no hr_entries/sport_bins in poll data; nothing "
+                "to import (ring log query returned empty)"
+            )
             return
         async with self._lock:
             await self._async_ensure_loaded()
