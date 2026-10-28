@@ -100,7 +100,9 @@ class BackfillManager:
         # shows which gate would silently disable imports.
         if not self._gates_logged:
             self._gates_logged = True
-            LOGGER.info(
+            # WARNING on purpose: this user's HA log only keeps WARNING+,
+            # and INFO diagnostics are invisible there.
+            LOGGER.warning(
                 "Colmi backfill: sync called (hr_enabled=%s steps_enabled=%s "
                 "hr_entries=%d sport_bins=%d)",
                 hr_enabled,
@@ -109,14 +111,14 @@ class BackfillManager:
                 len(data.get("sport_bins") or []),
             )
         if not hr_enabled and not steps_enabled:
-            LOGGER.info("Colmi backfill: both metrics disabled; skipping")
+            LOGGER.warning("Colmi backfill: both metrics disabled; skipping")
             return
         recorder = self._hass.services.async_services().get(RECORDER_DOMAIN)
         if not recorder or SERVICE_IMPORT_ENTITY_HISTORY not in recorder:
             # INFO on purpose (diagnostic): if the graph has gaps and no
             # "backfilled N rows" lines ever appear, this service being
             # missing is the prime suspect.
-            LOGGER.info(
+            LOGGER.warning(
                 "Colmi backfill: %s.%s unavailable; skipping",
                 RECORDER_DOMAIN,
                 SERVICE_IMPORT_ENTITY_HISTORY,
@@ -127,9 +129,9 @@ class BackfillManager:
         if not hr_entries and not sport_bins:
             # Nothing to import this poll; watermarks stay as they are so the
             # first non-empty batch still imports the whole backlog.
-            # INFO (diagnostic): if this repeats all day, the ring log
+            # WARNING (diagnostic): if this repeats all day, the ring log
             # queries are returning empty and backfill can never see data.
-            LOGGER.info(
+            LOGGER.warning(
                 "Colmi backfill: no hr_entries/sport_bins in poll data; nothing "
                 "to import (ring log query returned empty)"
             )
@@ -188,9 +190,9 @@ class BackfillManager:
         if entity_id is None:
             # Entity not registered yet (e.g. first refresh before platform
             # setup); do not advance the watermark so the next poll retries.
-            # INFO (diagnostic): persistent lines here mean the entity
+            # WARNING (diagnostic): persistent lines here mean the entity
             # registry lookup is wrong, so backfill never imports.
-            LOGGER.info(
+            LOGGER.warning(
                 "Colmi backfill: no sensor entity for %s yet; deferring %d rows",
                 kind,
                 len(pending),
@@ -215,10 +217,10 @@ class BackfillManager:
             LOGGER.exception("Colmi ring %s history backfill failed", kind)
             return False
         self._watermarks[kind] = pending[-1][0]
-        # INFO (diagnostic): these lines prove the import path is running;
+        # WARNING (diagnostic): these lines prove the import path is running;
         # if they appear but the Lovelace graph stays empty, the rows are
         # landing with wrong timestamps (timezone handling suspect).
-        LOGGER.info(
+        LOGGER.warning(
             "Colmi ring backfilled %d %s history rows (%s .. %s)",
             len(history),
             kind,
