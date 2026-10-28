@@ -356,12 +356,18 @@ class ColmiRingApiClient:
         self._hass = hass
         self._ring_address = ring_address
 
-    async def async_get_data(self) -> dict[str, Any]:
+    async def async_get_data(
+        self, include_previous_day: bool = False
+    ) -> dict[str, Any]:
         """Return the latest heart rate plus the ring's HR logging settings.
 
         ``heart_rate`` is ``None`` when the ring has no usable sample for
         today; ``hr_settings`` is ``None`` if the ring did not answer the
         settings query.
+
+        ``include_previous_day`` extends only the backfill time series
+        (``hr_entries``/``sport_bins``) with yesterday's UTC-day ring log;
+        the live sensor values stay strictly today-based.
         """
         heart_rate: int | None = None
         heart_rate_timestamp: datetime | None = None
@@ -490,6 +496,12 @@ class ColmiRingApiClient:
                         entries, key=lambda x: x[1]
                     )
 
+            # Yesterday's ring logs extend the backfill time series only;
+            # every live sensor value above stays strictly today-based.
+            hr_entries, sport_bins = await self._async_extend_previous_day(
+                conn, include_previous_day, hr_entries, sport_bins
+            )
+
         return {
             "heart_rate": heart_rate,
             "heart_rate_timestamp": heart_rate_timestamp,
@@ -503,6 +515,58 @@ class ColmiRingApiClient:
             "hr_entries": hr_entries,
             "sport_bins": sport_bins,
         }
+
+    async def _async_extend_previous_day(
+        self,
+        conn: _RingConnection,
+        include_previous_day: bool,
+        hr_entries: list[tuple[datetime, int]],
+        sport_bins: list[tuple[datetime, int, int, float]],
+    ) -> tuple[
+        list[tuple[datetime, int]], list[tuple[datetime, int, int, float]]
+    ]:
+        """Merge yesterday's UTC-day ring logs into the backfill series.
+
+        The ring keys its logs to UTC days, so a western user's daytime
+        samples land mostly in the *previous* UTC day's log, which today's
+        query alone can never reach. Requested only while a backfill
+        watermark still lags today's start (see
+        BackfillManager.async_pending_before). Best-effort: a query the ring
+        refuses (or times out on) just leaves that metric's series untouched,
+        never a failed poll.
+        """
+        if not include_previous_day:
+            return hr_entries, sport_bins
+        prev_day = date_utils.start_of_day(date_utils.now()) - timedelta(days=1)
+        try:
+            log = await conn.get_heart_rate_log(prev_day)
+            if isinstance(log, hr.HeartRateLog):
+                hr_entries = hr_entries + [
+                    (ts, bpm)
+                    for bpm, ts in log.heart_rates_with_times()
+                    if bpm > 0
+                ]
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Colmi ring %s did not answer previous-day heart-rate query",
+                self._ring_address,
+            )
+        try:
+            sport = await conn.get_steps(prev_day)
+            if isinstance(sport, list):
+                sport_bins = sport_bins + [
+                    (d.timestamp, d.steps, d.distance, d.calories / 1000)
+                    for d in sport
+                ]
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Colmi ring %s did not answer previous-day steps query",
+                self._ring_address,
+            )
+        return (
+            sorted(hr_entries, key=lambda row: row[0]),
+            sorted(sport_bins, key=lambda row: row[0]),
+        )
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
         """Read the ring's heart-rate logging settings."""

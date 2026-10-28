@@ -59,12 +59,21 @@ def _cumulative_sport_series(
 
     Matches the live sensors' ``TOTAL_INCREASING`` day-total semantics (calories
     rounded to whole kcal like the live sensor). Bins that do not change the
-    running total emit no row; the previous state implicitly continues.
+    running total emit no row; the previous state implicitly continues. The
+    running total resets at each UTC day boundary, so a series that mixes
+    yesterday's and today's bins (multi-day backfill) still reads as per-day
+    totals.
     """
     running = 0.0
     series: list[tuple[datetime, int]] = []
     last_value: int | None = None
+    last_day = None
     for row in bins:
+        day = row[0].date()
+        if day != last_day:
+            running = 0.0
+            last_value = None
+            last_day = day
         running += row[index]
         value = round(running)
         if value != last_value:
@@ -157,6 +166,30 @@ class BackfillManager:
                         for kind, ts in self._watermarks.items()
                     }
                 )
+
+    async def async_pending_before(
+        self, day_start: datetime, *, hr_enabled: bool, steps_enabled: bool
+    ) -> bool:
+        """True when an enabled metric's watermark still predates day_start.
+
+        The coordinator uses this to ask the API client for yesterday's
+        UTC-day ring log only while some enabled metric has a backlog older
+        than today's start: the ring keys its logs to UTC days, so a western
+        user's daytime samples land mostly in the *previous* UTC day and are
+        unreachable from today's log alone. Once every enabled watermark
+        catches up to today, the extra day of BLE traffic stops on its own.
+        """
+        if not hr_enabled and not steps_enabled:
+            return False
+        await self._async_ensure_loaded()
+        kinds = ["heart_rate"] if hr_enabled else []
+        if steps_enabled:
+            kinds.extend(_SPORT_INDEX)
+        return any(
+            self._watermarks.get(kind) is None
+            or self._watermarks[kind] < day_start
+            for kind in kinds
+        )
 
     async def _async_ensure_loaded(self) -> None:
         """Load persisted watermarks once (no imports until we know them)."""

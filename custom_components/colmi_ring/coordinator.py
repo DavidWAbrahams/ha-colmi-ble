@@ -12,6 +12,7 @@ from .api import (
     ColmiRingApiClientAuthenticationError,
     ColmiRingApiClientError,
 )
+from .colmi_codec import date_utils
 from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import (
     CONF_HR_BACKFILL,
@@ -61,10 +62,39 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             return True
         return live_ts >= logged_ts
 
+    async def _async_backfill_flags(self) -> tuple[bool, bool, bool]:
+        """(hr_enabled, steps_enabled, include_previous_day) for this poll.
+
+        Ask the API client for yesterday's UTC-day ring log only while some
+        enabled backfill watermark still lags today's start: the ring keys
+        its logs to UTC days, so e.g. a UTC-7 user's workday samples sit
+        mostly in the previous UTC day's log. Watermark dedup keeps the
+        extra BLE traffic cheap until things catch up.
+        """
+        hr_enabled = bool(self.config_entry.options.get(CONF_HR_BACKFILL, True))
+        steps_enabled = bool(
+            self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
+        )
+        include_previous_day = False
+        if self.backfill is not None:
+            include_previous_day = await self.backfill.async_pending_before(
+                date_utils.start_of_day(date_utils.now()),
+                hr_enabled=hr_enabled,
+                steps_enabled=steps_enabled,
+            )
+        return hr_enabled, steps_enabled, include_previous_day
+
     async def _async_update_data(self) -> Any:
         """Update data via library (merging persisted on-demand readings)."""
+        hr_enabled, steps_enabled, include_previous_day = (
+            await self._async_backfill_flags()
+        )
         try:
-            data = await self.config_entry.runtime_data.client.async_get_data()
+            data = (
+                await self.config_entry.runtime_data.client.async_get_data(
+                    include_previous_day=include_previous_day
+                )
+            )
         except ColmiRingApiClientAuthenticationError as exception:
             raise ConfigEntryAuthFailed(exception) from exception
         except ColmiRingApiClientError as exception:
@@ -105,13 +135,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         if self.backfill is not None:
             try:
                 await self.backfill.async_sync(
-                    data,
-                    hr_enabled=bool(
-                        self.config_entry.options.get(CONF_HR_BACKFILL, True)
-                    ),
-                    steps_enabled=bool(
-                        self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
-                    ),
+                    data, hr_enabled=hr_enabled, steps_enabled=steps_enabled
                 )
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring history backfill errored")
