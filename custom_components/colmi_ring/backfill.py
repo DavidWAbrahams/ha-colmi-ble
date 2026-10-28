@@ -99,7 +99,10 @@ class BackfillManager:
             return
         recorder = self._hass.services.async_services().get(RECORDER_DOMAIN)
         if not recorder or SERVICE_IMPORT_ENTITY_HISTORY not in recorder:
-            LOGGER.debug(
+            # INFO on purpose (diagnostic): if the graph has gaps and no
+            # "backfilled N rows" lines ever appear, this service being
+            # missing is the prime suspect.
+            LOGGER.info(
                 "Colmi backfill: %s.%s unavailable; skipping",
                 RECORDER_DOMAIN,
                 SERVICE_IMPORT_ENTITY_HISTORY,
@@ -165,7 +168,13 @@ class BackfillManager:
         if entity_id is None:
             # Entity not registered yet (e.g. first refresh before platform
             # setup); do not advance the watermark so the next poll retries.
-            LOGGER.debug("Colmi backfill: no entity for %s yet", kind)
+            # INFO (diagnostic): persistent lines here mean the entity
+            # registry lookup is wrong, so backfill never imports.
+            LOGGER.info(
+                "Colmi backfill: no sensor entity for %s yet; deferring %d rows",
+                kind,
+                len(pending),
+            )
             return False
         history = [
             {
@@ -186,8 +195,15 @@ class BackfillManager:
             LOGGER.exception("Colmi ring %s history backfill failed", kind)
             return False
         self._watermarks[kind] = pending[-1][0]
-        LOGGER.debug(
-            "Colmi ring backfilled %d %s history rows", len(history), kind
+        # INFO (diagnostic): these lines prove the import path is running;
+        # if they appear but the Lovelace graph stays empty, the rows are
+        # landing with wrong timestamps (timezone handling suspect).
+        LOGGER.info(
+            "Colmi ring backfilled %d %s history rows (%s .. %s)",
+            len(history),
+            kind,
+            pending[0][0],
+            pending[-1][0],
         )
         return True
 
