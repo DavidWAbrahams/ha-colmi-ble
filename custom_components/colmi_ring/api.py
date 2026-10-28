@@ -498,8 +498,12 @@ class ColmiRingApiClient:
 
             # Yesterday's ring logs extend the backfill time series only;
             # every live sensor value above stays strictly today-based.
-            hr_entries, sport_bins = await self._async_extend_previous_day(
-                conn, include_previous_day, hr_entries, sport_bins
+            # ``prev_day`` reports which earlier day was answered this poll so
+            # the backfill manager can stop asking for it (see async_sync).
+            hr_entries, sport_bins, prev_day = (
+                await self._async_extend_previous_day(
+                    conn, include_previous_day, hr_entries, sport_bins
+                )
             )
 
         return {
@@ -514,6 +518,9 @@ class ColmiRingApiClient:
             "calories": calories_total,
             "hr_entries": hr_entries,
             "sport_bins": sport_bins,
+            # ISO date of a previous-day log query the ring ANSWERED this
+            # poll (None when not requested or not answered).
+            "prev_day": prev_day,
         }
 
     async def _async_extend_previous_day(
@@ -523,24 +530,32 @@ class ColmiRingApiClient:
         hr_entries: list[tuple[datetime, int]],
         sport_bins: list[tuple[datetime, int, int, float]],
     ) -> tuple[
-        list[tuple[datetime, int]], list[tuple[datetime, int, int, float]]
+        list[tuple[datetime, int]],
+        list[tuple[datetime, int, int, float]],
+        str | None,
     ]:
         """Merge yesterday's UTC-day ring logs into the backfill series.
 
         The ring keys its logs to UTC days, so a western user's daytime
         samples land mostly in the *previous* UTC day's log, which today's
-        query alone can never reach. Requested only while a backfill
-        watermark still lags today's start (see
-        BackfillManager.async_pending_before). Best-effort: a query the ring
-        refuses (or times out on) just leaves that metric's series untouched,
-        never a failed poll.
+        query alone can never reach. Requested only until the backfill
+        manager records that day as fetched-and-imported (see
+        BackfillManager.async_needs_day / async_sync retry_day).
+        Best-effort: a query the ring refuses (or times out on) just leaves
+        that metric's series untouched, never a failed poll.
+
+        Returns the merged series plus the ISO date of a day whose HR log the
+        ring actually ANSWERED (None when not requested or answered with no
+        data), so the manager only stops asking once, not on refusals.
         """
         if not include_previous_day:
-            return hr_entries, sport_bins
+            return hr_entries, sport_bins, None
         prev_day = date_utils.start_of_day(date_utils.now()) - timedelta(days=1)
+        answered: str | None = None
         try:
             log = await conn.get_heart_rate_log(prev_day)
             if isinstance(log, hr.HeartRateLog):
+                answered = prev_day.date().isoformat()
                 hr_entries = hr_entries + [
                     (ts, bpm)
                     for bpm, ts in log.heart_rates_with_times()
@@ -566,6 +581,7 @@ class ColmiRingApiClient:
         return (
             sorted(hr_entries, key=lambda row: row[0]),
             sorted(sport_bins, key=lambda row: row[0]),
+            answered,
         )
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:

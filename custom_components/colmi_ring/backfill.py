@@ -21,7 +21,7 @@ backfill is gated behind an experimental option (see plans/hr-backfill-plan.md).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.helpers import entity_registry as er
@@ -35,6 +35,13 @@ if TYPE_CHECKING:
     from homeassistant.components.recorder.core import Recorder
     from homeassistant.core import HomeAssistant
 
+# Persisted as {kind: {"wm": iso, "scanned": [iso days]}}. Older installs
+# saved a bare {kind: iso}; the loader accepts both. The version is kept at 1
+# on purpose: bumping it would make Store.async_load() drop the existing file
+# (no MIGRATIONS), resetting watermarks and re-importing a day of duplicates.
+# "scanned" records UTC days whose ring log was already fetched and imported,
+# so rows that surface *below* the (mostly today-based) watermark from an
+# older day are still trusted, and the previous-day fetch happens once per day.
 STORAGE_VERSION = 1
 
 # Backfill kinds mapped to the sensor unique id they import into. The heart
@@ -96,6 +103,9 @@ class BackfillManager:
             f"{DOMAIN}_backfill_{entry_id}",
         )
         self._watermarks: dict[str, datetime] = {}
+        # ISO dates (YYYY-MM-DD) of UTC days whose ring log was already
+        # fetched and imported (see async_sync retry_day).
+        self._scanned: set[str] = set()
         self._loaded = False
         self._lock = asyncio.Lock()
         self._gates_logged = False
@@ -106,6 +116,7 @@ class BackfillManager:
         *,
         hr_enabled: bool,
         steps_enabled: bool,
+        retry_day: str | None = None,
     ) -> None:
         """Import any backlog from this poll's ring logs for enabled metrics."""
         # DIAGNOSTIC (one-shot): proves the new backfill.py is deployed and
@@ -147,82 +158,141 @@ class BackfillManager:
             return
         async with self._lock:
             await self._async_ensure_loaded()
-            changed = False
+            kind_results: dict[str, tuple[bool, bool]] = {}
             if hr_enabled:
-                changed |= await self._async_sync_kind(
-                    recorder, "heart_rate", hr_entries
+                kind_results["heart_rate"] = await self._async_sync_kind(
+                    recorder,
+                    "heart_rate",
+                    hr_entries,
+                    retry_day=retry_day,
                 )
             if steps_enabled and sport_bins:
                 for kind, index in _SPORT_INDEX.items():
-                    changed |= await self._async_sync_kind(
+                    kind_results[kind] = await self._async_sync_kind(
                         recorder,
                         kind,
                         _cumulative_sport_series(sport_bins, index),
+                        retry_day=retry_day,
                     )
+            changed = any(ok for ok, _ in kind_results.values())
+            if retry_day is not None:
+                deferred = [
+                    kind
+                    for kind, (imported, had_day) in kind_results.items()
+                    if had_day and not imported
+                ]
+                if deferred:
+                    # Import failed or was deferred (entity not registered
+                    # yet): keep re-fetching the day so its samples are not
+                    # lost below the today-based watermark.
+                    LOGGER.warning(
+                        "Colmi backfill: %s log fetched but import deferred "
+                        "for %s; will re-fetch next poll",
+                        retry_day,
+                        deferred,
+                    )
+                else:
+                    # Fetched and handled (imported, or the day was empty):
+                    # never fetch this day again. The watermark alone cannot
+                    # decide this - it sits at *today's* latest sample, above
+                    # the whole older day, which previously let its rows be
+                    # filtered out as "already imported" though they never
+                    # were.
+                    self._scanned.add(retry_day)
+                    # Bound growth: only recent days can ever be re-asked.
+                    cutoff = (
+                        datetime.now(tz=timezone.utc) - timedelta(days=8)
+                    ).date().isoformat()
+                    self._scanned = {d for d in self._scanned if d >= cutoff}
+                    changed = True
             if changed:
                 await self._store.async_save(
                     {
-                        kind: ts.isoformat()
+                        kind: {"wm": ts.isoformat(), "scanned": self._scanned}
                         for kind, ts in self._watermarks.items()
                     }
                 )
 
-    async def async_pending_before(
-        self, day_start: datetime, *, hr_enabled: bool, steps_enabled: bool
+    async def async_needs_day(
+        self, day: str, *, hr_enabled: bool, steps_enabled: bool
     ) -> bool:
-        """True when an enabled metric's watermark still predates day_start.
+        """True until ``day``'s ring log has been fetched and imported once.
 
-        The coordinator uses this to ask the API client for yesterday's
-        UTC-day ring log only while some enabled metric has a backlog older
-        than today's start: the ring keys its logs to UTC days, so a western
+        The coordinator uses this to ask the API client for the previous
+        UTC-day ring log: the ring keys its logs to UTC days, so a western
         user's daytime samples land mostly in the *previous* UTC day and are
-        unreachable from today's log alone. Once every enabled watermark
-        catches up to today, the extra day of BLE traffic stops on its own.
+        unreachable from today's log alone - and those rows sort below the
+        (today-based) watermark, so the watermark can never surface them.
+        The day is marked scanned in async_sync once handled; if the import
+        was deferred it stays unscanned and gets re-fetched next poll.
         """
         if not hr_enabled and not steps_enabled:
             return False
         await self._async_ensure_loaded()
-        kinds = ["heart_rate"] if hr_enabled else []
-        if steps_enabled:
-            kinds.extend(_SPORT_INDEX)
-        return any(
-            self._watermarks.get(kind) is None
-            or self._watermarks[kind] < day_start
-            for kind in kinds
-        )
+        return day not in self._scanned
 
     async def _async_ensure_loaded(self) -> None:
         """Load persisted watermarks once (no imports until we know them)."""
         if self._loaded:
             return
         saved = await self._store.async_load() or {}
-        self._watermarks = {
-            kind: datetime.fromisoformat(ts) for kind, ts in saved.items()
-        }
+        watermarks: dict[str, datetime] = {}
+        for kind, raw in saved.items():
+            if isinstance(raw, str):  # v1: bare watermark timestamp
+                watermarks[kind] = datetime.fromisoformat(raw)
+            elif isinstance(raw, dict) and raw.get("wm"):
+                watermarks[kind] = datetime.fromisoformat(raw["wm"])
+                self._scanned.update(raw.get("scanned") or [])
+        self._watermarks = watermarks
         self._loaded = True
 
     async def _async_sync_kind(
-        self, recorder: Recorder, kind: str, series: list[tuple[datetime, Any]]
-    ) -> bool:
-        """Import one sensor's backlog; return True if its watermark advanced.
+        self,
+        recorder: Recorder,
+        kind: str,
+        series: list[tuple[datetime, Any]],
+        retry_day: str | None = None,
+    ) -> tuple[bool, bool]:
+        """Import one sensor's backlog.
+
+        Returns ``(imported, had_retry_day_rows)``: whether any rows were
+        inserted, and whether the raw series carried rows for the freshly
+        fetched earlier day (so the caller only treats a failed import of
+        that day as a reason to re-fetch).
 
         The newest sample is left out: it is (or will be) the live sensor state
         and flows through the normal state machine. Once a newer sample
         supersedes it, the next poll imports it as part of the backlog.
         """
+        had_day = retry_day is not None and any(
+            ts.date().isoformat() == retry_day for ts, _ in series
+        )
         watermark = self._watermarks.get(kind)
+        # Drop whole UTC days already fetched-and-imported. The watermark
+        # alone cannot be trusted for older days: it sits at the newest
+        # imported sample (i.e. *today's*), so a previously unreachable
+        # earlier day's rows all sort below it and would be discarded as
+        # "already imported" when they never were.
         filtered = [
             (ts, value)
             for ts, value in series
-            if watermark is None or ts > watermark
+            if ts.date().isoformat() not in self._scanned
         ]
+        # Within (today's) not-yet-scanned rows, the watermark filters what the
+        # state machine or an earlier import already recorded.
+        if watermark is not None:
+            filtered = [
+                (ts, value)
+                for ts, value in filtered
+                if ts.date() != watermark.date() or ts > watermark
+            ]
         # The newest sample flows through the live sensor, so import everything
         # before it: each imported row runs from its sample time until the next
         # sample's time, the last one ending exactly where the live newest row
         # begins (no overlap with states the state machine already recorded).
         pending = filtered[:-1]
         if not pending:
-            return False
+            return False, had_day
         entity_id = self._async_entity_id(kind)
         if entity_id is None:
             # Entity not registered yet (e.g. first refresh before platform
@@ -234,7 +304,7 @@ class BackfillManager:
                 kind,
                 len(pending),
             )
-            return False
+            return False, had_day
         # Row end time is the next sample's time (filtered[i + 1]) so imported
         # rows tile up to where the live newest row begins, without overlap.
         rows = [
@@ -245,8 +315,10 @@ class BackfillManager:
             inserted = await self._async_import_history(recorder, entity_id, rows)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Colmi ring %s history backfill failed", kind)
-            return False
-        self._watermarks[kind] = pending[-1][0]
+            return False, had_day
+        new_wm = pending[-1][0]
+        if watermark is None or new_wm > watermark:
+            self._watermarks[kind] = new_wm
         # WARNING (diagnostic): these lines prove the import path is running;
         # if they appear but the Lovelace graph stays empty, the rows are
         # landing with wrong timestamps (timezone handling suspect).
@@ -257,7 +329,7 @@ class BackfillManager:
             pending[0][0],
             pending[-1][0],
         )
-        return True
+        return True, had_day
 
     async def _async_import_history(
         self,
