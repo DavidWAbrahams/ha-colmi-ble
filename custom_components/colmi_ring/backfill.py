@@ -345,7 +345,7 @@ class BackfillManager:
         state recorded before the backlog, then insert the imported rows in
         chronological order. Returns the number of rows inserted.
         """
-        from sqlalchemy import select  # noqa: PLC0415
+        from sqlalchemy import select, update  # noqa: PLC0415
 
         from homeassistant.components.recorder.db_schema import (  # noqa: PLC0415
             States,
@@ -369,6 +369,31 @@ class BackfillManager:
                     session.add(meta)
                     session.flush()
                     metadata_id = meta.metadata_id
+
+                # Reuse the attributes blob from the entity's newest
+                # state-machine row so imported states carry the same
+                # unit_of_measurement/device_class; rows without attributes
+                # make the block processor see a None unit and warn
+                # "unit is changing", suppressing long-term statistics.
+                attributes_id = session.execute(
+                    select(States.attributes_id)
+                    .where(
+                        States.metadata_id == metadata_id,
+                        States.attributes_id.is_not(None),
+                    )
+                    .order_by(States.last_updated_ts.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if attributes_id is not None:
+                    # Repair any rows a previous import left attribute-less.
+                    session.execute(
+                        update(States)
+                        .where(
+                            States.metadata_id == metadata_id,
+                            States.attributes_id.is_(None),
+                        )
+                        .values(attributes_id=attributes_id)
+                    )
 
                 # Continue the old_state_id chain from whatever the state
                 # machine recorded just before our first imported row.
@@ -394,7 +419,7 @@ class BackfillManager:
                         last_updated_ts=stamp,
                         last_reported_ts=stamp,
                         old_state_id=old_state_id,
-                        attributes_id=None,
+                        attributes_id=attributes_id,
                         metadata_id=metadata_id,
                     )
                     session.add(row)
