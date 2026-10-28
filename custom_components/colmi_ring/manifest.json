@@ -13,6 +13,9 @@
   "dependencies": [
     "bluetooth_adapters"
   ],
+  "after_dependencies": [
+    "recorder"
+  ],
   "requirements": [
     "bleak-retry-connector>=4.7.1"
   ],

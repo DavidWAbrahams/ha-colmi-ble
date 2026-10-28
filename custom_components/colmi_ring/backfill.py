@@ -2,11 +2,13 @@
 
 The ring keeps logging heart rate (5-min slots) and activity (15-min bins)
 while it is out of Bluetooth range. HA cannot attach historical timestamps to
-new state-machine events, but the recorder's ``import_entity_history`` service
-(the same one HA's own restore/migration flows use) bulk-inserts ``states``
-rows with arbitrary past timestamps. Each poll we diff the ring's day log
-against a persisted per-entity watermark and import only the backlog, so the
-history graph shows the off-ring samples at their true times.
+new state-machine events, and Home Assistant exposes NO service for adding
+historical states (``recorder.import_entity_history`` does not exist in any
+released HA version), so we bulk-insert ``states`` rows directly through the
+recorder's own DB session, running in the recorder's executor thread. Each
+poll we diff the ring's day log against a persisted per-entity watermark and
+import only the backlog, so the history graph shows the off-ring samples at
+their true times.
 
 Heart rate (``MEASUREMENT``) backfill is safe at both the raw-history and
 statistics layers. The steps-family sensors are ``TOTAL_INCREASING``:
@@ -23,16 +25,17 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.recorder import get_instance, session_scope
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, LOGGER
 
 if TYPE_CHECKING:
+    from homeassistant.components.recorder.core import Recorder
     from homeassistant.core import HomeAssistant
 
 STORAGE_VERSION = 1
-RECORDER_DOMAIN = "recorder"
-SERVICE_IMPORT_ENTITY_HISTORY = "import_entity_history"
 
 # Backfill kinds mapped to the sensor unique id they import into. The heart
 # rate sensor historically registered with the bare entry id (see sensor.py);
@@ -113,16 +116,13 @@ class BackfillManager:
         if not hr_enabled and not steps_enabled:
             LOGGER.warning("Colmi backfill: both metrics disabled; skipping")
             return
-        recorder = self._hass.services.async_services().get(RECORDER_DOMAIN)
-        if not recorder or SERVICE_IMPORT_ENTITY_HISTORY not in recorder:
-            # INFO on purpose (diagnostic): if the graph has gaps and no
-            # "backfilled N rows" lines ever appear, this service being
-            # missing is the prime suspect.
-            LOGGER.warning(
-                "Colmi backfill: %s.%s unavailable; skipping",
-                RECORDER_DOMAIN,
-                SERVICE_IMPORT_ENTITY_HISTORY,
-            )
+        try:
+            recorder = get_instance(self._hass)
+        except (KeyError, RuntimeError):
+            # Recorder not set up (hass.data key missing) or unavailable:
+            # nowhere to import history into. Watermarks stay put so the
+            # backlog imports once the recorder is up.
+            LOGGER.warning("Colmi backfill: recorder unavailable; skipping")
             return
         hr_entries = data.get("hr_entries") or []
         sport_bins = data.get("sport_bins") or []
@@ -140,11 +140,15 @@ class BackfillManager:
             await self._async_ensure_loaded()
             changed = False
             if hr_enabled:
-                changed |= await self._async_sync_kind("heart_rate", hr_entries)
+                changed |= await self._async_sync_kind(
+                    recorder, "heart_rate", hr_entries
+                )
             if steps_enabled and sport_bins:
                 for kind, index in _SPORT_INDEX.items():
                     changed |= await self._async_sync_kind(
-                        kind, _cumulative_sport_series(sport_bins, index)
+                        recorder,
+                        kind,
+                        _cumulative_sport_series(sport_bins, index),
                     )
             if changed:
                 await self._store.async_save(
@@ -165,7 +169,7 @@ class BackfillManager:
         self._loaded = True
 
     async def _async_sync_kind(
-        self, kind: str, series: list[tuple[datetime, Any]]
+        self, recorder: Recorder, kind: str, series: list[tuple[datetime, Any]]
     ) -> bool:
         """Import one sensor's backlog; return True if its watermark advanced.
 
@@ -198,21 +202,14 @@ class BackfillManager:
                 len(pending),
             )
             return False
-        history = [
-            {
-                "state": str(value),
-                "start": ts,
-                "end": filtered[i + 1][0],
-            }
+        # Row end time is the next sample's time (filtered[i + 1]) so imported
+        # rows tile up to where the live newest row begins, without overlap.
+        rows = [
+            (ts, filtered[i + 1][0], str(value))
             for i, (ts, value) in enumerate(pending)
         ]
         try:
-            await self._hass.services.async_call(
-                RECORDER_DOMAIN,
-                SERVICE_IMPORT_ENTITY_HISTORY,
-                {"entity_id": entity_id, "history": history},
-                blocking=True,
-            )
+            inserted = await self._async_import_history(recorder, entity_id, rows)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Colmi ring %s history backfill failed", kind)
             return False
@@ -222,12 +219,86 @@ class BackfillManager:
         # landing with wrong timestamps (timezone handling suspect).
         LOGGER.warning(
             "Colmi ring backfilled %d %s history rows (%s .. %s)",
-            len(history),
+            inserted,
             kind,
             pending[0][0],
             pending[-1][0],
         )
         return True
+
+    async def _async_import_history(
+        self,
+        recorder: Recorder,
+        entity_id: str,
+        rows: list[tuple[datetime, datetime, str]],
+    ) -> int:
+        """Bulk-insert ``states`` rows for one entity, in the recorder thread.
+
+        Runs entirely inside the recorder's own executor with its own session,
+        mirroring how the recorder commits states itself: resolve (or create)
+        the entity's ``states_meta`` row, chain ``old_state_id`` from the last
+        state recorded before the backlog, then insert the imported rows in
+        chronological order. Returns the number of rows inserted.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from homeassistant.components.recorder.db_schema import (  # noqa: PLC0415
+            States,
+            StatesMeta,
+        )
+
+        def _import() -> int:
+            def _ts(value: datetime) -> float:
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=dt_util.get_default_time_zone())
+                return value.timestamp()
+
+            with session_scope(session=recorder.get_session()) as session:
+                metadata_id = session.execute(
+                    select(StatesMeta.metadata_id).where(
+                        StatesMeta.entity_id == entity_id
+                    )
+                ).scalar_one_or_none()
+                if metadata_id is None:
+                    meta = StatesMeta(entity_id=entity_id)
+                    session.add(meta)
+                    session.flush()
+                    metadata_id = meta.metadata_id
+
+                # Continue the old_state_id chain from whatever the state
+                # machine recorded just before our first imported row.
+                old_state_id = session.execute(
+                    select(States.state_id)
+                    .where(
+                        States.metadata_id == metadata_id,
+                        States.last_updated_ts < _ts(rows[0][0]),
+                    )
+                    .order_by(States.last_updated_ts.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+
+                inserted = 0
+                for start, _end, state in rows:
+                    stamp = _ts(start)
+                    # entity_id/attributes are legacy unused columns since
+                    # schema 31+; the entity is identified via metadata_id
+                    # and attributes_id=None means "no attributes".
+                    row = States(
+                        state=state,
+                        last_changed_ts=stamp,
+                        last_updated_ts=stamp,
+                        last_reported_ts=stamp,
+                        old_state_id=old_state_id,
+                        attributes_id=None,
+                        metadata_id=metadata_id,
+                    )
+                    session.add(row)
+                    session.flush()  # populates row.state_id
+                    old_state_id = row.state_id  # chain within the batch
+                    inserted += 1
+                return inserted
+
+        return await recorder.async_add_executor_job(_import)
 
     def _async_entity_id(self, kind: str) -> str | None:
         """Resolve the sensor entity id registered for one backfill kind."""

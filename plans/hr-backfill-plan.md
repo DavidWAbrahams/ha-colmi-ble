@@ -13,10 +13,16 @@ logs but keeps only the most recent values:
   only the day sums are kept.
 
 HA cannot attach historical timestamps to state-machine events — states are always
-recorded at write time. **But** the recorder offers
-[`recorder.import_entity_history`](https://developers.home-assistant.io/docs/core/components/recorder),
-the service HA's own restore flows use to insert historical `states` rows with arbitrary
-past timestamps. This is the supported way to log "old" readings.
+recorded at write time.
+
+> **Correction (2026-10-28, implementation phase):** this plan originally relied on a
+> `recorder.import_entity_history` service. **It does not exist** in any released HA
+> version (verified against `homeassistant/components/recorder/services.yaml` at
+> 2024.7 / 2025.1 / 2025.7 / dev). The shipped implementation instead bulk-inserts
+> `states` rows directly via `homeassistant.helpers.recorder.get_instance()` +
+> `session_scope()` inside the recorder's own executor job (schema-53 columns:
+> `metadata_id`, `last_changed_ts`/`last_updated_ts` epoch floats, `old_state_id`
+> chain). Treat every `import_entity_history` mention below as "direct states insert".
 
 ## Approach
 

@@ -17,7 +17,7 @@ CONF_POLL_MAX_INTERVAL = "poll_max_interval"
 DEFAULT_POLL_MAX_INTERVAL = 30
 
 # Import heart-rate samples recorded while out of BLE range into HA history
-# (recorder.import_entity_history). Safe for the MEASUREMENT state class.
+# (direct recorder states insert). Safe for the MEASUREMENT state class.
 CONF_HR_BACKFILL = "hr_backfill"
 
 # Experimental: same treatment for the steps/distance/calories sensors, whose
