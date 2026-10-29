@@ -3,11 +3,12 @@
 Protocol reference: ``mrfloydst/smartringmidi`` ``bluetooth.html``, whose axis
 bit-packing is itself derived from ``atc1441/ATC_RF03_Ring``.
 
-Several details below are best-guess extrapolations from that single reference
-rather than things confirmed against our R02 firmware; they are deliberately
-isolated in this module (and in the ``MOTION_*`` constants in ``const.py``) so
-that the Phase 0 probe (:mod:`scripts/_accel_probe.py`) can correct them in one
-place without touching the detector or the Home Assistant surface:
+Two different kinds of assumption live here, and it is worth telling them apart.
+
+*Agrees with the reference.* The frame layouts and the decode below were compared
+against a literal transcription of the reference's JavaScript - command bytes and
+checksum, and the axis decode over the whole 12-bit space - with no mismatches.
+:mod:`scripts._motion_ref_parity` re-checks that in a second, without a ring:
 
 * RAW mode is enabled with ``A1 04 04`` and disabled with ``A1 02``.
 * A position notification is identified by ``packet[1] == 3``.
@@ -15,8 +16,18 @@ place without touching the detector or the Home Assistant surface:
   order **Y, Z, X**, with the low bits in the *low* nibble of the next byte.
 * The range is +/-4 g, so ``g = (raw / 2048) * 4``.
 * The ring's on-device "camera button" gesture is enabled with ``02 04`` and
-  disabled with ``02 06``; when it fires it announces itself on command byte
-  ``0x02``.
+  disabled with ``02 06``.
+
+*Unverified on our R02.* Parity with a web demo for a different ring is not the
+same as the R02 firmware agreeing, and two things go beyond anything the
+reference states: which ``packet[1]`` values are a camera-gesture *report* (see
+:data:`GESTURE_REPORT_TYPES`), and whether accel data really arrives on
+``CMD_RAW_MODE`` at all - the reference classifies notifications by ``packet[1]``
+alone and listens to every notifiable characteristic, so it never commits to a
+command byte. Those are the Phase 0 probe's to settle (:mod:`scripts._accel_probe`),
+and they are deliberately isolated in this module and in the ``MOTION_*``
+constants in ``const.py`` so a correction lands in one place without touching the
+detector or the Home Assistant surface.
 
 Like the rest of this subpackage this module is pure: no Home Assistant, no
 Bluetooth, no allocation on the hot path beyond the sample dataclass.

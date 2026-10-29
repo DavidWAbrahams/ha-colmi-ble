@@ -44,9 +44,11 @@ gestures: a **clap**, a **rapid hand raise**, and a **rapid hand lower**.
 
 Enable it in the integration's options ("Enable gesture detection"). That adds:
 
-- a `Motion Stream` switch, and
+- a `Motion Stream` switch,
 - three event entities - `Clap`, `Hand Raise`, `Hand Lower` - you can use directly as automation
-  triggers.
+  triggers, and
+- four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
+  `Acceleration` (the magnitude) - see below.
 
 There is also a single `colmi_ring_gesture` event that carries every gesture, so one trigger can
 catch all three and inspect what happened:
@@ -89,6 +91,36 @@ from that means the packet decode itself is wrong rather than the tuning being o
 warning. Turning on "Log every accelerometer sample to the debug log" in the options shows what your
 wrist is actually producing, which is the fastest way to tell a wrong guess from a threshold that
 needs moving.
+
+## Watching the raw accelerometer data
+
+While the `Motion Stream` switch is on, the ring's raw accelerometer readings are also published as
+four sensors, all in units of `g` and in the ring's own axis frame:
+
+| Sensor | Value |
+| --- | --- |
+| `sensor.<ring>_acceleration_x` | X axis, as the ring reports it |
+| `sensor.<ring>_acceleration_y` | Y axis, as the ring reports it |
+| `sensor.<ring>_acceleration_z` | Z axis, as the ring reports it |
+| `sensor.<ring>_acceleration` | `sqrt(x^2 + y^2 + z^2)` |
+
+These are deliberately *unprocessed*: no low-pass filter, no gravity removal, no tilt or orientation
+solving. At rest you should see roughly `1.0 g` on whichever axis happens to point up and near `0` on
+the other two; a magnitude near `1.0 g` while still is also the sanity check that the packet decode is
+right for this firmware. Which axis is up depends on how the ring sits on your finger, so if you want a
+"hand is raised" style condition, prefer the gesture events over picking axes by hand.
+
+The decode matches the published reference for this ring (the Colmi R02 MIDI demo and the
+[ATC_RF03_Ring](https://github.com/atc1441/ATC_RF03_Ring) work it is derived from), which its own
+page credits for the bit-packing and the ±4 g scale. Note that demo displays *angles* on X/Y/Z rather
+than acceleration, so its numbers are not directly comparable to these sensors; the axes themselves do
+correspond.
+
+They read `unknown` whenever the stream is off, because that is the truth: the accelerometer is only
+reporting while the connection is open with streaming on. Updates are published about once a second
+rather than at the full stream rate (tens of Hz) - every state change is a recorder row, and a hundred
+rows a second per sensor would swamp your database. Automations that need the sharp signal should use
+the gesture events; the full-rate data is what the "Log every accelerometer sample" debug option dumps.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

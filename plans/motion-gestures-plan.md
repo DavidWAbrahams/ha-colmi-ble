@@ -14,22 +14,50 @@ Protocol source: [`mrfloydst/smartringmidi bluetooth.html`](https://github.com/m
 
 Phases 1-4 are implemented and validated offline; **Phase 0 was deliberately deferred** on the
 user's instruction to implement against best guesses and correct the false ones later. Every guess
-therefore sits in a named constant or a single documented assumption:
+therefore sits in a named constant or a single documented assumption.
+
+The assumptions split into two kinds, and the difference matters for what the ring run can teach us:
+
+**Confirmed against the reference implementation.** The demo's JavaScript was transcribed literally
+and compared with our Python - command frames byte-for-byte including the checksum, and the axis
+decode over edge cases plus 200k random packets - with zero mismatches. This is what
+[`scripts/_motion_ref_parity.py`](../scripts/_motion_ref_parity.py) re-checks in a second, no ring
+required:
+
+| Definition | Parity with the reference |
+|---|---|
+| RAW on = `A1 04 04` (checksum `A9`), off = `A1 02` (`A3`) | byte-identical |
+| camera gesture `02 04` / `02 06` | byte-identical |
+| 12-bit axes in wire order **Y, Z, X**, low bits in the **low** nibble of the next byte | identical over 200k packets |
+| 12-bit two's-complement sign extension | identical |
+| +/-4 g over 12 bits (`g = raw / 2048 * 4`) | identical |
+| `packet[1] == 3` marks position data | same gate |
+
+**Still unproven, and only the ring can settle these:**
 
 | Assumption | Where it lives | If wrong |
 |---|---|---|
-| RAW on = `A1 04 04`, off = `A1 02` | `colmi_codec/motion.py` | the switch never opens a stream |
-| position packets are `packet[1] == 3` | `colmi_codec/motion.py` | no samples are ever decoded |
-| 12-bit axes in wire order **Y, Z, X**, low bits in the **low** nibble of the next byte | `colmi_codec/motion.py::_axis` | rest magnitude is nowhere near 1 g |
-| +/-4 g over 12 bits (`g = raw / 2048 * 4`) | `colmi_codec/motion.py` | every threshold is off by a constant factor |
-| camera gesture `02 04` / `02 06` | `colmi_codec/motion.py`, used by `motion_manager` | claps come only from the stream |
+| the R02 *answers* `A1 04 04` at all, and **which command byte it reports accel on** | `CMD_RAW_MODE` in `colmi_codec/motion.py` | no samples arrive; see the note below on how we would see this |
+| position packets are `packet[1] == 3` **on the R02** | `colmi_codec/motion.py` | no samples are ever decoded |
+| which `packet[1]` values are the camera gesture *reporting* (as opposed to our own enable command being echoed back) | `GESTURE_REPORT_TYPES` | phantom claps at session start, or none at all |
 | the stream's real sample rate | `MOTION_MIN_HZ_FOR_STREAM_CLAP` | the stream clap is wrongly enabled/disabled |
 | which axis is vertical, and its sign | `gestures.py` (gravity-relative by construction) | raise and lower swap |
 
+Note the asymmetry in the first row: the reference classifies a notification **only** by `value[1]`
+and attaches its listener to *every* notifiable characteristic, so it never asserts that position
+data arrives on `0xA1`. We do - [`_handle_tx`](../custom_components/colmi_ring/api.py) dispatches by
+`packet[0]`, and the motion session subscribes to `0xA1` and `0x02` only. If the R02 serves accel on
+another command byte, the packets are dropped in `api.py` before reaching `MotionManager`, and the
+evidence is the DEBUG-only "Unexpected packet type *N* (0x*NN*) … *payload*" line rather than the
+manager's own "unknown stream packet" line. So for the ring run, enable DEBUG on both
+`custom_components.colmi_ring.api` and `.motion_manager`; a byte that shows up repeatedly at
+stream-rate while streaming is the real command byte. If that happens the fix is one constant - or a
+catch-all listener for the duration of a session.
+
 A pleasant consequence of projecting onto the *estimated gravity vector* instead of picking a
 "vertical axis" by name: raise-vs-lower is correct for **any** axis mapping, since it only depends
-on the sign of the component along gravity. Only the wire-order/nibble/scale guesses can break the
-detector wholesale, and the probe will show that immediately (rest magnitude ~1 g or not).
+on the sign of the component along gravity. Only the scale/nibble assumptions can break the
+detector wholesale, and those are now the part the reference confirms.
 
 ---
 
@@ -138,6 +166,10 @@ Deliverables: confirmed constants, decode function, measured Hz, and the clap so
 - Validation is `scripts/_motion_replay.py` (see Phase 5) rather than a separate decode script:
   it replays either a synthetic stream or a captured one through this parser, so the ~1 g-at-rest
   and raise-sign assertions run against the same code path the integration uses.
+- `scripts/_motion_ref_parity.py` checks this module against the reference web app itself (command
+  frames + checksum, and the decode over 200k random packets). It needs no ring, so it is the check
+  to run after *any* edit to this file; it currently passes with zero mismatches, which is why the
+  **Status** table lists the decode as confirmed rather than assumed.
 
 ## Phase 2 - Transport: fan-out listener + long-lived shared session ✅ built
 
@@ -284,6 +316,20 @@ one continuous connection, not to the integration's uptime.
   `entity_category=CONFIG` (it is an operational toggle automations may call). A connect failure is
   not raised from `async_turn_on` - the client returns, the manager clears the flag, and the log
   gets one warning.
+- **Accelerometer sensors** ([`sensor.py`](../custom_components/colmi_ring/sensor.py), same
+  `CONF_MOTION_ENABLED` gate) - four `SensorEntity`s that mirror the raw sample instead of
+  interpreting it: `Acceleration X`, `Acceleration Y`, `Acceleration Z` (unique ids
+  `{entry_id}_accel_{x,y,z}`) plus `Acceleration` = the vector magnitude, all in `g` with
+  `suggested_display_precision: 3`. No device class / unit enum on purpose: the codec's unit really is
+  just `g`, and `SensorDeviceClass.ACCELERATION` is newer than the oldest core this integration has run
+  on, so importing it would risk taking the *whole* sensor platform down for a cosmetic win.
+  Push-driven, not polled: `MotionManager.last_sample` holds the newest `AccelSample`, and
+  `add_sample_listener` callbacks tell the entities to re-read it, so the same callback also serves the
+  sample *going away* (`_set_streaming(False)` clears it) - the sensors read `unknown` between sessions
+  rather than freezing on a stale reading. Publishing is throttled to `MOTION_SENSOR_UPDATE_S` (1 s),
+  because the stream runs at tens of Hz and every state change is a recorder row; the detector still
+  sees every sample, and the full-rate signal remains available via the gesture events and
+  `motion_log_samples`.
 - **Stream-state plumbing** - `MotionManager` is **always constructed** in
   [`__init__.py`](../custom_components/colmi_ring/__init__.py) next to `BackfillManager` and stored
   on `runtime_data` *and* on the coordinator, because the coordinator has to be able to ask whether
@@ -352,9 +398,24 @@ sensitivity scaling from the orientation test.
 - The rate probe reports the measured Hz *and* the median at-rest magnitude, confirming or replacing
   `MOTION_MIN_HZ_FOR_STREAM_CLAP` and the +/-4 g scale; **measure and record battery drain per
   streaming hour here**.
+- The four accelerometer sensors move about once a second while streaming, sit near `1.0 g` on the
+  "up" axis at rest, and return to `unknown` when the switch turns off. If they show a constant
+  nonsense value while streaming, the decode is wrong (same failure as the magnitude probe), not the
+  sensor plumbing. Also check the recorder's growth rate while streaming to confirm 1 s is a sane
+  publish cadence.
 - Confirm the post-stream poll re-imports nothing twice (the scanned-days set is idempotent).
 - Then fix/extend `scripts/_accel_probe.py` and correct whatever it disproves, in `const.py` and in
   the **Status** table above.
+
+#### Before the next on-device run
+
+- Enable DEBUG on `custom_components.colmi_ring.api` **as well as** `.motion_manager`. The command
+  byte is decided in `api.py::_handle_tx`, so if the R02 serves accel somewhere other than `0xA1`
+  the proof is api's "Unexpected packet type" line (which now carries the hex byte and full payload),
+  and it is invisible at INFO. One session with the logger on settles the only assumption in
+  `colmi_codec/motion.py` that the reference app could not confirm.
+- Run `python scripts/_motion_ref_parity.py` first: it takes a second, and if it fails then the
+  decode has drifted from the reference and no ring result should be interpreted until it passes.
 
 #### First on-device run (2026-10-29, firmware as-shipped, via the ESP32-C3 proxy)
 
