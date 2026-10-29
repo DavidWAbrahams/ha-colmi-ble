@@ -37,6 +37,7 @@ from .const import (
     CONF_MOTION_STREAM_TIMEOUT,
     DEFAULT_GESTURE_SENSITIVITY,
     DEFAULT_MOTION_STREAM_TIMEOUT,
+    ENABLE_RING_CAMERA_GESTURE,
     GESTURE_EVENT_TYPE,
     GESTURE_SENSITIVITY_SCALE,
     LOGGER,
@@ -255,6 +256,13 @@ class MotionManager:
         self._rate_timer = self._hass.async_call_later(
             _RATE_PROBE_S, self._async_check_rate
         )
+        # The RAW-stream command is the only thing written to the ring during a
+        # session unless the camera gesture is explicitly re-enabled. That write
+        # used to go out here about 30 ms after the stream opened, and the link
+        # died within milliseconds of it on every attempt; while the stream is
+        # being stabilised, nothing else may touch the ring mid-session.
+        if not ENABLE_RING_CAMERA_GESTURE:
+            return
         self._hass.async_create_task(
             self._async_enable_ring_gesture(session),
             "colmi_ring_camera_gesture",
@@ -262,6 +270,8 @@ class MotionManager:
 
     async def _async_enable_ring_gesture(self, session: MotionSession) -> None:
         """Ask the ring to report its own clap gesture while we are connected.
+
+        Only reached when ``ENABLE_RING_CAMERA_GESTURE`` is on.
 
         Best-effort: firmware that does not implement the camera-button gesture
         simply answers nothing, and a refusal is not worth an error.

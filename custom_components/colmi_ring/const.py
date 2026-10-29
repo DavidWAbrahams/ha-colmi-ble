@@ -187,3 +187,15 @@ MOTION_MIN_HZ_FOR_STREAM_CLAP = 15.0
 # Duration of the startup mute: the ring echoes our own gesture-enable packet
 # back at us, which must not be read as a clap.
 MOTION_STARTUP_MUTE_S = 2.0
+
+# Whether to ask the ring to run its own on-device camera-button (clap) gesture
+# detector while a RAW stream is open.
+#
+# Off, deliberately. That write goes out within ~30 ms of the RAW-stream
+# command, and the stream link reliably dies a moment after opening - so until
+# the two are separated by evidence rather than guesswork, the RAW-stream
+# command is the only thing written to the ring during a session. Nothing is
+# lost but the ring's own clap reporting; raise/lower and the stream-side clap
+# come from the accelerometer data and are unaffected. Flip this back to True
+# once the stream is confirmed to survive on its own.
+ENABLE_RING_CAMERA_GESTURE = False

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
@@ -167,9 +168,21 @@ class _RingConnection:
         # Open-ended streams (the RAW accelerometer) need every packet for a
         # command byte, not one reply per command, so they register here.
         self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
+        # Monotonic time the link came up, so a disconnect can be reported with
+        # how long it lasted: "the stream died 29 ms after opening" and "the
+        # stream died after 20 minutes" are completely different bugs, and
+        # without the age the log lines look identical.
+        self.linked_at: float | None = None
+        # True once *we* started closing the link, so the disconnect callback
+        # can say who ended it rather than leaving that to guesswork.
+        self.closing = False
         # Set when bleak reports the link dropped, so stream sessions can end
         # instead of waiting out their own timeout.
         self.dead = asyncio.Event()
+        # Called with *every* notification on this link, whatever its command
+        # byte. Used to account for what a stream session actually received, so
+        # a stream on an unexpected command byte is not misread as silence.
+        self.observer: Callable[[bytearray], None] | None = None
         # Monotonic timestamp of the most recent motion packet (see
         # ``add_motion_timestamp``); used by the stream watchdog.
         self.last_motion: float | None = None
@@ -288,6 +301,7 @@ class _RingConnection:
             self._rx_char = rx_char
 
             await self._client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
+            self.linked_at = time.monotonic()
         except ColmiRingApiClientError:
             await self._safe_disconnect()
             raise
@@ -312,8 +326,28 @@ class _RingConnection:
             self._release_lock()
 
     def _on_disconnect(self, _client: BleakClient) -> None:
-        """Best-effort: wake any waiting readers so they don't hang."""
-        LOGGER.debug("Colmi ring %s disconnected", self._address)
+        """Best-effort: wake any waiting readers so they don't hang.
+
+        The session *purpose*, who closed the link, and the link's age are in
+        the message because a bare "disconnected" is useless when several
+        sessions share an address: the line that killed the motion stream and
+        the line for an ordinary poll finishing look identical, and only the
+        age distinguishes "dropped by something else 29 ms after opening" from
+        "closed normally at the end of a session".
+        """
+        age = (
+            "unknown age"
+            if self.linked_at is None
+            else f"after {time.monotonic() - self.linked_at:.3f}s"
+        )
+        who = "closed by us" if self.closing else "DROPPED BY PEER"
+        LOGGER.debug(
+            "Colmi ring %s %s session disconnected (%s, %s)",
+            self._address,
+            self._purpose,
+            age,
+            who,
+        )
         self.dead.set()
 
     def add_listener(
@@ -337,6 +371,10 @@ class _RingConnection:
     async def _safe_disconnect(self) -> None:
         if self._client is None:
             return
+        # Set before disconnecting so the callback can tell our own teardown
+        # apart from the peer dropping us, which is the distinction that says
+        # whether a short-lived stream was closed by us or by the ring.
+        self.closing = True
         try:
             await self._client.disconnect()
         except (BleakError, asyncio.TimeoutError, OSError):
@@ -348,6 +386,13 @@ class _RingConnection:
             LOGGER.debug("Ignoring packet of unexpected length: %s", packet)
             return
         cmd = packet[0]
+        if self.observer is not None:
+            # Counted before dispatch so the tally covers bytes no listener on
+            # this session was registered for.
+            try:
+                self.observer(packet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring packet observer raised")
         # Streams are served first and unconditionally: a command byte may have
         # no one-shot queue at all (RAW motion never does). A listener raising
         # must not tear down the notification callback for everyone else, so
@@ -364,11 +409,13 @@ class _RingConnection:
             # easier to recognise (and look up) as 0x2F than as 47, and the body
             # is the only evidence available when the ring invents a notification
             # type we have no parser for (e.g. the RAW stream using a command
-            # byte other than the guessed 0xA1).
+            # byte other than the guessed 0xA1). The purpose says *which* session
+            # received it - the deciding detail when a stream and a poll overlap.
             LOGGER.debug(
-                "Unexpected packet type %s (0x%02X) from ring: %s",
+                "Unexpected packet type %s (0x%02X) from ring during %s session: %s",
                 cmd,
                 cmd,
+                self._purpose,
                 packet.hex(),
             )
             return
@@ -457,7 +504,13 @@ class _RingConnection:
     async def start_motion_stream(self) -> None:
         """Ask the ring to start streaming RAW accelerometer data."""
         self.touch_motion()
-        await self._send(motion.get_raw_start_packet())
+        packet = motion.get_raw_start_packet()
+        LOGGER.debug(
+            "Colmi ring %s RAW-stream start packet: %s",
+            self._address,
+            packet.hex(),
+        )
+        await self._send(packet)
 
     async def stop_motion_stream(self) -> None:
         """Ask the ring to stop streaming; errors are best-effort ignored.
@@ -484,6 +537,12 @@ class _RingConnection:
             motion.get_camera_gesture_on_packet()
             if enabled
             else motion.get_camera_gesture_off_packet()
+        )
+        LOGGER.debug(
+            "Colmi ring %s camera-gesture packet (%s): %s",
+            self._address,
+            "on" if enabled else "off",
+            packet.hex(),
         )
         try:
             await self._send(packet)
@@ -539,6 +598,42 @@ class _RingConnection:
 
         await self._send(real_time.get_stop_packet(reading_type))
         return valid
+
+
+class _StreamTally:
+    """Counts notifications seen by one stream session, by command byte.
+
+    Deliberately tiny and allocation-light: it runs inside the BLE
+    notification callback, on every packet of a stream that may run at tens of
+    Hz. Its whole purpose is one log line at session close, answering the only
+    question that matters when no accelerometer sensor ever updates: did the
+    ring send *nothing*, or did it send on a command byte we do not listen to?
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._by_type: Counter[str] = Counter()
+
+    def add(self, packet: bytearray) -> None:
+        """Record one 16-byte notification."""
+        self.count += 1
+        self._by_type[f"0x{packet[0]:02X}/{packet[1] if len(packet) > 1 else 0}"] += 1
+
+    def count_for(self, cmd: int) -> int:
+        """How many notifications carried command byte ``cmd``."""
+        prefix = f"0x{cmd:02X}/"
+        return sum(
+            num for name, num in self._by_type.items() if name.startswith(prefix)
+        )
+
+    def describe(self) -> str:
+        """Human-readable summary, most frequent type first."""
+        return (
+            ", ".join(
+                f"{name} x{num}" for name, num in self._by_type.most_common(5)
+            )
+            or "none"
+        )
 
 
 class MotionSession:
@@ -902,10 +997,16 @@ class ColmiRingApiClient:
             "heart_rate_timestamp": datetime.now(tz=timezone.utc),
         }
 
-    # How often the stream watchdog inspects link/silence state, and how long
-    # to wait before reconnecting a stream that died on its own.
+    # How often the stream watchdog inspects link/silence state.
     _STREAM_WATCHDOG_S = 5.0
-    _STREAM_RETRY_S = 10.0
+    # Reconnect delay for a stream that died or could not open: starts short
+    # and doubles per consecutive failure. The common causes (a poll still
+    # finishing on the one link, a ring that needs a moment to settle) clear in
+    # about a second, while a ring that genuinely refuses the stream should be
+    # retried politely, not hammered every second for half an hour. The count
+    # resets whenever a session opens successfully.
+    _STREAM_RETRY_MIN_S = 1.0
+    _STREAM_RETRY_MAX_S = 30.0
 
     @asynccontextmanager
     async def _motion_stream(
@@ -921,6 +1022,12 @@ class ColmiRingApiClient:
         """
         conn = self._connection("motion stream", STREAM_LOCK_WAIT_S)
         session = MotionSession(conn)
+        tally = _StreamTally()
+        # Observe the whole link, not just the command bytes we listen for: if
+        # the firmware streams on a byte other than the guessed 0xA1, the tally
+        # still shows packets arriving, which is a different diagnosis and a
+        # different fix.
+        conn.observer = tally.add
         listener = self._make_motion_listener(session, on_packet)
         async with conn:
             conn.add_listener(motion.CMD_RAW_MODE, listener)
@@ -940,11 +1047,57 @@ class ColmiRingApiClient:
                     pass
                 conn.remove_listener(motion.CMD_RAW_MODE, listener)
                 conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
+                self._log_stream_session(session, tally)
                 await conn.stop_motion_stream()
+
+    def _log_stream_session(
+        self, session: MotionSession, tally: _StreamTally
+    ) -> None:
+        """Report what a finished stream session actually saw.
+
+        The question this answers is whether the ring ever answered the RAW
+        command, and there are three answers worth telling apart: packets did
+        arrive on 0xA1 (the stream works), packets arrived but on other command
+        bytes (our guess of ``CMD_RAW_MODE`` is wrong, which is a decoder fix,
+        not a connection fix), or nothing arrived at all (the firmware is not
+        streaming, or refused and dropped the link). The last two are logged at
+        INFO because they are the ones worth reading without DEBUG enabled.
+        """
+        conn = session.conn
+        lived = (
+            "an unknown time"
+            if conn.linked_at is None
+            else f"{time.monotonic() - conn.linked_at:.1f}s"
+        )
+        reason = session.reason or "stopped"
+        raw_count = tally.count_for(motion.CMD_RAW_MODE)
+        if raw_count:
+            LOGGER.debug(
+                "Colmi ring %s motion stream closed (%s, after %s): %d"
+                " RAW notification(s), %d notification(s) total: %s",
+                self._ring_address,
+                reason,
+                lived,
+                raw_count,
+                tally.count,
+                tally.describe(),
+            )
+            return
+        LOGGER.info(
+            "Colmi ring %s motion stream closed after %s (%s) with %d"
+            " notification(s) of which none were RAW (0x%02X): %s",
+            self._ring_address,
+            lived,
+            reason,
+            tally.count,
+            motion.CMD_RAW_MODE,
+            tally.describe(),
+        )
 
     @staticmethod
     def _make_motion_listener(
-        session: MotionSession, on_packet: Callable[[bytearray], None]
+        session: MotionSession,
+        on_packet: Callable[[bytearray], None],
     ) -> Callable[[bytearray], None]:
         """Wrap the caller's callback so silence tracking stays automatic."""
 
@@ -990,42 +1143,113 @@ class ColmiRingApiClient:
         should_run: Callable[[], bool],
         on_session: Callable[[MotionSession], None] | None = None,
     ) -> str | None:
-        """Run one motion-stream session, restarting it while still wanted.
+        """Run motion-stream sessions, restarting them while still wanted.
 
         ``on_packet`` receives every RAW/gesture notification. ``should_run``
         is polled before each (re)connect and is what ends the loop when the
         user turns the stream off. Returns the reason the stream finally
-        stopped, or ``None`` if it could not be opened.
+        stopped, or ``None`` if it never managed to stay open.
 
-        Connection failures are reported as a return value rather than raised: a
-        stream that cannot start should let the caller log one line and mark its
-        switch off, not raise out of a service call.
+        A stream that drops or cannot open is retried with a doubling delay
+        (:data:`_STREAM_RETRY_MIN_S` up to :data:`_STREAM_RETRY_MAX_S`) for as
+        long as :data:`_STREAM_GIVEUP_S`, rather than giving up at the first
+        failure. Turning the switch off on the very first error made every brief
+        hiccup look like a broken feature, and it also threw away the evidence:
+        a stream that dies on every attempt at 1 s, 2 s, 4 s intervals reports
+        that pattern, where a single attempt reports nothing useful. The budget
+        is bounded because while it burns the manager still believes the stream
+        owns the ring and pauses polling; an unrecoverable failure has to end
+        with polling resuming and the switch off. A session that opens at all
+        resets the budget.
+
+        Failures are reported by return value rather than raised: a stream that
+        cannot start should let the caller log one line and mark its switch
+        off, not raise out of a service call.
         """
+        failing_since: float | None = None
+        delay = self._STREAM_RETRY_MIN_S
         while should_run():
             try:
                 async with self._motion_stream(on_packet) as session:
+                    failing_since = None
+                    delay = self._STREAM_RETRY_MIN_S
                     if on_session is not None:
                         on_session(session)
                     reason = await session.wait_stopped()
             except ColmiRingApiClientError as err:
-                # WARNING, not DEBUG: this is the one line explaining why the
-                # switch flipped itself back off, and the manager's matching
-                # warning only says "see the log above".
+                # WARNING, not DEBUG: this is the line explaining why the
+                # stream is not up yet, and it now repeats per attempt on
+                # purpose - the attempt count and the error text together are
+                # the evidence for *why* (busy vs. out of range vs. no UART
+                # service all look different here).
                 LOGGER.warning(
                     "Colmi ring %s motion stream could not start: %s",
                     self._ring_address,
                     err,
                 )
+                if await self._stream_pause(should_run, failing_since, delay):
+                    failing_since, delay = self._next_retry(
+                        failing_since, delay
+                    )
+                    continue
                 return None
             # A session that died on its own is worth retrying only while the
             # user still wants the stream; a user-requested stop is final.
             if reason in ("disconnected", "silent") and should_run():
-                LOGGER.info(
-                    "Colmi ring %s motion stream ended (%s); reconnecting",
+                if await self._stream_pause(should_run, failing_since, delay):
+                    LOGGER.info(
+                        "Colmi ring %s motion stream ended (%s); reconnecting"
+                        " in %.0fs",
+                        self._ring_address,
+                        reason,
+                        delay,
+                    )
+                    failing_since, delay = self._next_retry(
+                        failing_since, delay
+                    )
+                    continue
+                LOGGER.warning(
+                    "Colmi ring %s motion stream keeps ending (%s); giving up"
+                    " after %.0fs of retries",
                     self._ring_address,
                     reason,
+                    self._STREAM_GIVEUP_S,
                 )
-                await asyncio.sleep(self._STREAM_RETRY_S)
-                continue
+                return None
             return reason
         return None
+
+    # Total time to keep retrying a stream that never stays open before
+    # declaring it unworkable and letting the switch go off.
+    _STREAM_GIVEUP_S = 180.0
+
+    async def _stream_pause(
+        self,
+        should_run: Callable[[], bool],
+        failing_since: float | None,
+        delay: float,
+    ) -> bool:
+        """Sleep out one retry pause; False means the retry budget is done.
+
+        Single place deciding whether to keep trying, so both failure shapes
+        (could not open / died at once) obey the same bound and both stop
+        instantly when the user turns the switch off.
+        """
+        if not should_run():
+            return False
+        if (
+            failing_since is not None
+            and time.monotonic() - failing_since >= self._STREAM_GIVEUP_S
+        ):
+            return False
+        await asyncio.sleep(delay)
+        return True
+
+    def _next_retry(
+        self, failing_since: float | None, delay: float
+    ) -> tuple[float, float]:
+        """Advance the retry state: when the trouble started, and next delay."""
+        return (
+            failing_since if failing_since is not None else time.monotonic(),
+            min(delay * 2, self._STREAM_RETRY_MAX_S),
+        )

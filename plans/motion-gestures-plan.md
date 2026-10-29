@@ -462,11 +462,67 @@ sensitivity scaling from the orientation test.
   is now logged at WARNING in `api.async_stream_motion` - previously DEBUG-only, and the manager's
   line only says "see the log above".
 
+#### Third on-device run (2026-10-29): the lock did not fix it, and the poll is innocent
+
+    14:42:51.634 INFO  motion stream open; waiting for accelerometer data
+    14:42:51.663 DEBUG Colmi ring 78:14:12:A0:0F:8C disconnected
+    14:42:52.770 DEBUG Unexpected packet type 47 (0x2F) from ring: 2ff10000000000000000000000000020
+    14:42:52.770 DEBUG Unexpected packet type 1 (0x01) from ring: 01000100220000000001003001003086
+    14:42:53.428 DEBUG Colmi ring 78:14:12:A0:0F:8C disconnected
+    14:42:53.429 DEBUG Finished fetching colmi_ring data in 1.765 seconds (success: True)
+
+- Still dying, now **29 ms** after opening, and still with zero `0xA1` traffic.
+- **The poll-collision theory is disproved by this log.** The two unclaimed packets *are* ours:
+  `0x01` is `CMD_SET_TIME` (the poll's own clock sync ACK) and `0x2F` is the still-undocumented
+  notification from run 1. They belong to the **poll** connection, whose handler table holds only
+  battery / HR log / HR settings / real-time / steps. And that poll finished at `53.429` after
+  `1.765 s`, so it *started* around `51.664` - **1 ms after** the stream link was already gone at
+  `51.663`. It could only acquire the client-wide lock because the stream had died and released it.
+  The serialisation from the previous run is working; the poll is the *victim* of the ordering, not
+  its cause. (Confirmed independently by the user: the failure is far too reliable to be a
+  coincidental overlap with a poll that runs every few minutes.)
+- What is left, in the 29 ms between "stream open" and "disconnected", is **our own writes**.
+  `_motion_stream` sends `A1 04 04` (RAW on) and then `MotionManager._on_session` immediately fires
+  `set_camera_gesture(True)` - `02 04`. 29 ms is about one BLE round trip, so one of those two
+  writes is the prime suspect, and a write is a deterministic cause, which matches the reliability.
+- Changes made for the next run, on the assumption that the *next* log has to be self-explanatory:
+  - `_on_disconnect` now names the session purpose and the link's age, and says who closed it
+    (`closing` flag set by `_safe_disconnect`): `Colmi ring … motion stream session disconnected
+    (after 0.029s, DROPPED BY PEER)`. Previously the stream's death and an ordinary poll's end
+    printed the identical line.
+  - The RAW start packet and the camera-gesture packet are logged as hex as they are written.
+  - `_StreamTally` counts **every** notification on the link (`_RingConnection.observer`, wired in
+    before connecting), not just the command bytes we listen for. That distinction matters: packets
+    arriving on a byte other than `0xA1` means the *codec guess* is wrong, while nothing at all
+    means the firmware never answered. `_log_stream_session` reports the split at session close, at
+    INFO unless real `0xA1` packets arrived.
+  - "Unexpected packet type" now names the session that received it.
+- Behaviour changes, per the decision to treat on-device gesture detection as non-critical while the
+  stream is unstable:
+  - `const.ENABLE_RING_CAMERA_GESTURE = False`: `_on_session` no longer writes `02 04`, so the
+    RAW-stream command is the only thing written to the ring for the duration of a session. Nothing
+    is lost but the ring's own clap reporting; raise/lower and the stream-side clap come from the
+    accelerometer data. Re-enabling is one constant.
+  - `async_stream_motion` no longer returns `None` at the first failure. It retries with a doubling
+    delay (`_STREAM_RETRY_MIN_S` 1 s up to `_STREAM_RETRY_MAX_S` 30 s) for `_STREAM_GIVEUP_S` 180 s,
+    resetting the budget whenever a session opens at all. The budget is bounded because the manager
+    still pauses polling while it burns, so an unworkable stream must still end with polling
+    resumed and the switch off.
+- What the next run decides:
+  - `DROPPED BY PEER … after 0.0xxs` with **no** notification at all -> the ring refuses, or cannot
+    survive, the `A1 04 04` write itself. Next experiment: open the session and send *nothing*, and
+    see whether the link survives (i.e. whether R02 streams unprompted, as `scripts/_accel_probe.py`
+    suspects from its passive phase).
+  - Notifications counted on a byte other than `0xA1` -> the connection is fine and
+    `colmi_codec/motion.py` has the wrong command byte; fix the codec, not the transport.
+  - A session that now survives -> the camera-gesture write was the killer, and it can be re-armed
+    later behind a delay.
+
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Stock firmware streams too slowly for a stream-derived clap | rate probe disables *only* the stream clap and says so once; the on-device camera gesture (`02 04`) is armed in parallel, and raise/lower work at any rate |
+| Stock firmware streams too slowly for a stream-derived clap | rate probe disables *only* the stream clap and says so once, and raise/lower work at any rate. (The on-device camera gesture `02 04` *would* be the fallback, but it is switched off - `ENABLE_RING_CAMERA_GESTURE` - because that write is the leading suspect for killing the link; see the third run above.) |
 | Low-nibble decode assumption is wrong | rest magnitude will be nowhere near 1 g, which the replay script shows immediately; unparsable/odd packets are logged with hex |
 | Axis order / sign misread (wire order is Y, Z, X) | largely moot: velocity is projected onto the *estimated gravity vector*, so raise/lower are correct for any axis mapping; only scale/nibble can break it wholesale |
 | Ring will not serve commands while streaming | **decided:** coordinator pauses polling for the session; HR reads `unknown`, other call sites refuse with `STREAM_BUSY_MESSAGE` |
