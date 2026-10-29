@@ -356,6 +356,20 @@ sensitivity scaling from the orientation test.
 - Then fix/extend `scripts/_accel_probe.py` and correct whatever it disproves, in `const.py` and in
   the **Status** table above.
 
+#### First on-device run (2026-10-29, firmware as-shipped, via the ESP32-C3 proxy)
+
+- A session opened and ended ~2 s later with **no** rate-probe line and no gesture, i.e. it died
+  before the 5 s probe. Nothing in the log said why: `_on_session` logged nothing and the end
+  reason was DEBUG-only. Both are now INFO ("motion stream open…" / "motion stream ended
+  (reason)"), so the next run will show where the time went.
+- The post-stream coordinator refresh was silently dropped (`coroutine … was never awaited`,
+  fixed by `MotionManager._request_refresh`), so HR stayed stale for up to a full poll interval
+  after the switch went off.
+- During an ordinary poll the ring sent command bytes `47` (0x2F) and `1` (0x01, the set-time ACK)
+  that no parser claims. Harmless, but 0x2F is undocumented here: the "Unexpected packet type"
+  debug line now includes the hex command and the full payload so an unexpected *stream* packet is
+  identifiable (e.g. accel data served on a command byte other than the guessed `0xA1`).
+
 ## Risks
 
 | Risk | Mitigation |

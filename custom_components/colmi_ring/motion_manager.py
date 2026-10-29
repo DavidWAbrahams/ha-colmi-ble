@@ -167,6 +167,12 @@ class MotionManager:
                 "Colmi ring motion stream could not be opened; the switch has"
                 " been turned off (see the log above for the reason)"
             )
+        elif reason != "user":
+            # Worth an INFO line: a session that ends by itself (link dropped,
+            # stream went silent) is the case a user needs help with, and
+            # without it the switch simply goes off with no explanation in the
+            # default log level.
+            LOGGER.info("Colmi ring motion stream ended (%s)", reason)
         else:
             LOGGER.debug("Colmi ring motion stream finished (%s)", reason)
 
@@ -182,7 +188,7 @@ class MotionManager:
             # reflects reality, and the pending session will close itself when
             # it opens (see _on_session).
             self._set_streaming(False)
-            self._coordinator.async_request_refresh()
+            self._request_refresh()
             return
         session.request_stop(reason)
 
@@ -211,6 +217,9 @@ class MotionManager:
             session.request_stop("user")
             return
         self._session = session
+        LOGGER.info(
+            "Colmi ring motion stream open; waiting for accelerometer data"
+        )
         self._detector.reset()
         self._muted_until = time.monotonic() + MOTION_STARTUP_MUTE_S
         self._schedule_auto_off()
@@ -395,4 +404,16 @@ class MotionManager:
             # The client gave up on its own (it could not open a stream at all).
             self._want_stream = False
         self._set_streaming(False)
-        self._coordinator.async_request_refresh()
+        self._request_refresh()
+
+    def _request_refresh(self) -> None:
+        """Kick the coordinator now that the ring is free again.
+
+        Both call sites are synchronous, so the refresh coroutine has to be
+        handed to the event loop instead of merely created (which would warn
+        "coroutine ... was never awaited").
+        """
+        self._hass.async_create_task(
+            self._coordinator.async_request_refresh(),
+            "colmi_ring_post_stream_refresh",
+        )

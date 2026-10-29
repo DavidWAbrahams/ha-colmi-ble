@@ -271,7 +271,18 @@ class _RingConnection:
                 LOGGER.exception("Colmi ring stream listener raised for cmd %s", cmd)
         handler = self._handlers.get(cmd)
         if handler is None:
-            LOGGER.debug("Unexpected packet type %s from ring", cmd)
+            # Hex as well as decimal, plus the whole payload: the command bytes
+            # this integration knows are a small table, so an unfamiliar one is
+            # easier to recognise (and look up) as 0x2F than as 47, and the body
+            # is the only evidence available when the ring invents a notification
+            # type we have no parser for (e.g. the RAW stream using a command
+            # byte other than the guessed 0xA1).
+            LOGGER.debug(
+                "Unexpected packet type %s (0x%02X) from ring: %s",
+                cmd,
+                cmd,
+                packet.hex(),
+            )
             return
         result = handler(packet)
         if result is not None:
