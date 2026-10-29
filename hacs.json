@@ -1,5 +1,6 @@
 {
     "name": "Colmi Ring",
     "homeassistant": "2026.10.4",
-    "hacs": "2.0.1"
+    "hacs": "2.0.1",
+    "brand": "https://raw.githubusercontent.com/DavidWAbrahams/ha-colmi-ble/main/repository"
 }
