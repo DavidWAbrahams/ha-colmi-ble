@@ -26,7 +26,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from .api import ColmiRingApiClient, MotionSession
-from .colmi_codec.motion import parse_accel_packet, parse_gesture_packet
+from .colmi_codec.motion import (
+    AccelSample,
+    parse_accel_packet,
+    parse_gesture_packet,
+)
 from .const import (
     CONF_GESTURE_SENSITIVITY,
     CONF_MOTION_LOG_SAMPLES,
@@ -36,6 +40,7 @@ from .const import (
     GESTURE_EVENT_TYPE,
     GESTURE_SENSITIVITY_SCALE,
     LOGGER,
+    MOTION_SENSOR_UPDATE_S,
     MOTION_STARTUP_MUTE_S,
 )
 from .gestures import GestureEvent, GestureDetector
@@ -83,7 +88,13 @@ class MotionManager:
         self._logged_rate = False
 
         self.is_streaming = False
+        # Newest decoded sample, for the accelerometer sensors. None whenever no
+        # stream is running, so the sensors go unknown instead of freezing.
+        self.last_sample: AccelSample | None = None
+        self._last_sample_published = 0.0
+
         self._event_listeners: list[Callable[[GestureEvent], None]] = []
+        self._sample_listeners: list[Callable[[], None]] = []
         self._state_listeners: list[Callable[[bool], None]] = []
 
     # -- configuration ------------------------------------------------------
@@ -117,6 +128,24 @@ class MotionManager:
     def _remove_event_listener(self, listener: Callable[[GestureEvent], None]) -> None:
         if listener in self._event_listeners:
             self._event_listeners.remove(listener)
+
+    def add_sample_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Learn that a new accelerometer sample is ready to be read.
+
+        The listener takes no arguments and reads :attr:`last_sample` itself, so
+        the same callback also works when the sample goes away with the stream.
+
+        Deliberately throttled to :data:`MOTION_SENSOR_UPDATE_S` rather than the
+        stream rate: these listeners update sensors, and every sensor update is a
+        recorder row. Automations that need the full-rate signal should use the
+        gesture events instead.
+        """
+        self._sample_listeners.append(listener)
+        return lambda: self._remove_sample_listener(listener)
+
+    def _remove_sample_listener(self, listener: Callable[[], None]) -> None:
+        if listener in self._sample_listeners:
+            self._sample_listeners.remove(listener)
 
     def add_state_listener(self, listener: Callable[[bool], None]) -> Callable[[], None]:
         """Learn when the stream actually turns on or off (for the switch)."""
@@ -324,8 +353,37 @@ class MotionManager:
             LOGGER.debug(
                 "colmi motion %.3f %.3f %.3f g", sample.x, sample.y, sample.z
             )
+        self._publish_sample(sample)
         for event in self._detector.feed(sample):
             self._publish(event)
+
+    def _publish_sample(self, sample: AccelSample) -> None:
+        """Hand the newest sample to the sensors, at most once per second.
+
+        The detector still sees every sample; only the published state is
+        rate-limited, because a state change per sample would write a recorder
+        row per sample. The first sample of a session is always published, so the
+        sensors leave ``unknown`` promptly instead of after a second of stream.
+        """
+        self.last_sample = sample
+        if not self._sample_listeners:
+            return
+        now = time.monotonic()
+        if (
+            self._last_sample_published
+            and now - self._last_sample_published < MOTION_SENSOR_UPDATE_S
+        ):
+            return
+        self._last_sample_published = now
+        self._notify_sample_listeners()
+
+    def _notify_sample_listeners(self) -> None:
+        """Tell the accelerometer sensors to re-read :attr:`last_sample`."""
+        for listener in list(self._sample_listeners):
+            try:
+                listener()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring sample listener raised")
 
     def _publish(self, event: GestureEvent) -> None:
         """Announce a gesture on the bus, to the entities, and restart auto-off."""
@@ -390,6 +448,15 @@ class MotionManager:
         if self.is_streaming == streaming:
             return
         self.is_streaming = streaming
+        if streaming:
+            # Publish the first sample of the session without waiting out the
+            # throttle window.
+            self._last_sample_published = 0.0
+        else:
+            # No stream, no data: the sensors go unknown rather than showing the
+            # last reading of a session that has ended.
+            self.last_sample = None
+            self._notify_sample_listeners()
         for listener in list(self._state_listeners):
             try:
                 listener(streaming)

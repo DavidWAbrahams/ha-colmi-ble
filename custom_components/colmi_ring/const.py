@@ -62,6 +62,13 @@ DEFAULT_MOTION_STREAM_TIMEOUT = 30
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
 
+# Minimum seconds between updates of the accelerometer sensors. The stream runs
+# at tens of Hz, and every state change is a recorder row: four sensors at
+# 25 Hz would write a hundred rows per second. One second still shows the values
+# moving in real time while leaving the database usable; the full-rate data is
+# what CONF_MOTION_LOG_SAMPLES logs instead.
+MOTION_SENSOR_UPDATE_S = 1.0
+
 # --- Detector tuning ------------------------------------------------------
 #
 # All of these are best guesses pending the Phase 0 capture; see
