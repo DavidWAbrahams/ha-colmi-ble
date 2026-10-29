@@ -106,4 +106,11 @@ async def async_reload_entry(
     reload path keeps its state machine consistent, and it debounces when
     the options flow also triggers an automatic reload.
     """
-    entry.async_schedule_reload(hass)
+    schedule_reload = getattr(hass.config_entries, "async_schedule_reload", None)
+    if schedule_reload is not None:
+        # Current cores: debounced, non-blocking.
+        schedule_reload(entry.entry_id)
+        return
+    # Older cores have neither this nor ConfigEntry.async_schedule_reload, so
+    # go through the reload coroutine directly.
+    await hass.config_entries.async_reload(entry.entry_id)
