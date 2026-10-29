@@ -49,10 +49,12 @@ data arrives on `0xA1`. We do - [`_handle_tx`](../custom_components/colmi_ring/a
 `packet[0]`, and the motion session subscribes to `0xA1` and `0x02` only. If the R02 serves accel on
 another command byte, the packets are dropped in `api.py` before reaching `MotionManager`, and the
 evidence is the DEBUG-only "Unexpected packet type *N* (0x*NN*) … *payload*" line rather than the
-manager's own "unknown stream packet" line. So for the ring run, enable DEBUG on both
-`custom_components.colmi_ring.api` and `.motion_manager`; a byte that shows up repeatedly at
-stream-rate while streaming is the real command byte. If that happens the fix is one constant - or a
-catch-all listener for the duration of a session.
+manager's own "unknown stream packet" line. So for the ring run, enable DEBUG on
+`custom_components.colmi_ring` (the integration's *root* logger: `api.py`, `coordinator.py` and
+`motion_manager.py` all log through the shared `LOGGER` from `const.py`, so there is no separate
+`.api` logger to enable); a byte that shows up repeatedly at stream-rate while streaming is the real
+command byte. If that happens the fix is one constant - or a catch-all listener for the duration of a
+session.
 
 A pleasant consequence of projecting onto the *estimated gravity vector* instead of picking a
 "vertical axis" by name: raise-vs-lower is correct for **any** axis mapping, since it only depends
@@ -409,11 +411,11 @@ sensitivity scaling from the orientation test.
 
 #### Before the next on-device run
 
-- Enable DEBUG on `custom_components.colmi_ring.api` **as well as** `.motion_manager`. The command
-  byte is decided in `api.py::_handle_tx`, so if the R02 serves accel somewhere other than `0xA1`
-  the proof is api's "Unexpected packet type" line (which now carries the hex byte and full payload),
-  and it is invisible at INFO. One session with the logger on settles the only assumption in
-  `colmi_codec/motion.py` that the reference app could not confirm.
+- Enable DEBUG on `custom_components.colmi_ring` (the root logger; see the note above - there is no
+  separate `.api` logger). The command byte is decided in `api.py::_handle_tx`, so if the R02 serves
+  accel somewhere other than `0xA1` the proof is api's "Unexpected packet type" line (which now
+  carries the hex byte and full payload), and it is invisible at INFO. One session with the logger on
+  settles the only assumption in `colmi_codec/motion.py` that the reference app could not confirm.
 - Run `python scripts/_motion_ref_parity.py` first: it takes a second, and if it fails then the
   decode has drifted from the reference and no ring result should be interpreted until it passes.
 
@@ -430,6 +432,35 @@ sensitivity scaling from the orientation test.
   that no parser claims. Harmless, but 0x2F is undocumented here: the "Unexpected packet type"
   debug line now includes the hex command and the full payload so an unexpected *stream* packet is
   identifiable (e.g. accel data served on a command byte other than the guessed `0xA1`).
+- **No accelerometer packet has ever been seen.** Both runs show the stream opening and dying with
+  zero `0xA1` traffic, so the "which command byte carries accel" question above is still open.
+
+#### Second on-device run (2026-10-29): the switch toggled itself back off
+
+- The log was unambiguous once read as a link problem rather than a decode problem:
+  `motion stream open; waiting for accelerometer data` at `12:38:05.222`, `disconnected` at
+  `12:38:05.283` - **61 ms**. Immediately before it, `Manually updated colmi_ring data`: that is
+  `MotionManager._request_refresh`, i.e. the refresh the *previous* stream session asked for.
+- Root cause: the ring answers **one central**, and two live GATT connections do not queue - one
+  link gets dropped. The `is_streaming` gate in `coordinator._async_update_data` only stops polls
+  that *start* after the flag flips; a poll already inside `async_get_data` still held its own
+  connection while the stream connected beside it, and the ring took the stream's link. The same
+  collision explains the first run's ~2 s session.
+- Fix: `ColmiRingApiClient` now owns one `asyncio.Lock`, and every `_RingConnection` holds it for
+  its whole life, so there is exactly one connection to a ring at a time. The wait budgets are
+  deliberately asymmetric - a poll waits `POLL_LOCK_WAIT_S` (5 s) and then fails with
+  `ColmiRingApiClientBusyError`, which the coordinator treats as *not a failure* (keep the last
+  known values, do not mark the entity unavailable); a UI command waits `USER_LOCK_WAIT_S` (15 s);
+  the stream waits `STREAM_LOCK_WAIT_S` (90 s), because the collision it hits is an ordinary
+  seconds-long poll that is worth waiting out rather than refusing.
+- The lock is claimed by polling `asyncio.Lock.locked()` rather than wrapping `acquire()` in a
+  timeout: cancelling an acquire queued on the lock can leave it **held forever**, which would
+  brick every later session. A free lock is claimed synchronously by the next `acquire()`, so
+  check-then-acquire has no interleaving window.
+- Also from this run: `_watch_stream` wakes on the connection's own `dead` event instead of
+  sleeping a blind 5 s (a dropped link is noticed at once), and the reason a stream could not open
+  is now logged at WARNING in `api.async_stream_motion` - previously DEBUG-only, and the manager's
+  line only says "see the log above".
 
 ## Risks
 
