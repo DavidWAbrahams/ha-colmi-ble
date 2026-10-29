@@ -237,7 +237,17 @@ class _RingConnection:
 
     async def _send(self, packet: bytearray) -> None:
         assert self._client is not None and self._rx_char is not None
-        await self._client.write_gatt_char(self._rx_char, packet, response=False)
+        # The ring can drop the GATT link mid-session (walking out of range);
+        # bleak then raises BleakError from write_gatt_char. Map it to the
+        # retryable client error so the coordinator reports a plain one-line
+        # update failure instead of logging a raw traceback.
+        try:
+            await self._client.write_gatt_char(self._rx_char, packet, response=False)
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            raise ColmiRingApiClientCommunicationError(
+                f"Lost connection to Colmi ring {self._address}"
+                " (out of range or disconnected)"
+            ) from err
 
     async def _command(self, packet: bytearray, cmd: int) -> Any:
         """Send a command and await its (final) parsed reply."""
