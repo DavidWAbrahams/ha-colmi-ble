@@ -10,6 +10,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import (
     ColmiRingApiClientAuthenticationError,
+    ColmiRingApiClientBusyError,
     ColmiRingApiClientError,
 )
 from .colmi_codec import date_utils
@@ -109,6 +110,15 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                     include_previous_day=include_previous_day
                 )
             )
+        except ColmiRingApiClientBusyError:
+            # The motion stream claimed the ring's one link between the gate
+            # above and here: toggling it on races a poll already in flight.
+            # That is not a fault to report, so keep the last known values and
+            # let the next poll proceed normally.
+            LOGGER.debug(
+                "Colmi ring poll skipped: the ring is busy with another session"
+            )
+            return self.data
         except ColmiRingApiClientAuthenticationError as exception:
             raise ConfigEntryAuthFailed(exception) from exception
         except ColmiRingApiClientError as exception:

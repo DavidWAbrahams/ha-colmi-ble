@@ -64,6 +64,21 @@ UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 # proxy, so we raise it.
 REPLY_TIMEOUT = 10.0
 
+# How long each kind of session will wait for the ring's single GATT link.
+#
+# A poll in flight must not queue behind an open stream: the ring has no spare
+# link, so waiting would only block the coordinator for the whole session. It
+# fails fast instead and the caller keeps its last known data.
+POLL_LOCK_WAIT_S = 5.0
+# The reverse case is common and harmless: toggling the stream on lands within a
+# second of the refresh that ran when the previous stream closed, so a poll is
+# mid-flight. Those finish in a few seconds, so the stream waits rather than
+# reporting a failure the user cannot act on.
+STREAM_LOCK_WAIT_S = 90.0
+# Button presses and settings writes come from a person in the UI, so a poll
+# already on the air is worth a short wait rather than an instant refusal.
+USER_LOCK_WAIT_S = 15.0
+
 
 def _latest_sample_is_zero(
     all_slots: list[tuple[int, datetime]],
@@ -109,13 +124,41 @@ class ColmiRingApiClientAuthenticationError(ColmiRingApiClientError):
     """Exception to indicate an authentication error."""
 
 
-class _RingConnection:
-    """A single active GATT connection to the ring, managed by HA's BT stack."""
+class ColmiRingApiClientBusyError(ColmiRingApiClientCommunicationError):
+    """Exception to indicate the ring's single link is owned by another session.
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
+    Not a failure of the ring: it means we asked for a second simultaneous
+    session (poll vs. motion stream), which its firmware cannot serve. Callers
+    that have data already should keep it rather than report an error.
+    """
+
+
+class _RingConnection:
+    """A single active GATT connection to the ring, managed by HA's BT stack.
+
+    The ring serves exactly one central, and opening a second connection while
+    one is live does not queue politely - it drops one of the two links. So a
+    connection also holds the client-wide :attr:`_lock` for its whole life,
+    which is what keeps a scheduled poll from tearing down an open motion
+    stream (and vice versa).
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        *,
+        lock: asyncio.Lock | None = None,
+        lock_wait_s: float = POLL_LOCK_WAIT_S,
+        purpose: str = "poll",
+    ) -> None:
         """Store the resolved HA instance and the ring MAC address."""
         self._hass = hass
         self._address = address
+        self._lock = lock
+        self._lock_wait_s = lock_wait_s
+        self._purpose = purpose
+        self._locked = False
         self._client: BleakClient | None = None
         self._rx_char: BleakGATTCharacteristic | None = None
         # Fresh, stateful parsers per connection so multi-packet logs don't leak.
@@ -167,7 +210,49 @@ class _RingConnection:
                 raise ColmiRingApiClientCommunicationError(msg)
             await asyncio.sleep(self._RESOLVE_POLL_S)
 
+    _LOCK_POLL_S = 0.25
+
+    async def _async_acquire_lock(self) -> None:
+        """Claim the ring's single-link lock, waiting up to the caller's budget.
+
+        Polls :meth:`asyncio.Lock.locked` instead of wrapping ``acquire()`` in a
+        timeout: cancelling an acquire that is queued on the lock can leave the
+        lock held forever, which would silently brick every later session. A
+        free lock is claimed synchronously by the next ``acquire()``, so
+        checking and then acquiring cannot be slipped between, and a caller that
+        must not wait simply runs out its deadline here.
+        """
+        assert self._lock is not None
+        deadline = time.monotonic() + self._lock_wait_s
+        while True:
+            if not self._lock.locked():
+                await self._lock.acquire()
+                self._locked = True
+                return
+            if time.monotonic() >= deadline:
+                msg = (
+                    f"Ring {self._address} is busy with another session"
+                    f" (this one is a {self._purpose})"
+                )
+                raise ColmiRingApiClientBusyError(msg)
+            await asyncio.sleep(self._LOCK_POLL_S)
+
+    def _release_lock(self) -> None:
+        if self._locked and self._lock is not None:
+            self._locked = False
+            self._lock.release()
+
     async def __aenter__(self) -> _RingConnection:
+        """Take the ring's one link, then resolve + connect through HA's stack."""
+        if self._lock is not None:
+            await self._async_acquire_lock()
+        try:
+            return await self._async_connect()
+        except BaseException:
+            self._release_lock()
+            raise
+
+    async def _async_connect(self) -> _RingConnection:
         """Resolve + connect the device through HA's Bluetooth stack."""
         # Resolve to HA's BLEDevice so the connection is routed to the
         # adapter / ESPHome proxy that actually sees the ring.
@@ -221,7 +306,10 @@ class _RingConnection:
         exc_tb: TracebackType | None,
     ) -> None:
         """Disconnect and release the GATT connection."""
-        await self._safe_disconnect()
+        try:
+            await self._safe_disconnect()
+        finally:
+            self._release_lock()
 
     def _on_disconnect(self, _client: BleakClient) -> None:
         """Best-effort: wake any waiting readers so they don't hang."""
@@ -490,6 +578,21 @@ class ColmiRingApiClient:
         """Store the HA instance and ring address (no connection yet)."""
         self._hass = hass
         self._ring_address = ring_address
+        # Every session to this ring goes through here. The firmware serves one
+        # central, so two overlapping connections do not queue - they drop each
+        # other's link, which is how a motion stream gets torn off the air
+        # seconds after opening.
+        self._lock = asyncio.Lock()
+
+    def _connection(self, purpose: str, lock_wait_s: float) -> _RingConnection:
+        """A connection that holds the ring's single link for its whole life."""
+        return _RingConnection(
+            self._hass,
+            self._ring_address,
+            lock=self._lock,
+            lock_wait_s=lock_wait_s,
+            purpose=purpose,
+        )
 
     async def async_get_data(
         self, include_previous_day: bool = False
@@ -516,7 +619,7 @@ class ColmiRingApiClient:
         # direct evidence the optical sensor is not on skin right now, even
         # if the newest *non-zero* sample is still within the staleness grace.
         hr_zero_reading = False
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("poll", POLL_LOCK_WAIT_S) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
             except ColmiRingApiClientError:
@@ -721,7 +824,7 @@ class ColmiRingApiClient:
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
         """Read the ring's heart-rate logging settings."""
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("settings", USER_LOCK_WAIT_S) as conn:
             return await conn.get_hr_log_settings()
 
     async def async_set_hr_log_settings(
@@ -731,14 +834,14 @@ class ColmiRingApiClient:
 
         Returns the settings as the ring reports them after the write.
         """
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("settings", USER_LOCK_WAIT_S) as conn:
             await conn.set_hr_log_settings(settings)
             await asyncio.sleep(0.5)
             return await conn.get_hr_log_settings()
 
     async def async_get_battery(self) -> dict[str, Any]:
         """Return battery level + charging state."""
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("battery", USER_LOCK_WAIT_S) as conn:
             info = await conn.get_battery()
             return {
                 "battery_level": info.battery_level,
@@ -747,17 +850,17 @@ class ColmiRingApiClient:
 
     async def async_set_time(self, value: datetime) -> Any:
         """Sync the ring clock (required to interpret logged data)."""
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("set-time", USER_LOCK_WAIT_S) as conn:
             return await conn.set_time(value)
 
     async def async_blink_twice(self) -> Any:
         """Trigger blink-twice on the ring."""
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("blink", USER_LOCK_WAIT_S) as conn:
             return await conn.blink_twice()
 
     async def async_reboot(self) -> Any:
         """Reboot the ring."""
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("reboot", USER_LOCK_WAIT_S) as conn:
             return await conn.reboot()
 
     async def async_take_spo2(self) -> dict[str, Any]:
@@ -766,7 +869,7 @@ class ColmiRingApiClient:
         Returns a dict with ``spo2`` (int %) and ``spo2_timestamp`` (aware
         datetime), or ``spo2`` = None if the ring produced no valid reading.
         """
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("spo2", USER_LOCK_WAIT_S) as conn:
             samples = await conn.poll_real_time_reading(
                 real_time.RealTimeReading.SPO2
             )
@@ -786,7 +889,7 @@ class ColmiRingApiClient:
         (aware datetime), or ``heart_rate`` = None if the ring produced no
         valid reading.
         """
-        async with _RingConnection(self._hass, self._ring_address) as conn:
+        async with self._connection("live-hr", USER_LOCK_WAIT_S) as conn:
             samples = await conn.poll_real_time_reading(
                 real_time.RealTimeReading.HEART_RATE
             )
@@ -811,10 +914,12 @@ class ColmiRingApiClient:
         """Hold the connection open with RAW streaming on, until stopped.
 
         The ring serves a single central, so this connection *is* the link for
-        as long as it lives: nothing else may talk to the ring concurrently (the
-        coordinator pauses its polls, see ``MotionManager``).
+        as long as it lives. The coordinator pauses its polls for the duration
+        (see ``MotionManager``), but a poll already in flight when the user
+        toggles the stream on can only be waited out, hence the generous
+        :data:`STREAM_LOCK_WAIT_S`.
         """
-        conn = _RingConnection(self._hass, self._ring_address)
+        conn = self._connection("motion stream", STREAM_LOCK_WAIT_S)
         session = MotionSession(conn)
         listener = self._make_motion_listener(session, on_packet)
         async with conn:
@@ -850,9 +955,24 @@ class ColmiRingApiClient:
         return listener
 
     async def _watch_stream(self, session: MotionSession) -> None:
-        """Close the session if the link drops or the stream stops reporting."""
+        """Close the session if the link drops or the stream stops reporting.
+
+        The disconnect check wakes on the connection's own event rather than
+        waiting for the next sweep, so a dropped link is noticed (and retried)
+        within a second instead of up to :data:`_STREAM_WATCHDOG_S` later -
+        relevant when the ring is dropped by something else on the link.
+        """
         while True:
-            await asyncio.sleep(self._STREAM_WATCHDOG_S)
+            dead_waiter = asyncio.ensure_future(session.conn.dead.wait())
+            try:
+                await asyncio.wait({dead_waiter}, timeout=self._STREAM_WATCHDOG_S)
+            finally:
+                # ``asyncio.wait`` leaves the waiter running on both timeout and
+                # cancellation; tidy it up so no task outlives this loop.
+                if not dead_waiter.done():
+                    dead_waiter.cancel()
+            # The event is inspected directly rather than via ``done``: a lost
+            # wake-up then costs at most one watchdog sweep, not the session.
             if session.conn.dead.is_set():
                 session.request_stop("disconnected")
                 return
@@ -888,7 +1008,10 @@ class ColmiRingApiClient:
                         on_session(session)
                     reason = await session.wait_stopped()
             except ColmiRingApiClientError as err:
-                LOGGER.debug(
+                # WARNING, not DEBUG: this is the one line explaining why the
+                # switch flipped itself back off, and the manager's matching
+                # warning only says "see the log above".
+                LOGGER.warning(
                     "Colmi ring %s motion stream could not start: %s",
                     self._ring_address,
                     err,
