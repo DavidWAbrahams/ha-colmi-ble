@@ -21,12 +21,16 @@
     "options": {
         "step": {
             "init": {
-                "description": "Heart rate freshness, BLE polling, and history backfill options.",
+                "description": "Heart rate freshness, BLE polling, history backfill, and gesture detection options.",
                 "data": {
                     "hr_stale_after_polls": "Grace polls before Heart Rate goes unknown after the ring is removed (0 = fastest detection)",
                     "poll_max_interval": "Maximum BLE polling interval in minutes (the integration polls at your heart-rate sampling period, up to this limit)",
                     "hr_backfill": "Log heart-rate samples recorded while out of Bluetooth range into history",
-                    "steps_backfill": "Experimental: also backfill steps/distance/calories history (raw graph only, may not show in long-term statistics)"
+                    "steps_backfill": "Experimental: also backfill steps/distance/calories history (raw graph only, may not show in long-term statistics)",
+                    "motion_enabled": "Enable gesture detection (adds a Motion Stream switch and clap/hand-raise/hand-lower events; streaming pauses normal polling and uses more battery)",
+                    "gesture_sensitivity": "Gesture sensitivity",
+                    "motion_stream_timeout": "Turn the motion stream off automatically after this many minutes (0 = leave it on until switched off)",
+                    "motion_log_samples": "Log every accelerometer sample to the debug log (for tuning gestures)"
                 }
             }
         }

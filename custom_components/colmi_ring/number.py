@@ -94,6 +94,7 @@ class ColmiRingHrIntervalNumber(ColmiRingEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Write the interval to the ring and re-read it to verify."""
+        self._assert_ring_free()
         settings = self._current_settings()
         # Preserve the ring's current enabled flag unless we know it.
         enabled = settings.enabled if settings else True

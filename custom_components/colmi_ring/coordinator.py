@@ -26,6 +26,7 @@ from .const import (
 if TYPE_CHECKING:
     from .backfill import BackfillManager
     from .data import ColmiRingConfigEntry
+    from .motion_manager import MotionManager
 
 
 # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -41,6 +42,10 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         super().__init__(*args, **kwargs)
         # Imports off-ring HR/activity samples into the recorder each poll.
         self.backfill = backfill
+        # Set by async_setup_entry once the manager exists (it needs us to be
+        # constructed first). While its ``is_streaming`` is set we must not open
+        # a connection of our own: the ring serves one central at a time.
+        self.motion: MotionManager | None = None
         # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
         self.spo2_reading: dict[str, Any] | None = None
         # {"heart_rate": int | None, "heart_rate_timestamp": datetime | None}
@@ -88,6 +93,13 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> Any:
         """Update data via library (merging persisted on-demand readings)."""
+        if self.motion is not None and self.motion.is_streaming:
+            # The RAW motion stream holds the ring's single GATT link. Rather
+            # than fight it for the connection, keep the last known values and
+            # resume as soon as the stream closes (the manager refreshes us).
+            # History backfill pauses too, which is harmless: it is idempotent
+            # and picks the backlog up on the next real poll.
+            return self.data
         hr_enabled, steps_enabled, include_previous_day = (
             await self._async_backfill_flags()
         )
@@ -104,23 +116,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as exception:  # noqa: BLE001
             LOGGER.exception("Unexpected error updating Colmi ring")
             raise UpdateFailed(exception) from exception
-        if self.spo2_reading is not None:
-            data["spo2"] = self.spo2_reading.get("spo2")
-            data["spo2_timestamp"] = self.spo2_reading.get("spo2_timestamp")
-        else:
-            data.setdefault("spo2", None)
-            data.setdefault("spo2_timestamp", None)
-        # Heart rate precedence: an on-demand live reading wins only while it is
-        # fresher than the ring's own logged sample, so the 5-min log poll
-        # naturally overtakes once the ring records a newer HR sample.
-        if self.hr_live is not None:
-            if self._prefer_newer_hr(data, self.hr_live):
-                data["heart_rate"] = self.hr_live.get("heart_rate")
-                data["heart_rate_timestamp"] = self.hr_live.get(
-                    "heart_rate_timestamp"
-                )
-            else:
-                self.hr_live = None
+        self._apply_spo2_reading(data)
+        self._apply_live_heart_rate(data)
         if self._heart_rate_is_stale(data):
             # The newest sample is old enough that the ring is almost certainly
             # off the finger; report "unknown" instead of a stale value.
@@ -146,6 +143,30 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 LOGGER.exception("Colmi ring history backfill errored")
         self._apply_poll_interval(data)
         return data
+
+    def _apply_spo2_reading(self, data: dict[str, Any]) -> None:
+        """Overlay the persisted on-demand SpO2 reading, if any."""
+        if self.spo2_reading is not None:
+            data["spo2"] = self.spo2_reading.get("spo2")
+            data["spo2_timestamp"] = self.spo2_reading.get("spo2_timestamp")
+        else:
+            data.setdefault("spo2", None)
+            data.setdefault("spo2_timestamp", None)
+
+    def _apply_live_heart_rate(self, data: dict[str, Any]) -> None:
+        """Overlay the on-demand live heart rate while it is the fresher sample.
+
+        Heart rate precedence: a live reading wins only while it is fresher
+        than the ring's own logged sample, so the 5-min log poll naturally
+        overtakes once the ring records a newer HR sample.
+        """
+        if self.hr_live is None:
+            return
+        if self._prefer_newer_hr(data, self.hr_live):
+            data["heart_rate"] = self.hr_live.get("heart_rate")
+            data["heart_rate_timestamp"] = self.hr_live.get("heart_rate_timestamp")
+        else:
+            self.hr_live = None
 
     # Floor for the adaptive poll interval. The ring's HR log is a 5-min
     # slot grid, so polling faster than that can never reveal a new sample.
@@ -237,4 +258,21 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         data = dict(self.data) if self.data else {}
         data["heart_rate"] = reading.get("heart_rate")
         data["heart_rate_timestamp"] = reading.get("heart_rate_timestamp")
+        self.async_set_updated_data(data)
+
+    def async_clear_heart_rate(self) -> None:
+        """Drop the published heart rate and push "unknown" to entities now.
+
+        Called when the motion stream opens. Polling stops for the duration, so
+        leaving the last value in place would present a frozen measurement as
+        though it were live; the sensor recovers on the refresh that follows the
+        stream closing.
+        """
+        if not self.data or self.data.get("heart_rate") is None:
+            self.hr_live = None
+            return
+        self.hr_live = None
+        data = dict(self.data)
+        data["heart_rate"] = None
+        data["heart_rate_timestamp"] = None
         self.async_set_updated_data(data)

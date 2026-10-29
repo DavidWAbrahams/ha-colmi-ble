@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
     from .api import ColmiRingApiClient
     from .coordinator import ColmiRingDataUpdateCoordinator
+    from .motion_manager import MotionManager
 
 
 type ColmiRingConfigEntry = ConfigEntry[ColmiRingData]
@@ -23,3 +24,6 @@ class ColmiRingData:
     client: ColmiRingApiClient
     coordinator: ColmiRingDataUpdateCoordinator
     integration: Integration
+    # Owns the RAW motion stream; None when the motion options are off, which is
+    # why every user of it treats "no manager" as "stream cannot be busy".
+    motion: MotionManager | None = None

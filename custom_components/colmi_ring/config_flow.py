@@ -17,14 +17,33 @@ from .api import (
     ColmiRingApiClientError,
 )
 from .const import (
+    CONF_GESTURE_SENSITIVITY,
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
+    CONF_MOTION_ENABLED,
+    CONF_MOTION_LOG_SAMPLES,
+    CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
+    DEFAULT_GESTURE_SENSITIVITY,
+    DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
     DOMAIN,
+    GESTURE_SENSITIVITY_SCALE,
     LOGGER,
 )
+
+# Options flow labels for the sensitivity selector, in GESTURE_SENSITIVITY_SCALE's
+# declaration order so the dropdown reads low -> high.
+_GESTURE_SENSITIVITY_LABELS = {
+    "low": "Low (only clear movements)",
+    "medium": "Medium",
+    "high": "High (also slight movements)",
+}
+_GESTURE_SENSITIVITY_OPTIONS = [
+    {"value": key, "label": _GESTURE_SENSITIVITY_LABELS.get(key, key)}
+    for key in GESTURE_SENSITIVITY_SCALE
+]
 
 
 class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
@@ -162,6 +181,44 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_STEPS_BACKFILL,
                         default=self.config_entry.options.get(
                             CONF_STEPS_BACKFILL, False
+                        ),
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_MOTION_ENABLED,
+                        default=self.config_entry.options.get(
+                            CONF_MOTION_ENABLED, False
+                        ),
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_GESTURE_SENSITIVITY,
+                        default=self.config_entry.options.get(
+                            CONF_GESTURE_SENSITIVITY, DEFAULT_GESTURE_SENSITIVITY
+                        ),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=_GESTURE_SENSITIVITY_OPTIONS,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_MOTION_STREAM_TIMEOUT,
+                        default=self.config_entry.options.get(
+                            CONF_MOTION_STREAM_TIMEOUT,
+                            DEFAULT_MOTION_STREAM_TIMEOUT,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            # 0 means "stay on until switched off".
+                            min=0,
+                            max=480,
+                            step=5,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_MOTION_LOG_SAMPLES,
+                        default=self.config_entry.options.get(
+                            CONF_MOTION_LOG_SAMPLES, False
                         ),
                     ): selector.BooleanSelector(),
                 }

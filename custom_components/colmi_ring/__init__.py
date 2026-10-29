@@ -18,6 +18,7 @@ from .backfill import BackfillManager
 from .const import DOMAIN, LOGGER
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
+from .motion_manager import MotionManager
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -29,6 +30,10 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.NUMBER,
+    # Both are created only when the motion option is on; the platforms
+    # themselves check, so nothing appears when it is off.
+    Platform.SWITCH,
+    Platform.EVENT,
 ]
 
 
@@ -48,10 +53,18 @@ async def async_setup_entry(
         update_interval=timedelta(minutes=5),
         backfill=BackfillManager(hass, entry.entry_id),
     )
+    client = ColmiRingApiClient(hass=hass, ring_address=entry.data[CONF_ADDRESS])
+    # Always constructed (it does no I/O until asked) because the coordinator
+    # needs to be able to ask whether the stream is holding the connection even
+    # in setups where the option is off. The switch and event entities, in
+    # contrast, only appear when CONF_MOTION_ENABLED is on.
+    motion = MotionManager(hass, entry, client, coordinator)
+    coordinator.motion = motion
     entry.runtime_data = ColmiRingData(
-        client=ColmiRingApiClient(hass=hass, ring_address=entry.data[CONF_ADDRESS]),
+        client=client,
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,
+        motion=motion,
     )
 
     # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -70,6 +83,12 @@ async def async_unload_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
+    # Close a live stream before its entities disappear, and before the
+    # coordinator stops: otherwise the stream task is left holding a connection
+    # nobody owns any more.
+    motion = entry.runtime_data.motion
+    if motion is not None:
+        await motion.async_shutdown()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

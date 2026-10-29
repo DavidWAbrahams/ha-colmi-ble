@@ -79,6 +79,10 @@ class ColmiRingBlinkButton(ColmiRingEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button."""
+        # Checked here, not in async_press: these buttons fire their work in the
+        # background, so raising from the task would only ever reach the log
+        # instead of the UI.
+        self._assert_ring_free()
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -103,6 +107,7 @@ class ColmiRingRebootButton(ColmiRingEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button."""
+        self._assert_ring_free()
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -127,6 +132,7 @@ class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button (measurement takes ~30s; run it in the background)."""
+        self._assert_ring_free()
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -162,6 +168,7 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button (measurement takes ~30s; run it in the background)."""
+        self._assert_ring_free()
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .const import STREAM_BUSY_MESSAGE
 from .coordinator import ColmiRingDataUpdateCoordinator
+
+if TYPE_CHECKING:
+    from .motion_manager import MotionManager
 
 
 class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
@@ -23,3 +30,18 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
                 ),
             },
         )
+
+    def _motion_manager(self) -> MotionManager | None:
+        """The stream owner, or None if motion detection is not set up."""
+        return self.coordinator.motion
+
+    def _assert_ring_free(self) -> None:
+        """Refuse a ring command while the motion stream owns the connection.
+
+        The ring answers exactly one central, so a button press mid-stream
+        would either fail confusingly or tear the stream down; better to say so
+        plainly and let the user turn the switch off.
+        """
+        motion = self._motion_manager()
+        if motion is not None and motion.is_streaming:
+            raise HomeAssistantError(STREAM_BUSY_MESSAGE)

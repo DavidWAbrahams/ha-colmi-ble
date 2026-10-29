@@ -16,8 +16,6 @@ from homeassistant.core import callback
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 

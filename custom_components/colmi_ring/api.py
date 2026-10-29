@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ from .colmi_codec import (
     date_utils,
     hr,
     hr_settings,
+    motion,
     real_time,
     reboot,
     set_time as set_time_mod,
@@ -42,10 +44,13 @@ from .colmi_codec import (
 from .colmi_codec.hr import HeartRateLogParser
 from .colmi_codec.steps import SportDetailParser
 
-from .const import LOGGER
+from .const import (
+    LOGGER,
+    MOTION_STREAM_SILENCE_TIMEOUT_S,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from homeassistant.core import HomeAssistant
 
@@ -116,6 +121,15 @@ class _RingConnection:
         # Fresh, stateful parsers per connection so multi-packet logs don't leak.
         self._handlers: dict[int, Callable[[bytearray], Any]] = {}
         self._queues: dict[int, asyncio.Queue] = {}
+        # Open-ended streams (the RAW accelerometer) need every packet for a
+        # command byte, not one reply per command, so they register here.
+        self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
+        # Set when bleak reports the link dropped, so stream sessions can end
+        # instead of waiting out their own timeout.
+        self.dead = asyncio.Event()
+        # Monotonic timestamp of the most recent motion packet (see
+        # ``add_motion_timestamp``); used by the stream watchdog.
+        self.last_motion: float | None = None
 
     # Rings advertise roughly once per second, so HA's scanner normally
     # re-lists the device within a couple of poll attempts.
@@ -212,6 +226,25 @@ class _RingConnection:
     def _on_disconnect(self, _client: BleakClient) -> None:
         """Best-effort: wake any waiting readers so they don't hang."""
         LOGGER.debug("Colmi ring %s disconnected", self._address)
+        self.dead.set()
+
+    def add_listener(
+        self, cmd: int, listener: Callable[[bytearray], None]
+    ) -> None:
+        """Receive *every* notification whose command byte is ``cmd``."""
+        self._listeners.setdefault(cmd, []).append(listener)
+
+    def remove_listener(
+        self, cmd: int, listener: Callable[[bytearray], None]
+    ) -> None:
+        """Undo :meth:`add_listener`; unknown listeners are ignored."""
+        listeners = self._listeners.get(cmd)
+        if listeners and listener in listeners:
+            listeners.remove(listener)
+
+    def touch_motion(self) -> None:
+        """Record that motion data just arrived (feeds the stream watchdog)."""
+        self.last_motion = time.monotonic()
 
     async def _safe_disconnect(self) -> None:
         if self._client is None:
@@ -227,6 +260,15 @@ class _RingConnection:
             LOGGER.debug("Ignoring packet of unexpected length: %s", packet)
             return
         cmd = packet[0]
+        # Streams are served first and unconditionally: a command byte may have
+        # no one-shot queue at all (RAW motion never does). A listener raising
+        # must not tear down the notification callback for everyone else, so
+        # each call is fenced.
+        for listener in list(self._listeners.get(cmd, ())):
+            try:
+                listener(packet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring stream listener raised for cmd %s", cmd)
         handler = self._handlers.get(cmd)
         if handler is None:
             LOGGER.debug("Unexpected packet type %s from ring", cmd)
@@ -313,6 +355,48 @@ class _RingConnection:
         """Write the ring's heart-rate logging settings (no reply expected)."""
         await self._send(hr_settings.hr_log_settings_packet(settings))
 
+    async def start_motion_stream(self) -> None:
+        """Ask the ring to start streaming RAW accelerometer data."""
+        self.touch_motion()
+        await self._send(motion.get_raw_start_packet())
+
+    async def stop_motion_stream(self) -> None:
+        """Ask the ring to stop streaming; errors are best-effort ignored.
+
+        Called while tearing a session down, including after the link has
+        already dropped, where the write would raise.
+        """
+        try:
+            await self._send(motion.get_raw_stop_packet())
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Could not tell ring %s to stop streaming (already gone?)",
+                self._address,
+            )
+
+    async def set_camera_gesture(self, enabled: bool) -> bool:
+        """Toggle the ring's on-device camera-button (clap) detection.
+
+        Best-effort: the ring's answer to this command is not part of the
+        stream, so there is nothing to await beyond the write. Returns whether
+        the write reached the ring.
+        """
+        packet = (
+            motion.get_camera_gesture_on_packet()
+            if enabled
+            else motion.get_camera_gesture_off_packet()
+        )
+        try:
+            await self._send(packet)
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Could not set camera gesture %s on ring %s",
+                "on" if enabled else "off",
+                self._address,
+            )
+            return False
+        return True
+
     async def poll_real_time_reading(
         self, reading_type: real_time.RealTimeReading
     ) -> list[int]:
@@ -356,6 +440,36 @@ class _RingConnection:
 
         await self._send(real_time.get_stop_packet(reading_type))
         return valid
+
+
+class MotionSession:
+    """A live RAW-motion session: one open connection with the stream on.
+
+    Handed out by :meth:`ColmiRingApiClient.async_stream_motion`. The holder
+    may end the session early with :meth:`request_stop` (the auto-off timer does
+    this); the transport ends it itself if the link drops or the stream goes
+    silent.
+    """
+
+    def __init__(self, conn: _RingConnection) -> None:
+        self.conn = conn
+        self._stopped = asyncio.Event()
+        self.reason: str | None = None
+
+    def request_stop(self, reason: str) -> None:
+        """Ask the session to close; the first reason wins."""
+        if self.reason is None:
+            self.reason = reason
+        self._stopped.set()
+
+    async def enable_camera_gesture(self, enabled: bool) -> bool:
+        """Toggle the ring's on-device camera-button (clap) detection."""
+        return await self.conn.set_camera_gesture(enabled)
+
+    async def wait_stopped(self) -> str | None:
+        """Block until the session is over, returning the closing reason."""
+        await self._stopped.wait()
+        return self.reason
 
 
 class ColmiRingApiClient:
@@ -673,3 +787,111 @@ class ColmiRingApiClient:
             "heart_rate": median,
             "heart_rate_timestamp": datetime.now(tz=timezone.utc),
         }
+
+    # How often the stream watchdog inspects link/silence state, and how long
+    # to wait before reconnecting a stream that died on its own.
+    _STREAM_WATCHDOG_S = 5.0
+    _STREAM_RETRY_S = 10.0
+
+    @asynccontextmanager
+    async def _motion_stream(
+        self, on_packet: Callable[[bytearray], None]
+    ) -> AsyncIterator[MotionSession]:
+        """Hold the connection open with RAW streaming on, until stopped.
+
+        The ring serves a single central, so this connection *is* the link for
+        as long as it lives: nothing else may talk to the ring concurrently (the
+        coordinator pauses its polls, see ``MotionManager``).
+        """
+        conn = _RingConnection(self._hass, self._ring_address)
+        session = MotionSession(conn)
+        listener = self._make_motion_listener(session, on_packet)
+        async with conn:
+            conn.add_listener(motion.CMD_RAW_MODE, listener)
+            conn.add_listener(motion.CMD_CAMERA_GESTURE, listener)
+            conn.touch_motion()
+            await conn.start_motion_stream()
+            watchdog = asyncio.create_task(self._watch_stream(session))
+            try:
+                # The context manager's ``__aexit__`` runs on every exit path,
+                # including an exception raised inside the ``async with`` body.
+                yield session
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except asyncio.CancelledError:
+                    pass
+                conn.remove_listener(motion.CMD_RAW_MODE, listener)
+                conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
+                await conn.stop_motion_stream()
+
+    @staticmethod
+    def _make_motion_listener(
+        session: MotionSession, on_packet: Callable[[bytearray], None]
+    ) -> Callable[[bytearray], None]:
+        """Wrap the caller's callback so silence tracking stays automatic."""
+
+        def listener(packet: bytearray) -> None:
+            session.conn.touch_motion()
+            on_packet(packet)
+
+        return listener
+
+    async def _watch_stream(self, session: MotionSession) -> None:
+        """Close the session if the link drops or the stream stops reporting."""
+        while True:
+            await asyncio.sleep(self._STREAM_WATCHDOG_S)
+            if session.conn.dead.is_set():
+                session.request_stop("disconnected")
+                return
+            last = session.conn.last_motion
+            if (
+                last is not None
+                and time.monotonic() - last > MOTION_STREAM_SILENCE_TIMEOUT_S
+            ):
+                session.request_stop("silent")
+                return
+
+    async def async_stream_motion(
+        self,
+        on_packet: Callable[[bytearray], None],
+        should_run: Callable[[], bool],
+        on_session: Callable[[MotionSession], None] | None = None,
+    ) -> str | None:
+        """Run one motion-stream session, restarting it while still wanted.
+
+        ``on_packet`` receives every RAW/gesture notification. ``should_run``
+        is polled before each (re)connect and is what ends the loop when the
+        user turns the stream off. Returns the reason the stream finally
+        stopped, or ``None`` if it could not be opened.
+
+        Connection failures are reported as a return value rather than raised: a
+        stream that cannot start should let the caller log one line and mark its
+        switch off, not raise out of a service call.
+        """
+        while should_run():
+            try:
+                async with self._motion_stream(on_packet) as session:
+                    if on_session is not None:
+                        on_session(session)
+                    reason = await session.wait_stopped()
+            except ColmiRingApiClientError as err:
+                LOGGER.debug(
+                    "Colmi ring %s motion stream could not start: %s",
+                    self._ring_address,
+                    err,
+                )
+                return None
+            # A session that died on its own is worth retrying only while the
+            # user still wants the stream; a user-requested stop is final.
+            if reason in ("disconnected", "silent") and should_run():
+                LOGGER.info(
+                    "Colmi ring %s motion stream ended (%s); reconnecting",
+                    self._ring_address,
+                    reason,
+                )
+                await asyncio.sleep(self._STREAM_RETRY_S)
+                continue
+            return reason
+        return None
