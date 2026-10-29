@@ -58,6 +58,54 @@ _KIND_UNIQUE_SUFFIX: dict[str, str | None] = {
 # (timestamp, steps, distance, calories_kcal).
 _SPORT_INDEX = {"steps": 1, "distance": 2, "calories": 3}
 
+# SQLite allows a single writer. Our import runs in the recorder's executor but
+# is a *separate* transaction from the recorder's own commit loop, so on SQLite
+# it regularly collides with it and the whole transaction is rejected with
+# ``OperationalError: database is locked``. A rejected transaction rolls back
+# (nothing is half-inserted, and the watermark is not advanced), so retrying it
+# is safe. Three attempts wait 0.25 s then 0.5 s: about the time a recorder
+# commit takes to land, and small enough that four sensors' worth of retries
+# cannot stall the poll that triggered the sync.
+_LOCK_RETRIES = 3
+_LOCK_BACKOFF_S = 0.25
+
+# How far back the attribute-repair pass reaches. It exists so imported rows
+# carry the same unit_of_measurement/device_class as live ones, which the block
+# processor only checks in the window it is currently compiling statistics for;
+# an unbounded UPDATE rewrites the entity's *entire* history while holding the
+# SQLite write lock, which is what loses the race against a busy recorder.
+_REPAIR_WINDOW_S = 2 * 86400
+
+# How writer contention surfaces, per recorder backend: SQLite says ``database
+# is locked`` (SQLITE_BUSY) or ``database table is locked``, MariaDB reports a
+# deadlock, PostgreSQL a serialization failure. SQLAlchemy wraps the DB-API
+# error, so the text is matched across the whole exception chain instead of by
+# exception class: importing ``sqlalchemy.exc`` here would couple this module to
+# the recorder's engine at import time.
+_DB_BUSY_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "deadlock found",
+    "could not serialize access",
+)
+
+
+def _db_is_busy(err: BaseException) -> bool:
+    """True if ``err`` (or anything it wraps) is SQLite writer contention."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [err]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if any(marker in str(current).lower() for marker in _DB_BUSY_MARKERS):
+            return True
+        linked = [current.__cause__, current.__context__]
+        linked.append(getattr(current, "orig", None))
+        pending.extend(item for item in linked if isinstance(item, BaseException))
+    return False
+
 
 def _cumulative_sport_series(
     bins: list[tuple[datetime, int, int, float]], index: int
@@ -313,8 +361,21 @@ class BackfillManager:
         ]
         try:
             inserted = await self._async_import_history(recorder, entity_id, rows)
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("Colmi ring %s history backfill failed", kind)
+        except Exception as err:  # noqa: BLE001
+            if _db_is_busy(err):
+                # The recorder's own writer had the database locked for longer
+                # than our retries. Nothing was written and the watermark is
+                # untouched, so the next poll imports the same backlog; the
+                # backlog drains on its own and a busy database is not worth a
+                # traceback every poll.
+                LOGGER.debug(
+                    "Colmi ring %s history backfill deferred: the recorder"
+                    " database is busy (%s)",
+                    kind,
+                    err,
+                )
+            else:
+                LOGGER.exception("Colmi ring %s history backfill failed", kind)
             return False, had_day
         new_wm = pending[-1][0]
         if watermark is None or new_wm > watermark:
@@ -385,12 +446,22 @@ class BackfillManager:
                     .limit(1)
                 ).scalar_one_or_none()
                 if attributes_id is not None:
-                    # Repair any rows a previous import left attribute-less.
+                    # Repair rows an older import (before imported rows carried
+                    # attributes) left attribute-less, but only inside the
+                    # window statistics still look at: an unbounded UPDATE
+                    # rewrites the entity's whole history while holding the
+                    # SQLite write lock, which is exactly what loses the race
+                    # with the recorder's own writer.
+                    repair_cutoff = _ts(
+                        datetime.now(tz=timezone.utc)
+                        - timedelta(seconds=_REPAIR_WINDOW_S)
+                    )
                     session.execute(
                         update(States)
                         .where(
                             States.metadata_id == metadata_id,
                             States.attributes_id.is_(None),
+                            States.last_updated_ts >= repair_cutoff,
                         )
                         .values(attributes_id=attributes_id)
                     )
@@ -428,7 +499,22 @@ class BackfillManager:
                     inserted += 1
                 return inserted
 
-        return await recorder.async_add_executor_job(_import)
+        # Retry the whole transaction, not the failing statement: SQLite
+        # rejects the entire transaction on writer contention and rolls it back
+        # in full, so re-running it cannot leave half a batch behind nor
+        # duplicate rows. Waiting happens in the event loop, not in the
+        # recorder's thread.
+        attempts_left = _LOCK_RETRIES
+        while True:
+            attempts_left -= 1
+            try:
+                return await recorder.async_add_executor_job(_import)
+            except Exception as err:  # noqa: BLE001
+                if not attempts_left or not _db_is_busy(err):
+                    raise
+                await asyncio.sleep(
+                    _LOCK_BACKOFF_S * 2 ** (_LOCK_RETRIES - attempts_left - 1)
+                )
 
     def _async_entity_id(self, kind: str) -> str | None:
         """Resolve the sensor entity id registered for one backfill kind."""

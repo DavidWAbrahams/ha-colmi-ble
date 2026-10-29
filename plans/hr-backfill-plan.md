@@ -98,8 +98,43 @@ flowchart TD
   small offsets are inherent to the hardware (same as the existing latest-sample logic).
 - **Restart**: watermarks in `.storage` → no duplicate imports; first-ever run imports
   the whole day, which is the desired "log the old readings" behavior.
-- **Recorder absent / entity not yet registered / import error**: degrade silently.
+- **Recorder absent / entity not yet registered / import error**: no crash and no
+  watermark change, so the same backlog is retried on the next poll. Writer contention is
+  logged at DEBUG (see below); anything else logs a traceback, since it is a real bug.
 - **`hr_live` on-demand readings** are not in the ring log; not backfilled (v1).
+
+### Writer contention: `sqlite3.OperationalError: database is locked`
+
+Observed on-device as an ERROR every few polls once the steps-family backfill started
+running (`Colmi ring steps history backfill failed`, raised from the bulk
+`UPDATE states SET attributes_id=? WHERE metadata_id=? AND attributes_id IS NULL`).
+
+SQLite permits exactly **one writer**. Our import runs inside the recorder's own executor
+via `session_scope(session=recorder.get_session())`, which makes it a *peer* of the
+recorder's commit loop rather than part of it: two independent write transactions on the
+same file. Whichever one is refused fails fast — HA's engine does not wait on the lock —
+and the whole transaction is rolled back.
+
+Two things made the collision likely, and both are now fixed in `backfill.py`:
+
+1. **The unbounded attribute-repair `UPDATE`.** Rewriting every `states` row of the
+   entity, for a whole day of history, is the longest-running write in the batch — and it
+   only ever existed to repair rows imported *before* imported rows started carrying
+   `attributes_id` (freshly inserted rows already get it). It is now restricted to the
+   last `_REPAIR_WINDOW_S` (2 days), which is the window the block processor actually
+   inspects when compiling statistics.
+2. **No retry.** `_async_import_history` now re-runs the whole transaction up to
+   `_LOCK_RETRIES` times with exponential backoff (0.25 s, then 0.5 s). Retrying the
+   transaction is safe: it rolled back in full, and the watermark only advances after a
+   successful commit, so no rows are duplicated or lost. Waiting happens with
+   `asyncio.sleep` in the event loop, never inside the recorder's thread.
+
+Contention is detected by `_db_is_busy()`, which walks the exception chain
+(`__cause__`, `__context__`, SQLAlchemy's `.orig`) looking for the backend's busy/deadlock
+text. Matching text rather than exception class avoids importing `sqlalchemy.exc` at
+module import time. When retries are exhausted the failure is logged at DEBUG instead of
+`LOGGER.exception`: nothing was lost, the backlog drains on a later poll, and a busy
+database does not deserve a traceback every five minutes.
 
 ### Metric scope by data availability
 
