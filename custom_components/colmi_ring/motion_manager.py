@@ -69,6 +69,12 @@ _REST_TRUST_G = 0.35
 # problem, and naming them all would only bury the log.
 _MAX_UNKNOWN_KINDS = 6
 
+# Frame kinds the stream is known to send alongside the samples and that carry
+# nothing we decode: measured over a 77 s session to arrive exactly once per
+# second next to the 0xA1/3 sample, always near-identical in content. They are
+# per-tick status echoes, not a codec problem, so they must not be warned about.
+_BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02)})
+
 
 class MotionManager:
     """Start/stop the ring's RAW stream and turn it into gesture events."""
@@ -392,17 +398,18 @@ class MotionManager:
             self._publish(event)
 
     def _log_unknown_packet(self, packet: bytearray) -> None:
-        """Name each kind of undecodable frame once, with one example.
+        """Name each kind of genuinely surprising undecodable frame once.
 
         A ring that answers the RAW command but never yields a decodable sample
         is the failure that looks like a silent ring: the session stays open, the
         sensors stay ``unknown``, and no gesture ever fires. The deciding detail
         is the command/subtype pair, because that is what ``colmi_codec/motion.py``
-        matches on, so each new pair earns one WARNING with its payload; repeats
-        stay quiet (``api.py`` already logs every frame at DEBUG).
+        matches on, so each new pair earns one WARNING with its payload. Known
+        benign per-tick frames are dropped silently, and repeats stay quiet, so a
+        healthy session produces no log noise from this path at all.
         """
         kind = (packet[0], packet[1] if len(packet) > 1 else 0)
-        if kind in self._unknown_kinds:
+        if kind in _BENIGN_STREAM_FRAMES or kind in self._unknown_kinds:
             return
         if len(self._unknown_kinds) >= _MAX_UNKNOWN_KINDS:
             return
@@ -410,9 +417,9 @@ class MotionManager:
         self._unknown_kinds[kind] = payload
         LOGGER.warning(
             "Colmi ring motion stream sent a frame we cannot decode: command"
-            " 0x%02X, subtype 0x%02X (%s). If this is the accelerometer stream,"
-            " the layout assumed in colmi_codec/motion.py is wrong and no"
-            " gesture can ever be detected",
+            " 0x%02X, subtype 0x%02X (%s). If this is meant to be the"
+            " accelerometer stream, the layout assumed in colmi_codec/motion.py"
+            " is wrong and no gesture can ever be detected",
             kind[0],
             kind[1],
             payload,

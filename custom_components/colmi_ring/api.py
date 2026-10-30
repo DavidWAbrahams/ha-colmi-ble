@@ -168,6 +168,11 @@ class _RingConnection:
         # Open-ended streams (the RAW accelerometer) need every packet for a
         # command byte, not one reply per command, so they register here.
         self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
+        # Command bytes already reported as unexpected on this link. An
+        # unfamiliar byte is a diagnosis the first time and a flood afterwards,
+        # since a stream repeats its frames every second, so each one is named
+        # at most once per connection.
+        self._logged_unexpected: set[int] = set()
         # Monotonic time the link came up, so a disconnect can be reported with
         # how long it lasted: "the stream died 29 ms after opening" and "the
         # stream died after 20 minutes" are completely different bugs, and
@@ -397,27 +402,34 @@ class _RingConnection:
         # no one-shot queue at all (RAW motion never does). A listener raising
         # must not tear down the notification callback for everyone else, so
         # each call is fenced.
-        for listener in list(self._listeners.get(cmd, ())):
+        listeners = self._listeners.get(cmd, ())
+        for listener in list(listeners):
             try:
                 listener(packet)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring stream listener raised for cmd %s", cmd)
         handler = self._handlers.get(cmd)
         if handler is None:
-            # Hex as well as decimal, plus the whole payload: the command bytes
-            # this integration knows are a small table, so an unfamiliar one is
-            # easier to recognise (and look up) as 0x2F than as 47, and the body
-            # is the only evidence available when the ring invents a notification
-            # type we have no parser for (e.g. the RAW stream using a command
-            # byte other than the guessed 0xA1). The purpose says *which* session
-            # received it - the deciding detail when a stream and a poll overlap.
-            LOGGER.debug(
-                "Unexpected packet type %s (0x%02X) from ring during %s session: %s",
-                cmd,
-                cmd,
-                self._purpose,
-                packet.hex(),
-            )
+            # A frame a stream listener consumed is exactly what that session
+            # asked for, so it is not unexpected: at one bundle per second,
+            # logging it would bury everything else in the log. Anything else
+            # is named once per link. Hex as well as decimal, plus the whole
+            # payload: the command bytes this integration knows are a small
+            # table, so an unfamiliar one is easier to recognise (and look up)
+            # as 0x2F than as 47, and the body is the only evidence available
+            # when the ring invents a notification type we have no parser for.
+            # The purpose says *which* session received it - the deciding detail
+            # when a stream and a poll overlap.
+            if not listeners and cmd not in self._logged_unexpected:
+                self._logged_unexpected.add(cmd)
+                LOGGER.debug(
+                    "Unexpected packet type %s (0x%02X) from ring during %s"
+                    " session: %s",
+                    cmd,
+                    cmd,
+                    self._purpose,
+                    packet.hex(),
+                )
             return
         result = handler(packet)
         if result is not None:
