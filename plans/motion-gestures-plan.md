@@ -572,6 +572,78 @@ sensitivity scaling from the orientation test.
   - A session that stays open past 10 s -> the fault was in the previous build's arming path, and
     the run proceeds to the real Phase 5 questions: sample rate, scale, axis signs.
 
+#### Fifth on-device run (2026-10-29): root cause — a Home Assistant API we never had
+
+    17:21:54.541 DEBUG RAW-stream start packet: a10404000000000000000000000000a9
+    17:21:54.542 INFO  Colmi ring motion stream open; waiting for accelerometer data
+    17:21:54.542 ERROR Colmi ring motion stream arming callback raised; closing the session
+      File ".../api.py", line 1308, in _arm_session          on_session(session)
+      File ".../motion_manager.py", line 267, in _on_session  self._schedule_auto_off()
+      File ".../motion_manager.py", line 439, in _schedule_auto_off
+        self._timer = self._hass.async_call_later(
+    AttributeError: 'HomeAssistant' object has no attribute 'async_call_later'
+    17:21:54.545 INFO  motion stream closed after 0.0s (ABORTED (never stopped by anyone)) with 0 notification(s) ...: none
+    17:21:54.609 DEBUG motion stream session disconnected (after 0.068s, closed by us)
+    17:21:54.610 ERROR motion stream aborted while the session was open; closing it and retrying
+    17:21:55.839 / 17:21:58.244 / 17:22:03.826 / 17:22:12.667  ERROR ... aborted again (same traceback)
+    17:21:58.298 DEBUG Unexpected packet type 161 (0xA1) from ring during motion stream session:
+              a101000000d2009800b00100000000bd
+    17:21:58.298 DEBUG Unexpected packet type 161 (0xA1) from ring during motion stream session:
+              a10200002df72ced010a0100000000ec
+
+- Run 4's decision table paid off on the first redeploy: the **`arming callback raised`** branch,
+  with the traceback naming the exact frame. `HomeAssistant` has no `async_call_later`; the timer
+  helper is `homeassistant.helpers.event.async_call_later(hass, delay, action)`, which returns the
+  unsubscribe callable that `self._timer: Callable[[], None]` already expects. Both call sites
+  (`_schedule_auto_off`, and the rate probe in `_on_session` that would have failed one line later)
+  now use the helper. This is the whole bug: an `AttributeError` 0–2 ms after every session opened,
+  unwinding a healthy transport, switching the entity off and triggering the post-mortem poll.
+- Every mechanism added in run 4 behaved as designed — `_arm_session` attributed the fault to the
+  manager instead of a ring rejection, `ABORTED (never stopped by anyone)` named the unwind, and the
+  retry budget escalated 1 s → 2 s → 5 s → 9 s instead of resetting forever on a 2 ms session.
+- **The ring does answer `A1 04 04`.** Two `0xA1` notifications arrived 54 ms after the start write
+  of the 17:21:58 attempt — after that session had already been aborted and its listeners removed,
+  which is exactly why the close line still reported `0 notification(s)` and a tally of `none`. The
+  "R02 may refuse the RAW command" hypothesis is dead.
+- Both frames are **checksum-valid** (`sum(packet[:15]) & 0xFF` equals the trailing byte: `0xBD`,
+  `0xEC`; our own `A1 04 04` checks out at `0xA9`). They are well-formed protocol replies, not noise
+  or truncation.
+- But their subtypes are `01` and `02`, and `parse_accel_packet` only accepts `TYPE_POSITION = 3`.
+  What the current codec derives from them (measured, not guessed):
+  - `0xA1/1`: `x +0.016 g, y 0.000 g, z +0.004 g`, `|v| 0.016 g`, and only offsets 5, 7, 9, 10 are
+    non-zero — an acknowledgement, not a sample.
+  - `0xA1/2`: `x +1.400 g, y 0.000 g, z +1.420 g`, `|v| 1.994 g`, non-zero from offset 4 to 10.
+    `02` is our own `SUB_RAW_OFF`, so a reply is the natural reading.
+  - The suggestive part: a brute-force search over every axis offset triplet, both nibble
+    conventions and full scales of 2/4/8/16 g finds **no** layout that makes `0xA1/1` look like a
+    resting ring (closest `|v|` = 1.249 g), but `0xA1/2` lands on **0.9975 g** if the full scale were
+    **2 g** instead of 4 g (offsets 4, 6, 8; the high-nibble variant gives 1.0034 g at offsets
+    2, 4, 6). One frame at one magnitude is not evidence — but it is the single concrete
+    alternative-layout lead, so keep it in mind if the next run shows a real stream that decodes to
+    ~2 g instead of ~1 g.
+  Neither frame is the stream (a stream is many frames per second, and the tally would show it), so
+  the sample-rate question stays open; guessing a new layout from two frames would be unfounded.
+- Changes, all in `motion_manager.py`:
+  - `from homeassistant.helpers.event import async_call_later`, and both timers call it with
+    `self._hass` as their first argument.
+  - Undecodable frames are now named by the manager itself instead of only appearing as api's DEBUG
+    "Unexpected packet type" line (which fires for *every* RAW frame, since RAW registers no one-shot
+    handler). `_log_unknown_packet` logs the command/subtype pair and one example payload once per
+    kind per session, capped at `_MAX_UNKNOWN_KINDS`, and `_async_check_rate` appends the kinds it
+    saw when it finds no sample — so a session that survives reports the exact pair to teach the
+    codec, at WARNING, without needing DEBUG logging enabled.
+- What the next run decides:
+  - `motion stream: N Hz over M samples, median magnitude ~1 g` -> the decode is right; go tune
+    thresholds against real data (the actual Phase 5 goal).
+  - `no accelerometer sample in 5 seconds (received 0xA1/1, 0xA1/2 instead)` plus the WARNING
+    payloads -> the ring replies but streams elsewhere or in another layout; fix
+    `colmi_codec/motion.py` from those frames.
+  - A magnitude warning (median far from 1 g while samples do decode) -> scale or bit-packing is
+    wrong, not the gesture logic. If the median sits near **2 g**, that is the 2 g-full-scale lead
+    above confirmed, and the fix is one constant in `colmi_codec/motion.py`.
+  - A session that lives past 10 s and then ends on its own -> a transport question again, and by
+    now the log would say which.
+
 ## Risks
 
 | Risk | Mitigation |

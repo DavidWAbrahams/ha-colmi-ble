@@ -25,6 +25,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.helpers.event import async_call_later
+
 from .api import ColmiRingApiClient, MotionSession
 from .colmi_codec.motion import (
     AccelSample,
@@ -61,6 +63,12 @@ _RATE_PROBE_S = 5.0
 # treated as suspect. Generous, because a hand is never perfectly still.
 _REST_TRUST_G = 0.35
 
+# How many distinct kinds of undecodable frame to name per session. The question
+# they answer is which command/subtype pair carries the accelerometer stream, so
+# a handful is a diagnosis; a stream inventing more than that is a different
+# problem, and naming them all would only bury the log.
+_MAX_UNKNOWN_KINDS = 6
+
 
 class MotionManager:
     """Start/stop the ring's RAW stream and turn it into gesture events."""
@@ -87,6 +95,8 @@ class MotionManager:
         self._muted_until = 0.0
         self._log_samples = False
         self._logged_rate = False
+        # (command, subtype) -> first payload seen for that kind this session.
+        self._unknown_kinds: dict[tuple[int, int], str] = {}
 
         self.is_streaming = False
         # Newest decoded sample, for the accelerometer sensors. None whenever no
@@ -263,10 +273,11 @@ class MotionManager:
             "Colmi ring motion stream open; waiting for accelerometer data"
         )
         self._detector.reset()
+        self._unknown_kinds.clear()
         self._muted_until = time.monotonic() + MOTION_STARTUP_MUTE_S
         self._schedule_auto_off()
-        self._rate_timer = self._hass.async_call_later(
-            _RATE_PROBE_S, self._async_check_rate
+        self._rate_timer = async_call_later(
+            self._hass, _RATE_PROBE_S, self._async_check_rate
         )
         # The RAW-stream command is the only thing written to the ring during a
         # session unless the camera gesture is explicitly re-enabled. That write
@@ -320,9 +331,10 @@ class MotionManager:
         if rate is None:
             LOGGER.info(
                 "Colmi ring motion stream has reported no accelerometer sample"
-                " in %d seconds%s",
+                " in %d seconds%s%s",
                 int(_RATE_PROBE_S),
                 magnitude,
+                self._unknown_summary(),
             )
         elif self._detector.rate_is_too_low():
             self._detector.stream_clap = False
@@ -369,7 +381,7 @@ class MotionManager:
 
         sample = parse_accel_packet(packet)
         if sample is None:
-            LOGGER.debug("Colmi ring sent an unknown stream packet: %s", packet.hex())
+            self._log_unknown_packet(packet)
             return
         if self._log_samples and LOGGER.isEnabledFor(logging.DEBUG):
             LOGGER.debug(
@@ -378,6 +390,40 @@ class MotionManager:
         self._publish_sample(sample)
         for event in self._detector.feed(sample):
             self._publish(event)
+
+    def _log_unknown_packet(self, packet: bytearray) -> None:
+        """Name each kind of undecodable frame once, with one example.
+
+        A ring that answers the RAW command but never yields a decodable sample
+        is the failure that looks like a silent ring: the session stays open, the
+        sensors stay ``unknown``, and no gesture ever fires. The deciding detail
+        is the command/subtype pair, because that is what ``colmi_codec/motion.py``
+        matches on, so each new pair earns one WARNING with its payload; repeats
+        stay quiet (``api.py`` already logs every frame at DEBUG).
+        """
+        kind = (packet[0], packet[1] if len(packet) > 1 else 0)
+        if kind in self._unknown_kinds:
+            return
+        if len(self._unknown_kinds) >= _MAX_UNKNOWN_KINDS:
+            return
+        payload = packet.hex()
+        self._unknown_kinds[kind] = payload
+        LOGGER.warning(
+            "Colmi ring motion stream sent a frame we cannot decode: command"
+            " 0x%02X, subtype 0x%02X (%s). If this is the accelerometer stream,"
+            " the layout assumed in colmi_codec/motion.py is wrong and no"
+            " gesture can ever be detected",
+            kind[0],
+            kind[1],
+            payload,
+        )
+
+    def _unknown_summary(self) -> str:
+        """The undecodable kinds seen this session, for the rate-check line."""
+        if not self._unknown_kinds:
+            return ""
+        kinds = ", ".join(f"0x{cmd:02X}/{sub}" for cmd, sub in self._unknown_kinds)
+        return f" (received {kinds} instead)"
 
     def _publish_sample(self, sample: AccelSample) -> None:
         """Hand the newest sample to the sensors, at most once per second.
@@ -436,8 +482,8 @@ class MotionManager:
         minutes = self._timeout_minutes()
         if minutes <= 0:
             return
-        self._timer = self._hass.async_call_later(
-            minutes * 60.0, self._async_auto_off
+        self._timer = async_call_later(
+            self._hass, minutes * 60.0, self._async_auto_off
         )
 
     def _async_auto_off(self, _now: Any) -> None:
