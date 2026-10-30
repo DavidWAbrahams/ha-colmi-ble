@@ -177,6 +177,53 @@ MOTION_CLAP_REFRACTORY_S = 0.6
 MOTION_GESTURE_COOLDOWN_S = 1.2
 MOTION_GESTURE_SUPPRESS_S = 0.5
 
+# --- Ring angle (tilt) tuning ---------------------------------------------
+#
+# See :class:`TiltTracker`. The RAW stream carries no gyroscope, so the only
+# pose information in it is the direction of gravity in the sensor's own frame;
+# the reported angle is how far that direction has moved since the ring was last
+# zeroed.
+
+# Time constant of the low-pass applied to that direction. The angle is taken
+# from the filtered vector rather than from each raw sample: the accelerometer's
+# least significant bit is 4 g / 2048, which at 1 g is about 0.11 degrees, and
+# acos has an infinite derivative there - so raw samples would jitter by several
+# degrees around a hand that is not moving at all.
+MOTION_TILT_TAU_S = 0.5
+
+# Discard samples whose magnitude strays this far from 1 g. Their direction is
+# then mostly the movement rather than gravity, so letting them in would drag the
+# pose estimate toward wherever the hand happens to be accelerating; the estimate
+# simply holds its value while they last.
+MOTION_TILT_TRUST_G = 0.3
+
+# The zero pose is captured from a window of stillness this long, so what gets
+# recorded is the pose the hand is actually resting in rather than whichever
+# mid-swing sample happened to arrive first.
+MOTION_TILT_ZERO_STILL_S = 0.75
+
+# ...and the window must hold at least this many samples, so a single quiet
+# reading at the top of a bounce cannot define "zero".
+MOTION_TILT_MIN_ZERO_SAMPLES = 3
+
+# Poses in that window must also agree this closely. Sitting near 1 g is not the
+# same as being still - a slow rotation reads as 1 g the whole way round - so the
+# window has to be a run of poses that point the same way, and anything further
+# from their median than this starts a new window. Loose enough to admit the
+# tremor of a real hand, tight enough that a slow sweep of the arm does not
+# define a pose somewhere in the middle of itself.
+MOTION_TILT_ZERO_TOLERANCE_DEG = 8.0
+
+# A hand that never holds still must not leave the sensor unknown for the whole
+# session: after this long the zero pose is taken from the current estimate
+# instead, however imperfect, and the user can re-zero from the button.
+MOTION_TILT_ZERO_TIMEOUT_S = 4.0
+
+# Report zero below this angle. A resting hand produces a little residual noise
+# however well filtered, and the recorder does not need a row per wiggle; tilt
+# gestures are slow and deliberate, so this much deadband costs nothing visible.
+MOTION_TILT_DEADBAND_DEG = 1.5
+
 # How long the RAW stream may stay silent before the session is considered
 # dead and closed. Generous because the stock firmware is known to report
 # slowly, and proxy latency adds to it.

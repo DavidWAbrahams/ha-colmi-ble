@@ -46,9 +46,10 @@ Enable it in the integration's options ("Enable gesture detection"). That adds:
 
 - a `Motion Stream` switch,
 - an event entity - `Clap` - that you can use directly as an automation
-  trigger, and
+  trigger,
 - four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
-  `Acceleration` (the magnitude) - see below.
+  `Acceleration` (the magnitude) - see below, and
+- a `Ring Angle` sensor with a `Calibrate Ring Angle` button - see below.
 
 There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
 we may implement:
@@ -94,12 +95,33 @@ These are deliberately *unprocessed*: no low-pass filter, no gravity removal, no
 solving.
 
 In the stock firmware, these messages are sent once per second. You can easily flash a modified firmware
-from your browser that increases this to 4 per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using (ATC RF03 Ring OTA Flasher)[https://atc1441.github.io/ATC_RF03_Writer.html]. If you do this, you will likely want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25.
+from your browser that increases this to 4 per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using [ATC RF03 Ring OTA Flasher](https://atc1441.github.io/ATC_RF03_Writer.html). If you do this, you will likely want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25.
 
 The motion sensors read `unknown` whenever the motion stream is off. Updates are published about once a second
 rather than at the full stream rate - every state change is a recorder row, and a higher rate could
 swamp your database. Automations that need the sharp signal could use
 the gesture event(s).
+
+## Ring angle
+
+`sensor.<ring>_ring_angle` is the one derived motion sensor: how far the ring has tilted, in degrees,
+from the pose it was last zeroed in. `0` is that pose, `90` is a quarter turn away from it, and `180`
+is upside down.
+
+It is derived from the accelerometer alone, on the assumption that a still ring reads gravity. Two
+consequences are worth knowing before building an automation on it:
+
+- it measures *tilt*, not *roll*. A still accelerometer cannot see rotation about the direction of
+  gravity, so turning your hand like a doorknob leaves the value alone. A single non-negative number
+  is the whole story for that reason.
+- it cannot drift, because nothing is integrated. Bring your hand back to the zero pose and the
+  sensor returns to zero.
+
+The angle is zeroed automatically on the first still pose after the stream starts, and on demand by
+the `Calibrate Ring Angle` button. That button is the one control that works *while* the stream is on:
+it writes nothing to the ring, so the stream keeps running and the sensor simply starts counting from
+wherever your hand happens to be. The reading is low-pass filtered and has a small deadband, so a
+resting hand holds a steady `0` instead of wandering by a few degrees.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

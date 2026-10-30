@@ -1061,6 +1061,14 @@ class ColmiRingApiClient:
                 conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
                 self._log_stream_session(session, tally)
                 await conn.stop_motion_stream()
+                # Undo the camera-gesture enable from the session start. It is a
+                # setting the ring remembers after we disconnect, so leaving it
+                # on would keep its detector running - and its battery cost -
+                # for as long as the ring is worn. Sent second because a stream
+                # still running is the more urgent thing to silence, and this
+                # write is the one that can be lost if that first write is what
+                # finally kills the link.
+                await conn.set_camera_gesture(False)
 
     def _log_stream_session(
         self, session: MotionSession, tally: _StreamTally

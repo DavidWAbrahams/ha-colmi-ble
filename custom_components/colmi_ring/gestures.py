@@ -23,6 +23,11 @@ Two guards keep ordinary life from producing gestures:
 * a raise/lower must also be corroborated by a real swing of the gravity
   direction between the start and the peak of the movement, so vibration or a
   jiggling walk cannot pass.
+
+The file also holds :class:`TiltTracker`, which reports how far the ring has
+tilted from the pose it was zeroed in. It is here rather than in its own module
+because it reuses the same helpers and the same "feed it every sample" contract
+as the detector, and because it is just as replayable offline.
 """
 
 from __future__ import annotations
@@ -55,6 +60,13 @@ from .const import (
     MOTION_RAISE_MAX_PEAK_S,
     MOTION_RAISE_PITCH_DEG,
     MOTION_RAISE_VELOCITY_G_S,
+    MOTION_TILT_DEADBAND_DEG,
+    MOTION_TILT_MIN_ZERO_SAMPLES,
+    MOTION_TILT_TAU_S,
+    MOTION_TILT_TRUST_G,
+    MOTION_TILT_ZERO_STILL_S,
+    MOTION_TILT_ZERO_TIMEOUT_S,
+    MOTION_TILT_ZERO_TOLERANCE_DEG,
     MOTION_VELOCITY_LEAK_TAU_S,
 )
 
@@ -659,4 +671,240 @@ class GestureDetector:
         """Note that ``gesture`` fired, for cooldown and mutual suppression."""
         self._last_fire[gesture] = now
         self._last_any_fire = now
+
+
+def _separation_deg(a: AccelSample, b: AccelSample) -> float:
+    """Angle in degrees between two directions, over the full 0..180 range.
+
+    Unlike :func:`_angle_deg` this does not ignore which way round the vectors
+    are: for a tilt, pointing the ring the other way round *is* a big change in
+    pose, and folding it into 0..90 would report it as a small one.
+    """
+    cosine = max(-1.0, min(1.0, a.dot(b)))
+    return math.degrees(math.acos(cosine))
+
+
+def _slerp(old: AccelSample, new: AccelSample, weight: float) -> AccelSample:
+    """Rotate ``old`` toward ``new`` by ``weight`` of the angle between them.
+
+    A plain vector blend will not do for a direction. The two opposite poses a
+    hand has are *opposite vectors*, and their weighted sum is just the longer
+    one, so an estimate would sit still and shrink while the hand turned around
+    beneath it. Rotating through the angle instead puts the smoothing on the
+    angle itself, which is the thing being measured here.
+    """
+    cosine = max(-1.0, min(1.0, old.dot(new)))
+    angle = math.acos(cosine)
+    span = math.sin(angle)
+    if span < 1e-9:
+        # Either already there, or exactly the other way round - which has no
+        # short way round, so there is nothing to interpolate through.
+        return new if angle > math.pi / 2 else old
+    keep = math.sin((1.0 - weight) * angle) / span
+    bring = math.sin(weight * angle) / span
+    return AccelSample(
+        old.x * keep + new.x * bring,
+        old.y * keep + new.y * bring,
+        old.z * keep + new.z * bring,
+    )
+
+
+class TiltTracker:
+    """How far the ring has tilted from the pose it was last zeroed in.
+
+    A wrist-worn accelerometer at rest reads gravity, so its vector says which
+    way up the ring is - and how far that has changed since it was zeroed says
+    how far the hand has tilted. Two caveats are inherent to the sensor rather
+    than to this code, and both are why the value is a single non-negative
+    angle:
+
+    * a still accelerometer cannot see rotation *about* the gravity direction,
+      so the angle is how far the ring has tilted (0..180) rather than how many
+      degrees it has been rolled;
+    * nothing is integrated, so the reading cannot drift. It is always relative
+      to the zero pose, and always recovers it when the hand returns there.
+
+    The precision comes from the filtering: the angle is taken between a frozen
+    zero pose and a low-passed current pose, both medians or averages of unit
+    vectors, because the raw signal quantizes at about 0.11 degrees at 1 g and a
+    resting hand would otherwise produce several degrees of wander.
+    """
+
+    def __init__(self) -> None:
+        """Start unzeroed, with no pose estimate."""
+        # Low-passed direction of gravity in the ring's frame.
+        self._pose: AccelSample | None = None
+        # The frozen pose reported as zero degrees.
+        self._zero: AccelSample | None = None
+        self._prev_time: float | None = None
+        self._first_time: float | None = None
+        # Poses from the current run of still samples, awaiting the zero.
+        self._still_start: float | None = None
+        self._still: list[AccelSample] = []
+        self.angle_deg: float | None = None
+
+    @property
+    def calibrated(self) -> bool:
+        """True once a zero pose exists, so :attr:`angle_deg` means anything."""
+        return self._zero is not None
+
+    def feed(self, sample: AccelSample, now: float | None = None) -> float | None:
+        """Feed one sample; return the current angle, or None while unzeroed.
+
+        Every sample of the session should be fed, whether or not its reading
+        gets published: the filter and the stillness window both need the
+        uninterrupted stream. ``now`` is a monotonic timestamp and defaults to
+        the monotonic clock, so a capture can be replayed with its own times.
+        """
+        if now is None:
+            now = time.monotonic()
+
+        dt = self._elapsed(now)
+        unit = _unit(sample)
+        if unit is None:
+            return self.angle_deg
+
+        if not self._trusts(sample.magnitude_g):
+            # Moving: this direction says more about the movement than about
+            # gravity. Hold the estimate rather than follow it, and treat the
+            # hand as not still for the purposes of capturing a zero pose.
+            self._break_stillness()
+            return self.angle_deg
+
+        self._update_pose(unit, dt)
+        self._capture_zero(now)
+
+        if self._zero is None or self._pose is None:
+            return self.angle_deg
+
+        angle = _separation_deg(self._zero, self._pose)
+        self.angle_deg = 0.0 if angle < MOTION_TILT_DEADBAND_DEG else angle
+        return self.angle_deg
+
+    def zero(self) -> bool:
+        """Re-zero on the pose the ring is in right now.
+
+        This is what the calibrate button does. It needs nothing from the ring,
+        so it works mid-session: the angle simply restarts from wherever the
+        hand happens to be. Returns False (and changes nothing) while there is
+        no pose estimate to zero on, which is only before the first usable
+        sample.
+        """
+        if self._pose is None:
+            return False
+        self._zero = self._pose
+        self._break_stillness()
+        self.angle_deg = 0.0
+        return True
+
+    def reset(self) -> None:
+        """Forget everything (call when a stream session starts)."""
+        self._pose = None
+        self._zero = None
+        self._prev_time = None
+        self._first_time = None
+        self._break_stillness()
+        self.angle_deg = None
+
+    # -- internals --------------------------------------------------------
+
+    def _elapsed(self, now: float) -> float:
+        """Seconds since the previous sample; 0 for the first, or after a gap.
+
+        A gap (a reconnect, or a ring that reports in bursts) is not a
+        measurement of elapsed pose change, so the filter is held instead of
+        jumping.
+        """
+        if self._first_time is None:
+            self._first_time = now
+        dt = 0.0
+        if self._prev_time is not None:
+            dt = now - self._prev_time
+            if dt <= 0 or dt > 1.0:
+                dt = 0.0
+                self._break_stillness()
+        self._prev_time = now
+        return dt
+
+    @staticmethod
+    def _trusts(magnitude_g: float) -> bool:
+        """True if a magnitude near 1 g means gravity is what we are reading."""
+        return abs(magnitude_g - 1.0) <= MOTION_TILT_TRUST_G
+
+    def _update_pose(self, unit: AccelSample, dt: float) -> None:
+        if self._pose is None:
+            self._pose = unit
+            return
+        if dt <= 0:
+            return
+        alpha = 1.0 - math.exp(-dt / MOTION_TILT_TAU_S)
+        self._pose = _slerp(self._pose, unit, alpha)
+
+    def _capture_zero(self, now: float) -> None:
+        """Zero on the first pose the hand rests still in.
+
+        Only the *first* zero is captured like this. Afterwards it stays frozen,
+        so the reading can never creep back toward zero by itself, and the only
+        thing that moves it is :meth:`zero`.
+        """
+        if self._zero is not None or self._pose is None:
+            return
+
+        if self._still_start is None or self._strays(self._pose):
+            self._still_start = now
+            self._still = [self._pose]
+        else:
+            self._still.append(self._pose)
+
+        rested = now - self._still_start >= MOTION_TILT_ZERO_STILL_S
+        rested = rested and len(self._still) >= MOTION_TILT_MIN_ZERO_SAMPLES
+        waiting = self._first_time if self._first_time is not None else now
+        if rested or now - waiting >= MOTION_TILT_ZERO_TIMEOUT_S:
+            self._set_zero(self._median_pose())
+
+    def _strays(self, pose: AccelSample) -> bool:
+        """True if ``pose`` no longer agrees with the poses gathered so far.
+
+        Sitting near 1 g is not the same as being still: a slow rotation reads as
+        1 g the whole way round. So the window must also be a run of poses that
+        agree with each other, and a pose pointing appreciably away from the
+        median of the window so far starts a new window rather than widening the
+        current one.
+        """
+        anchor = self._window_median()
+        if anchor is None:
+            return True
+        return _separation_deg(anchor, pose) > MOTION_TILT_ZERO_TOLERANCE_DEG
+
+    def _set_zero(self, pose: AccelSample | None) -> None:
+        if pose is None:
+            return
+        self._zero = pose
+        self.angle_deg = 0.0
+        self._break_stillness()
+
+    def _median_pose(self) -> AccelSample | None:
+        """The window's pose, or the filtered estimate if the window disagrees.
+
+        Directions that disagree wildly can average out to something short, even
+        near zero, and then they define no pose at all; the estimate is the next
+        best thing, since at least it tracks the stream.
+        """
+        return self._window_median() or self._pose
+
+    def _window_median(self) -> AccelSample | None:
+        """Per-axis median of the gathered poses, as a direction, if usable."""
+        if not self._still:
+            return None
+        return _unit(
+            AccelSample(
+                statistics.median(s.x for s in self._still),
+                statistics.median(s.y for s in self._still),
+                statistics.median(s.z for s in self._still),
+            )
+        )
+
+    def _break_stillness(self) -> None:
+        self._still_start = None
+        self._still.clear()
 

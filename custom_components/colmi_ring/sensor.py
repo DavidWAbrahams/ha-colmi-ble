@@ -135,6 +135,23 @@ ACCELEROMETER_SENSORS: tuple[_AccelSensor, ...] = (
     ),
 )
 
+# How far the ring has tilted from the pose it was zeroed in. This is the one
+# derived value among the accelerometer entities, and it is deliberately its own
+# sensor rather than another face of the raw sample above: the axes stay exactly
+# as the ring sent them, while this number is filtered and relative.
+#
+# No device class and no unit enum: the angle is a plain degree count against a
+# user-chosen pose, not an orientation the ACCELEROMETER or ROTATION classes
+# mean, and the plain "°" unit keeps the import safe on older cores.
+RING_ANGLE_SENSOR = SensorEntityDescription(
+    key="ring_angle",
+    name="Ring Angle",
+    icon="mdi:angle-acute",
+    native_unit_of_measurement="°",
+    state_class=SensorStateClass.MEASUREMENT,
+    suggested_display_precision=1,
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,  # noqa: ARG001 Unused function argument: `hass`
@@ -157,6 +174,9 @@ async def async_setup_entry(
     async_add_entities(
         ColmiRingAccelerometerSensor(coordinator=coordinator, sensor=sensor)
         for sensor in ACCELEROMETER_SENSORS
+    )
+    async_add_entities(
+        [ColmiRingAngleSensor(coordinator=coordinator, description=RING_ANGLE_SENSOR)]
     )
 
 
@@ -262,4 +282,61 @@ class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):
     @callback
     def _on_sample(self) -> None:
         """The manager published a sample; republish our part of it."""
+        self.async_write_ha_state()
+
+
+class ColmiRingAngleSensor(ColmiRingEntity, SensorEntity):
+    """How far the ring has tilted since its angle was last zeroed.
+
+    Push-driven like the axis sensors, but reading the tilt tracker's answer
+    rather than a raw sample. The value is the angle, in degrees, between the
+    pose the ring was zeroed in and the pose it is in now: ``0`` is that pose,
+    ``90`` is a quarter turn away from it, and ``180`` is upside down.
+
+    Two properties are worth knowing before building an automation on it:
+
+    * it is a tilt, not a roll. A still accelerometer cannot see rotation about
+      gravity, so turning the hand like a doorknob changes nothing;
+    * it cannot drift, because nothing is integrated. Returning the hand to the
+      zero pose returns the sensor to zero.
+
+    Zeroing happens by itself on the first still pose of a session, and on
+    demand from the Calibrate Ring Angle button.
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        description: SensorEntityDescription,
+    ) -> None:
+        """Initialize the ring angle sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{description.key}"
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the current tilt, or None until the ring has been still."""
+        motion = self._motion_manager()
+        return motion.last_angle_deg if motion is not None else None
+
+    async def async_added_to_hass(self) -> None:
+        """Start following the stream once the entity is registered."""
+        await super().async_added_to_hass()
+        motion = self._motion_manager()
+        if motion is None:  # pragma: no cover - setup order guard
+            LOGGER.debug(
+                "Colmi ring angle sensor %s has no motion manager",
+                self.entity_description.key,
+            )
+            return
+        self.async_on_remove(motion.add_sample_listener(self._on_sample))
+
+    @callback
+    def _on_sample(self) -> None:
+        """The manager published a sample; republish our angle from it."""
         self.async_write_ha_state()
