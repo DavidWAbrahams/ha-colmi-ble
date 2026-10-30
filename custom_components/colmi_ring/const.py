@@ -177,7 +177,7 @@ MOTION_CLAP_REFRACTORY_S = 0.6
 MOTION_GESTURE_COOLDOWN_S = 1.2
 MOTION_GESTURE_SUPPRESS_S = 0.5
 
-# --- Ring angle (tilt) tuning ---------------------------------------------
+# --- Vertical angle (tilt) tuning -----------------------------------------
 #
 # See :class:`TiltTracker`. The RAW stream carries no gyroscope, so the only
 # pose information in it is the direction of gravity in the sensor's own frame;

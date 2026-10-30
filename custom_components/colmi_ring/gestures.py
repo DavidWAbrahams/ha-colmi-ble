@@ -784,7 +784,7 @@ class TiltTracker:
     def zero(self) -> bool:
         """Re-zero on the pose the ring is in right now.
 
-        This is what the calibrate button does. It needs nothing from the ring,
+        This is what the zero button does. It needs nothing from the ring,
         so it works mid-session: the angle simply restarts from wherever the
         hand happens to be. Returns False (and changes nothing) while there is
         no pose estimate to zero on, which is only before the first usable

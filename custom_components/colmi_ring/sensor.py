@@ -143,9 +143,9 @@ ACCELEROMETER_SENSORS: tuple[_AccelSensor, ...] = (
 # No device class and no unit enum: the angle is a plain degree count against a
 # user-chosen pose, not an orientation the ACCELEROMETER or ROTATION classes
 # mean, and the plain "°" unit keeps the import safe on older cores.
-RING_ANGLE_SENSOR = SensorEntityDescription(
-    key="ring_angle",
-    name="Ring Angle",
+VERTICAL_ANGLE_SENSOR = SensorEntityDescription(
+    key="vertical_angle",
+    name="Vertical Angle",
     icon="mdi:angle-acute",
     native_unit_of_measurement="°",
     state_class=SensorStateClass.MEASUREMENT,
@@ -176,7 +176,11 @@ async def async_setup_entry(
         for sensor in ACCELEROMETER_SENSORS
     )
     async_add_entities(
-        [ColmiRingAngleSensor(coordinator=coordinator, description=RING_ANGLE_SENSOR)]
+        [
+            ColmiRingVerticalAngleSensor(
+                coordinator=coordinator, description=VERTICAL_ANGLE_SENSOR
+            )
+        ]
     )
 
 
@@ -285,7 +289,7 @@ class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):
         self.async_write_ha_state()
 
 
-class ColmiRingAngleSensor(ColmiRingEntity, SensorEntity):
+class ColmiRingVerticalAngleSensor(ColmiRingEntity, SensorEntity):
     """How far the ring has tilted since its angle was last zeroed.
 
     Push-driven like the axis sensors, but reading the tilt tracker's answer
@@ -301,7 +305,7 @@ class ColmiRingAngleSensor(ColmiRingEntity, SensorEntity):
       zero pose returns the sensor to zero.
 
     Zeroing happens by itself on the first still pose of a session, and on
-    demand from the Calibrate Ring Angle button.
+    demand from the Zero Vertical Angle button.
     """
 
     _attr_has_entity_name = True
@@ -311,7 +315,7 @@ class ColmiRingAngleSensor(ColmiRingEntity, SensorEntity):
         coordinator: ColmiRingDataUpdateCoordinator,
         description: SensorEntityDescription,
     ) -> None:
-        """Initialize the ring angle sensor."""
+        """Initialize the vertical angle sensor."""
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = (
@@ -330,7 +334,7 @@ class ColmiRingAngleSensor(ColmiRingEntity, SensorEntity):
         motion = self._motion_manager()
         if motion is None:  # pragma: no cover - setup order guard
             LOGGER.debug(
-                "Colmi ring angle sensor %s has no motion manager",
+                "Colmi vertical angle sensor %s has no motion manager",
                 self.entity_description.key,
             )
             return

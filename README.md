@@ -49,7 +49,7 @@ Enable it in the integration's options ("Enable gesture detection"). That adds:
   trigger,
 - four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
   `Acceleration` (the magnitude) - see below, and
-- a `Ring Angle` sensor with a `Calibrate Ring Angle` button - see below.
+- a `Vertical Angle` sensor with a `Zero Vertical Angle` button - see below.
 
 There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
 we may implement:
@@ -102,26 +102,28 @@ rather than at the full stream rate - every state change is a recorder row, and 
 swamp your database. Automations that need the sharp signal could use
 the gesture event(s).
 
-## Ring angle
+## Vertical angle
 
-`sensor.<ring>_ring_angle` is the one derived motion sensor: how far the ring has tilted, in degrees,
-from the pose it was last zeroed in. `0` is that pose, `90` is a quarter turn away from it, and `180`
-is upside down.
+`sensor.<ring>_vertical_angle` is the one derived motion sensor: how far the ring has tilted away from
+standing up straight, in degrees. `0` means the ring is upright, `90` is a quarter turn away from that,
+and `180` is upside down. Like a plumb line it only measures against the vertical, which is why it is a
+single non-negative number rather than a compass heading.
 
 It is derived from the accelerometer alone, on the assumption that a still ring reads gravity. Two
 consequences are worth knowing before building an automation on it:
 
 - it measures *tilt*, not *roll*. A still accelerometer cannot see rotation about the direction of
-  gravity, so turning your hand like a doorknob leaves the value alone. A single non-negative number
-  is the whole story for that reason.
+  gravity, so turning your hand like a doorknob leaves the value alone.
 - it cannot drift, because nothing is integrated. Bring your hand back to the zero pose and the
   sensor returns to zero.
 
 The angle is zeroed automatically on the first still pose after the stream starts, and on demand by
-the `Calibrate Ring Angle` button. That button is the one control that works *while* the stream is on:
+the `Zero Vertical Angle` button. That button is the one control that works *while* the stream is on:
 it writes nothing to the ring, so the stream keeps running and the sensor simply starts counting from
-wherever your hand happens to be. The reading is low-pass filtered and has a small deadband, so a
-resting hand holds a steady `0` instead of wandering by a few degrees.
+wherever your hand happens to be. Zero it with the ring held upright and the reading becomes the angle
+from vertical itself - handy if the pose the stream happened to auto-zero on isn't the reference you
+want. The reading is low-pass filtered and has a small deadband, so a resting hand holds a steady `0`
+instead of wandering by a few degrees.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

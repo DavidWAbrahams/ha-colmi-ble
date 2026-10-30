@@ -60,15 +60,15 @@ async def async_setup_entry(
             ),
         ),
     ]
-    # Re-zeroing the ring angle only makes sense alongside the sensor it
-    # calibrates, and that sensor is gated on the motion option.
+    # Zeroing the vertical angle only makes sense alongside the sensor it
+    # zeroes, and that sensor is gated on the motion option.
     if entry.options.get(CONF_MOTION_ENABLED, False):
         buttons.append(
-            ColmiRingCalibrateAngleButton(
+            ColmiRingZeroVerticalAngleButton(
                 coordinator=coordinator,
                 entity_description=ButtonEntityDescription(
-                    key="calibrate_ring_angle",
-                    name="Calibrate Ring Angle",
+                    key="zero_vertical_angle",
+                    name="Zero Vertical Angle",
                     icon="mdi:angle-acute",
                 ),
             )
@@ -201,15 +201,15 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
         self.coordinator.apply_heart_rate(reading)
 
 
-class ColmiRingCalibrateAngleButton(ColmiRingEntity, ButtonEntity):
-    """Re-zero the Ring Angle sensor on the pose the hand is in right now.
+class ColmiRingZeroVerticalAngleButton(ColmiRingEntity, ButtonEntity):
+    """Make the Vertical Angle sensor read zero on the pose it is in now.
 
     The one button that deliberately does *not* call :meth:`_assert_ring_free`:
     re-zeroing mid-stream is the whole point. It writes nothing to the ring and
     opens no connection, so the stream keeps running and the sensor simply
     restarts counting from wherever the hand happens to be.
 
-    It overrides :meth:`async_press` rather than ``press`` because re-zeroing
+    It overrides :meth:`async_press` rather than ``press`` because zeroing
     republishes the angle sensor through the motion manager's callback
     listeners, which has to happen on the event loop; unlike the other buttons
     there is nothing slow to hand to a background task.
@@ -230,11 +230,11 @@ class ColmiRingCalibrateAngleButton(ColmiRingEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Zero the angle on the pose the hand is in right now."""
         motion = self._motion_manager()
-        if motion is None or not motion.async_calibrate_angle():
+        if motion is None or not motion.async_zero_angle():
             # Only reachable before the stream has produced a usable sample,
             # i.e. in the first second of a session, or with the switch off.
             raise HomeAssistantError(
-                "Colmi ring angle cannot be calibrated yet: the motion stream"
+                "Colmi vertical angle cannot be zeroed yet: the motion stream"
                 " has not reported an accelerometer sample"
             )
-        LOGGER.debug("Colmi ring angle zeroed on the current pose")
+        LOGGER.debug("Colmi vertical angle zeroed on the current pose")

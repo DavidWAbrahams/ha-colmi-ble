@@ -148,8 +148,9 @@ class MotionManager:
         # Newest decoded sample, for the accelerometer sensors. None whenever no
         # stream is running, so the sensors go unknown instead of freezing.
         self.last_sample: AccelSample | None = None
-        # How far the ring has tilted since it was last zeroed, for the angle
-        # sensor. None until the stream has seen a still enough pose to zero on.
+        # How far the ring has tilted since it was last zeroed, for the vertical
+        # angle sensor. None until the stream has seen a pose still enough to
+        # zero on.
         self.last_angle_deg: float | None = None
         self._last_sample_published = 0.0
 
@@ -623,13 +624,13 @@ class MotionManager:
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring stream state listener raised")
 
-    def async_calibrate_angle(self) -> bool:
-        """Re-zero the ring angle on the pose the hand is in right now.
+    def async_zero_angle(self) -> bool:
+        """Zero the vertical angle on the pose the hand is in right now.
 
-        The calibrate button's action. Deliberately needs nothing from the
-        ring, so it works mid-stream; the angle simply restarts from wherever
-        the hand happens to be. Returns False if the stream has not yet seen a
-        usable sample, in which case nothing changed.
+        The zero button's action. Deliberately needs nothing from the ring, so
+        it works mid-stream; the angle simply restarts from wherever the hand
+        happens to be. Returns False if the stream has not yet seen a usable
+        sample, in which case nothing changed.
         """
         if not self._tilt.zero():
             return False
