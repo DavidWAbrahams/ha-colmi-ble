@@ -184,14 +184,26 @@ class MotionManager:
 
     async def _run(self) -> None:
         """Run the stream until it ends, then restore normal operation."""
+        aborted = False
         try:
             reason = await self._client.async_stream_motion(
                 self._on_packet,
                 lambda: self._want_stream,
                 self._on_session,
             )
+        except Exception:  # noqa: BLE001
+            # Report a fault on *this* logger. Left alone, the traceback is written
+            # by Home Assistant's task handler under a ``homeassistant.*`` logger,
+            # so a log filtered to ``custom_components.colmi_ring`` shows the stream
+            # closing cleanly with no reason and no explanation of why.
+            LOGGER.exception("Colmi ring motion stream task failed")
+            reason, aborted = None, True
         finally:
             self.async_notify_stream_finished()
+        if aborted:
+            # The traceback above is the explanation; do not also claim the stream
+            # never opened, which describes the retry-budget case, not this one.
+            return
         if reason is None:
             LOGGER.warning(
                 "Colmi ring motion stream could not be opened; the switch has"

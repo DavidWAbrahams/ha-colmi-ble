@@ -518,6 +518,60 @@ sensitivity scaling from the orientation test.
   - A session that now survives -> the camera-gesture write was the killer, and it can be re-armed
     later behind a delay.
 
+#### Fourth on-device run (2026-10-29): the ring is innocent — we close the link ourselves
+
+    16:08:44.567 DEBUG RAW-stream start packet: a10404000000000000000000000000a9
+    16:08:44.570 INFO  motion stream open; waiting for accelerometer data
+    16:08:44.572 INFO  motion stream closed after 0.0s (stopped) with 0 notification(s) ...
+    16:08:44.593 DEBUG motion stream session disconnected (after 0.025s, closed by us)
+    16:08:45.592 DEBUG Unexpected packet type 47 (0x2F) ... (poll session)
+    16:08:46.323 DEBUG Finished fetching colmi_ring data in 1.730 seconds (success: True)
+
+- The three decision lines from run 3 all came back negative at once: the disconnect says
+  **`closed by us`** (the `closing` flag was set, i.e. our own `_safe_disconnect` ended the link),
+  the close line reports **`(stopped)`**, and the `0xA1` write went out cleanly. The ring never
+  dropped anything.
+- `(stopped)` is the tell: that line prints `session.reason or "stopped"`, so `reason` was
+  **`None`** — nobody ever called `request_stop`. Not the user, not auto-off, not shutdown, not the
+  watchdog. The session did not end; it was **unwound**.
+- Corroboration: all three of `MotionManager._run`'s completion lines (the WARNING "could not be
+  opened", the INFO "ended (%s)", the DEBUG "finished (user)") are **absent**, so `_run` never
+  returned normally — an exception escaped it, or its task was cancelled. HA writes task exceptions
+  under a `homeassistant.*` logger, which a log filtered to `custom_components.colmi_ring` cannot
+  show. That is why the teardown looked silent.
+- Timing: INFO at `44.570` → close at `44.572` is **2 ms** — pure synchronous code, no BLE round
+  trip. The raise happens after `_on_session`'s own INFO line, or is a cancellation inside
+  `wait_stopped()`. Suspects that survived inspection: `GestureDetector.reset()` (cleared —
+  `__init__` initialises everything `reset()` touches), `_schedule_auto_off` / `_timeout_minutes` /
+  `hass.async_call_later` (not cleared statically).
+- The poll at `45.592` is again a *consequence*: the abort runs `async_notify_stream_finished()`,
+  which forces the switch off (the "self-disabling" symptom) and calls `_request_refresh()`. Second
+  independent confirmation that polling is downstream of the failure, not its cause.
+- Changes made, so the next log names the fault instead of describing its silhouette:
+  - `_log_stream_session` prints **`ABORTED (never stopped by anyone)`** instead of `(stopped)` when
+    no reason was ever set.
+  - `async_stream_motion` gained `except asyncio.CancelledError` (WARNING naming the cancellation,
+    then re-raise) and a catch-all `except Exception` (full traceback on the first attempt, one
+    line per retry, then the same bounded back-off). Both land on *this* logger.
+  - `MotionManager._run` catches `Exception` and logs `Colmi ring motion stream task failed` with
+    traceback, so nothing hides under `homeassistant.tasks` any more.
+  - The arming callback now runs inside `_arm_session`, which logs
+    `"arming callback raised; closing the session"` with traceback before re-raising — a
+    manager-side fault is attributed to the manager instead of looking like a ring rejection, and a
+    half-armed session is not left holding the ring.
+  - The retry budget no longer resets just because a session *opened*: only a session that lived
+    `_STREAM_STABLE_S` (10 s) resets it (`_session_lived`). Before, a fault that reproduced every
+    attempt at ~2 ms reset the budget forever and retried at the 1 s minimum indefinitely, with the
+    switch on and polling paused.
+- What the next run decides:
+  - A traceback from `arming callback raised` -> the fault is in `_on_session`; fix the callback.
+  - `motion stream task was cancelled` -> find the canceller (reload/shutdown path or a
+    `hass.async_create_task` ownership quirk).
+  - `ABORTED` with neither of the above -> the unwind is inside the transport; the traceback names
+    the frame.
+  - A session that stays open past 10 s -> the fault was in the previous build's arming path, and
+    the run proceeds to the real Phase 5 questions: sample rate, scale, axis signs.
+
 ## Risks
 
 | Risk | Mitigation |

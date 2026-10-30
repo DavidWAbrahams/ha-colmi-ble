@@ -1069,7 +1069,12 @@ class ColmiRingApiClient:
             if conn.linked_at is None
             else f"{time.monotonic() - conn.linked_at:.1f}s"
         )
-        reason = session.reason or "stopped"
+        # No reason means nobody asked this session to stop, so it did not end on
+        # its own: something unwound it (an exception, or a cancelled task). Saying
+        # "stopped" there sends the reader looking at the ring for a teardown we
+        # caused ourselves, which is exactly how a 2 ms session read as "the ring
+        # refuses to stream".
+        reason = session.reason or "ABORTED (never stopped by anyone)"
         raw_count = tally.count_for(motion.CMD_RAW_MODE)
         if raw_count:
             LOGGER.debug(
@@ -1169,13 +1174,24 @@ class ColmiRingApiClient:
         failing_since: float | None = None
         delay = self._STREAM_RETRY_MIN_S
         while should_run():
+            # Declared here so a failed ``__aenter__`` cannot leave the previous
+            # attempt's session visible to the stability check below.
+            session: MotionSession | None = None
             try:
                 async with self._motion_stream(on_packet) as session:
+                    self._arm_session(session, on_session)
+                    reason = await session.wait_stopped()
+                # Only a session that stayed up counts as a success for retry
+                # accounting. Resetting the budget the moment a session *opens*
+                # means a fault that reproduces every time (a session that dies two
+                # milliseconds after opening, say) restarts the budget on every
+                # attempt and so retries at the minimum delay forever - while the
+                # manager believes the stream owns the ring and keeps polling
+                # paused. Requiring a real lifetime lets the budget run out and the
+                # switch go off.
+                if self._session_lived(session) >= self._STREAM_STABLE_S:
                     failing_since = None
                     delay = self._STREAM_RETRY_MIN_S
-                    if on_session is not None:
-                        on_session(session)
-                    reason = await session.wait_stopped()
             except ColmiRingApiClientError as err:
                 # WARNING, not DEBUG: this is the line explaining why the
                 # stream is not up yet, and it now repeats per attempt on
@@ -1187,6 +1203,47 @@ class ColmiRingApiClient:
                     self._ring_address,
                     err,
                 )
+                if await self._stream_pause(should_run, failing_since, delay):
+                    failing_since, delay = self._next_retry(
+                        failing_since, delay
+                    )
+                    continue
+                return None
+            except asyncio.CancelledError:
+                # A session abandoned this way reports "closed (stopped)" with no
+                # reason, because cancellation unwinds the ``async with`` without
+                # ever setting one. Without this line that case is indistinguishable
+                # from the ring refusing to stream, so say it out loud before
+                # handing the cancellation back to whoever started it.
+                LOGGER.warning(
+                    "Colmi ring %s motion stream task was cancelled while the"
+                    " session was open (reload, shutdown, or a cancelled task)",
+                    self._ring_address,
+                )
+                raise
+            except Exception:  # noqa: BLE001
+                # Anything else that escapes the session - including a fault in the
+                # caller's own arming callback, which runs inside the transport -
+                # used to propagate silently into the stream task, where it was
+                # logged under a different logger than this integration's. That is
+                # what "the switch turns itself off a moment after enabling" looked
+                # like from the inside: a clean teardown, no reason, no retry, and
+                # nothing in this component's log explaining it.
+                #
+                # The traceback is logged once; a fault that reproduces on every
+                # attempt gets one line per retry rather than a stack each time.
+                if failing_since is None:
+                    LOGGER.exception(
+                        "Colmi ring %s motion stream aborted while the session"
+                        " was open; closing it and retrying",
+                        self._ring_address,
+                    )
+                else:
+                    LOGGER.warning(
+                        "Colmi ring %s motion stream aborted again (see the"
+                        " traceback from the first attempt)",
+                        self._ring_address,
+                    )
                 if await self._stream_pause(should_run, failing_since, delay):
                     failing_since, delay = self._next_retry(
                         failing_since, delay
@@ -1222,6 +1279,46 @@ class ColmiRingApiClient:
     # Total time to keep retrying a stream that never stays open before
     # declaring it unworkable and letting the switch go off.
     _STREAM_GIVEUP_S = 180.0
+
+    # How long a session must survive to count as a working stream, and so to
+    # reset the retry budget. Anything shorter is the failure this loop exists to
+    # chase, not evidence that the ring streams.
+    _STREAM_STABLE_S = 10.0
+
+    @staticmethod
+    def _arm_session(
+        session: MotionSession,
+        on_session: Callable[[MotionSession], None] | None,
+    ) -> None:
+        """Hand the open session to the caller, and say so if the arming fails.
+
+        The callback arms the stream (listeners, timers, the gesture detector). A
+        fault there used to propagate straight out of the transport: the session
+        closed a couple of milliseconds after opening with no reason set, and the
+        traceback was written by Home Assistant's task handler under a
+        ``homeassistant.*`` logger - so this integration's log showed a clean,
+        unexplained teardown that read exactly like the ring refusing to stream.
+        Naming the arming callback here attributes the fault, and re-raising lets
+        the retry loop treat it like any other failure: back off, and give up
+        inside the budget rather than hold the ring open on a half-armed session.
+        """
+        if on_session is None:
+            return
+        try:
+            on_session(session)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Colmi ring motion stream arming callback raised;"
+                " closing the session"
+            )
+            raise
+
+    @staticmethod
+    def _session_lived(session: MotionSession | None) -> float:
+        """Seconds a finished session held the link, or -1 if it never linked."""
+        if session is None or session.conn.linked_at is None:
+            return -1.0
+        return time.monotonic() - session.conn.linked_at
 
     async def _stream_pause(
         self,
