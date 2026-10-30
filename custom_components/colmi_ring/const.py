@@ -62,12 +62,15 @@ DEFAULT_MOTION_STREAM_TIMEOUT = 30
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
 
-# Minimum seconds between updates of the accelerometer sensors. The stream runs
-# at tens of Hz, and every state change is a recorder row: four sensors at
-# 25 Hz would write a hundred rows per second. One second still shows the values
-# moving in real time while leaving the database usable; the full-rate data is
-# what CONF_MOTION_LOG_SAMPLES logs instead.
-MOTION_SENSOR_UPDATE_S = 1.0
+# Minimum seconds between updates of the accelerometer sensors; 0 publishes every
+# sample. Configurable because the stream rate is a firmware property rather than
+# a fixed one: stock R02 firmware reports at 1 Hz, where any throttle is
+# invisible, while a firmware that reports several samples per second is throttled
+# by this. Every sensor update is a recorder row, so four axes at 25 Hz would
+# write a hundred rows per second; the one-second default keeps the database
+# usable, and CONF_MOTION_LOG_SAMPLES remains the way to see the full-rate signal.
+CONF_MOTION_SENSOR_UPDATE_S = "motion_sensor_update_s"
+DEFAULT_MOTION_SENSOR_UPDATE_S = 1.0
 
 # --- Detector tuning ------------------------------------------------------
 #
@@ -180,8 +183,9 @@ MOTION_GESTURE_SUPPRESS_S = 0.5
 MOTION_STREAM_SILENCE_TIMEOUT_S = 30.0
 
 # Below this measured sample rate the stream cannot resolve a clap's ~50 ms
-# impulse, so the stream-derived clap detector stays off and only raise/lower
-# are reported. Best guess; the Phase 0 probe measures the real rate.
+# impulse, so the stream-derived clap detector stays off. Measured on stock R02
+# firmware, which streams at exactly 1 Hz, so in practice this always trips and a
+# clap can only come from the ring's own detector.
 MOTION_MIN_HZ_FOR_STREAM_CLAP = 15.0
 
 # Duration of the startup mute: the ring echoes our own gesture-enable packet
@@ -191,11 +195,13 @@ MOTION_STARTUP_MUTE_S = 2.0
 # Whether to ask the ring to run its own on-device camera-button (clap) gesture
 # detector while a RAW stream is open.
 #
-# Off, deliberately. That write goes out within ~30 ms of the RAW-stream
-# command, and the stream link reliably dies a moment after opening - so until
-# the two are separated by evidence rather than guesswork, the RAW-stream
-# command is the only thing written to the ring during a session. Nothing is
-# lost but the ring's own clap reporting; raise/lower and the stream-side clap
-# come from the accelerometer data and are unaffected. Flip this back to True
-# once the stream is confirmed to survive on its own.
-ENABLE_RING_CAMERA_GESTURE = False
+# On. This write is the only route to a clap on stock firmware: the ring streams
+# the accelerometer at exactly 1 Hz (measured), far too slow for the stream-side
+# detector, so without the ring's own detection nothing would ever fire.
+#
+# It was off while the stream link kept dying shortly after opening, but that
+# write was innocent - the deaths were our own bug in the auto-off scheduling,
+# fixed separately, and the stream now survives full sessions with the write in
+# flight. The remaining hazard is that the ring echoes the write back and the
+# echo looks like a gesture report; see MOTION_STARTUP_MUTE_S.
+ENABLE_RING_CAMERA_GESTURE = True

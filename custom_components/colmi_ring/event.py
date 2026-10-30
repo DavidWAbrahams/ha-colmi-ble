@@ -1,16 +1,19 @@
 """Event platform for colmi_ring: the detected gestures.
 
-One event entity per gesture, all firing the same Home Assistant event type so a
-single automation trigger can catch any of them::
+Each gesture is one event entity, and every gesture also fires the same Home
+Assistant event type, so an automation can trigger on either::
 
     trigger:
       - platform: event
         event_type: colmi_ring_gesture
         event_data:
-          gesture: hand_raise
+          gesture: clap
 
-The same event also reaches the entity's own triggers, so a per-gesture
-automation can instead use the entity as its trigger.
+Only the clap is offered today. Raise and lower are recognised by
+``GestureDetector`` but are not published, because a ring streaming at 1 Hz
+cannot resolve a steady lift or drop (see ``_SUPPRESSED_GESTURES`` in
+``motion_manager.py``), so publishing them would only produce unreliable
+automations.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from .const import (
     LOGGER,
 )
 from .entity import ColmiRingEntity
-from .gestures import GESTURE_CLAP, GESTURE_LOWER, GESTURE_RAISE, GestureEvent
+from .gestures import GESTURE_CLAP, GestureEvent
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -43,16 +46,6 @@ ENTITY_DESCRIPTIONS = (
         key=GESTURE_CLAP,
         name="Clap",
         icon="mdi:hand-back-right",
-    ),
-    EventEntityDescription(
-        key=GESTURE_RAISE,
-        name="Hand Raise",
-        icon="mdi:hand-back-right-up",
-    ),
-    EventEntityDescription(
-        key=GESTURE_LOWER,
-        name="Hand Lower",
-        icon="mdi:hand-back-right-down",
     ),
 )
 
@@ -81,9 +74,8 @@ class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
     The entity's own event is named after the gesture, so it can be used as a
     per-gesture automation trigger. The integration *also* fires the
     ``colmi_ring_gesture`` event on the bus (see ``MotionManager._publish``)
-    with the same data, which is the way to catch all three gestures with one
-    trigger and does not depend on how the event component names its generated
-    events.
+    with the same data, which catches every gesture with one trigger and does
+    not depend on how the event component names its generated events.
     """
 
     _attr_has_entity_name = True

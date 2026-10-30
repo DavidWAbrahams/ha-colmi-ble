@@ -22,10 +22,12 @@ from .const import (
     CONF_HR_STALE_POLLS,
     CONF_MOTION_ENABLED,
     CONF_MOTION_LOG_SAMPLES,
+    CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
     DEFAULT_GESTURE_SENSITIVITY,
+    DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
     DOMAIN,
@@ -212,6 +214,21 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             min=0,
                             max=480,
                             step=5,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_MOTION_SENSOR_UPDATE_S,
+                        default=self.config_entry.options.get(
+                            CONF_MOTION_SENSOR_UPDATE_S,
+                            DEFAULT_MOTION_SENSOR_UPDATE_S,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            # 0 means "publish every sample the ring sends".
+                            min=0,
+                            max=5,
+                            step=0.05,
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),

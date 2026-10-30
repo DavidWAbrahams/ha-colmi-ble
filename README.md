@@ -39,26 +39,26 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 
 # Gestures (experimental, off by default)
 
-The ring can stream its raw accelerometer data, and this integration can watch that stream for three
-gestures: a **clap**, a **rapid hand raise**, and a **rapid hand lower**.
+While the motion stream switch is enabled on the Home Assistant device, the device constantly
+reports accelerometer data and one gesture that is specifically suppored by the ring firmware: `Clap`.
 
 Enable it in the integration's options ("Enable gesture detection"). That adds:
 
 - a `Motion Stream` switch,
-- three event entities - `Clap`, `Hand Raise`, `Hand Lower` - you can use directly as automation
-  triggers, and
+- an event entity - `Clap` - that you can use directly as an automation
+  trigger, and
 - four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
   `Acceleration` (the magnitude) - see below.
 
-There is also a single `colmi_ring_gesture` event that carries every gesture, so one trigger can
-catch all three and inspect what happened:
+There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
+we may implement:
 
 ```yaml
 trigger:
   - platform: event
     event_type: colmi_ring_gesture
     event_data:
-      gesture: hand_raise
+      gesture: clap
 action:
   - variables:
       peak_g: "{{ trigger.event.data.peak_g }}"
@@ -68,14 +68,10 @@ The event data includes `gesture`, `source` (`ring` if the ring detected its own
 derived it from the accelerometer), `peak_g` and `velocity_g_s`.
 
 **Why it is opt-in.** The ring serves one Bluetooth connection at a time, so while the stream is on,
-*normal polling stops* - heart rate, steps and battery freeze, and heart rate reads `unknown` rather
-than showing a stale value. The other buttons and the sampling-interval number refuse to run until the
-stream is off. Streaming also drains the battery noticeably faster than polling does. The stream turns
+*normal polling stops* - heart rate, steps and battery freeze. The other buttons and the sampling-interval number refuse to run until the
+stream is off. Streaming also drains the battery quickly. The stream turns
 itself off after a configurable number of minutes (30 by default, restarted every time you make a
 gesture).
-
-**Tips.** If gestures are hard to trigger, raise the
-"Gesture sensitivity" option; if they fire when you did not mean it, lower it.
 
 ## Watching the raw accelerometer data
 
@@ -97,17 +93,13 @@ x: in the plane of the ring, roughly through the red LED
 These are deliberately *unprocessed*: no low-pass filter, no gravity removal, no tilt or orientation
 solving.
 
-The decode matches the published reference for this ring (the Colmi R02 MIDI demo and the
-[ATC_RF03_Ring](https://github.com/atc1441/ATC_RF03_Ring) work it is derived from), which its own
-page credits for the bit-packing and the ±4 g scale. Note that demo displays *angles* on X/Y/Z rather
-than acceleration, so its numbers are not directly comparable to these sensors; the axes themselves do
-correspond.
+In the stock firmware, these messages are sent once per second. You can easily flash a modified firmware
+from your browser that increases this to 4 per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using (ATC RF03 Ring OTA Flasher)[https://atc1441.github.io/ATC_RF03_Writer.html]. If you do this, you will likely want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25.
 
-They read `unknown` whenever the stream is off, because that is the truth: the accelerometer is only
-reporting while the connection is open with streaming on. Updates are published about once a second
+The motion sensors read `unknown` whenever the motion stream is off. Updates are published about once a second
 rather than at the full stream rate - every state change is a recorder row, and a higher rate could
-swamp your database. Automations that need the sharp signal should use
-the gesture events.
+swamp your database. Automations that need the sharp signal could use
+the gesture event(s).
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

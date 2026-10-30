@@ -30,23 +30,26 @@ from homeassistant.helpers.event import async_call_later
 from .api import ColmiRingApiClient, MotionSession
 from .colmi_codec.motion import (
     AccelSample,
+    CMD_CAMERA_GESTURE,
+    SUB_GESTURE_ON,
     parse_accel_packet,
     parse_gesture_packet,
 )
 from .const import (
     CONF_GESTURE_SENSITIVITY,
     CONF_MOTION_LOG_SAMPLES,
+    CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     DEFAULT_GESTURE_SENSITIVITY,
+    DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     ENABLE_RING_CAMERA_GESTURE,
     GESTURE_EVENT_TYPE,
     GESTURE_SENSITIVITY_SCALE,
     LOGGER,
-    MOTION_SENSOR_UPDATE_S,
     MOTION_STARTUP_MUTE_S,
 )
-from .gestures import GestureEvent, GestureDetector
+from .gestures import GESTURE_LOWER, GESTURE_RAISE, GestureEvent, GestureDetector
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,6 +78,34 @@ _MAX_UNKNOWN_KINDS = 6
 # per-tick status echoes, not a codec problem, so they must not be warned about.
 _BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02)})
 
+# Gestures the detector is still able to produce but that are never published.
+# A steady hand raise or lower produces no acceleration to integrate at the
+# ring's measured 1 Hz, so what fires is really a tilt, and an automation built
+# on it would act on the wrong gesture. The detector itself is untouched so a
+# future firmware with a faster stream can bring them back by dropping them here.
+_SUPPRESSED_GESTURES = frozenset({GESTURE_LOWER, GESTURE_RAISE})
+
+
+def _is_gesture_enable_echo(packet: bytearray) -> bool:
+    """True if ``packet`` is our own camera-gesture write coming back at us.
+
+    The on-device gesture *report* codes are still a guess (see
+    ``colmi_codec/motion.py``), and one of them is also the sub-command of the
+    write that turns the detector on - so the ring echoing that write parses as
+    a clap and fires a phantom gesture.
+
+    What identifies the echo is its empty body: we send ``02 04`` followed by
+    zero padding and a checksum, whereas a real report has something to say in
+    the payload. Matching on that instead of on the exact bytes keeps working
+    if the ring trims the padding on the way back.
+    """
+    return (
+        len(packet) > 1
+        and packet[0] == CMD_CAMERA_GESTURE
+        and packet[1] == SUB_GESTURE_ON
+        and not any(packet[2:-1])
+    )
+
 
 class MotionManager:
     """Start/stop the ring's RAW stream and turn it into gesture events."""
@@ -101,6 +132,8 @@ class MotionManager:
         self._muted_until = 0.0
         self._log_samples = False
         self._logged_rate = False
+        # Seconds between accelerometer sensor updates; set per session.
+        self._sensor_update_s = DEFAULT_MOTION_SENSOR_UPDATE_S
         # (command, subtype) -> first payload seen for that kind this session.
         self._unknown_kinds: dict[tuple[int, int], str] = {}
 
@@ -121,6 +154,23 @@ class MotionManager:
             CONF_GESTURE_SENSITIVITY, DEFAULT_GESTURE_SENSITIVITY
         )
         return GESTURE_SENSITIVITY_SCALE.get(str(raw), 1.0)
+
+    def _sensor_update_interval(self) -> float:
+        """Seconds between accelerometer sensor updates; 0 means every sample.
+
+        The stream rate is a firmware property, so the useful throttle is too:
+        stock firmware reports at 1 Hz and cannot be throttled below that, while
+        a faster firmware needs a smaller value to be worth seeing.
+        """
+        raw = self._entry.options.get(
+            CONF_MOTION_SENSOR_UPDATE_S, DEFAULT_MOTION_SENSOR_UPDATE_S
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(DEFAULT_MOTION_SENSOR_UPDATE_S)
+        # Zero (or nonsense below it) means "do not throttle at all".
+        return value if value > 0 else 0.0
 
     def _timeout_minutes(self) -> float:
         raw = self._entry.options.get(
@@ -152,10 +202,11 @@ class MotionManager:
         The listener takes no arguments and reads :attr:`last_sample` itself, so
         the same callback also works when the sample goes away with the stream.
 
-        Deliberately throttled to :data:`MOTION_SENSOR_UPDATE_S` rather than the
-        stream rate: these listeners update sensors, and every sensor update is a
-        recorder row. Automations that need the full-rate signal should use the
-        gesture events instead.
+        Deliberately throttled to the ``motion_sensor_update_s`` option rather
+        than the stream rate: these listeners update sensors, and every sensor
+        update is a recorder row. Set that option to 0 to be called for every
+        sample; automations that need the full-rate signal should otherwise use
+        the gesture events.
         """
         self._sample_listeners.append(listener)
         return lambda: self._remove_sample_listener(listener)
@@ -184,6 +235,9 @@ class MotionManager:
         self._log_samples = bool(
             self._entry.options.get(CONF_MOTION_LOG_SAMPLES, False)
         )
+        # Read once per session like the other options: changing any option
+        # reloads the entry, which rebuilds this manager anyway.
+        self._sensor_update_s = self._sensor_update_interval()
         # Rebuilt per session: the gravity reference and the rate estimate both
         # belong to one continuous connection, not to the whole uptime.
         self._detector = GestureDetector(sensitivity=self._sensitivity())
@@ -285,11 +339,10 @@ class MotionManager:
         self._rate_timer = async_call_later(
             self._hass, _RATE_PROBE_S, self._async_check_rate
         )
-        # The RAW-stream command is the only thing written to the ring during a
-        # session unless the camera gesture is explicitly re-enabled. That write
-        # used to go out here about 30 ms after the stream opened, and the link
-        # died within milliseconds of it on every attempt; while the stream is
-        # being stabilised, nothing else may touch the ring mid-session.
+        # Ask the ring to run its own clap detector too. At the stream's measured
+        # 1 Hz this is the only source of a clap; the write goes out within a few
+        # tens of milliseconds of the RAW-stream command and the stream has been
+        # shown to survive it.
         if not ENABLE_RING_CAMERA_GESTURE:
             return
         self._hass.async_create_task(
@@ -346,8 +399,8 @@ class MotionManager:
             self._detector.stream_clap = False
             LOGGER.info(
                 "Colmi ring motion stream: %.1f Hz over %d samples%s; too slow to"
-                " detect a clap from it, so raise/lower will still be reported and"
-                " claps only if the ring's own gesture detector works",
+                " detect a clap from the accelerometer, so claps rely on the"
+                " ring's own gesture detector",
                 rate,
                 self._detector.samples_seen,
                 magnitude,
@@ -372,9 +425,18 @@ class MotionManager:
         """Feed one notification from the stream into the detector."""
         gesture_packet = parse_gesture_packet(packet)
         if gesture_packet is not None:
-            # The ring echoes our own enable packet back, and the firmware may
-            # also flush anything it queued, so the first moments of a session
-            # are not trustworthy.
+            # Our own enable write, echoed straight back. The report codes are a
+            # guess, so an echo cannot be told from a clap by code alone; drop
+            # the ones with an empty body instead. See _is_gesture_enable_echo.
+            if _is_gesture_enable_echo(packet):
+                LOGGER.debug(
+                    "Colmi ring echoed the camera-gesture enable packet;"
+                    " not a clap: %s",
+                    packet.hex(),
+                )
+                return
+            # The firmware may also flush anything it queued, so the first
+            # moments of a session are not trustworthy.
             if time.monotonic() < self._muted_until:
                 LOGGER.debug(
                     "Colmi ring reported a gesture during the startup mute;"
@@ -395,6 +457,10 @@ class MotionManager:
             )
         self._publish_sample(sample)
         for event in self._detector.feed(sample):
+            # Deliberately not published; see _SUPPRESSED_GESTURES. The detector
+            # still tracks them so its internal state stays as tested.
+            if event.gesture in _SUPPRESSED_GESTURES:
+                continue
             self._publish(event)
 
     def _log_unknown_packet(self, packet: bytearray) -> None:
@@ -433,12 +499,12 @@ class MotionManager:
         return f" (received {kinds} instead)"
 
     def _publish_sample(self, sample: AccelSample) -> None:
-        """Hand the newest sample to the sensors, at most once per second.
+        """Hand the newest sample to the sensors, no faster than the option says.
 
         The detector still sees every sample; only the published state is
-        rate-limited, because a state change per sample would write a recorder
-        row per sample. The first sample of a session is always published, so the
-        sensors leave ``unknown`` promptly instead of after a second of stream.
+        rate-limited, because a state change per sample writes a recorder row per
+        sample. The first sample of a session is always published, so the sensors
+        leave ``unknown`` promptly instead of after a whole interval of stream.
         """
         self.last_sample = sample
         if not self._sample_listeners:
@@ -446,7 +512,7 @@ class MotionManager:
         now = time.monotonic()
         if (
             self._last_sample_published
-            and now - self._last_sample_published < MOTION_SENSOR_UPDATE_S
+            and now - self._last_sample_published < self._sensor_update_s
         ):
             return
         self._last_sample_published = now
@@ -470,7 +536,7 @@ class MotionManager:
         )
         self._schedule_auto_off()
         # Fired here rather than from an entity so it works even if the event
-        # entities are disabled, and so one automation trigger sees all three.
+        # entities are disabled, and so one automation trigger sees every gesture.
         self._hass.bus.async_fire(
             GESTURE_EVENT_TYPE,
             {**event.as_event_data(), "entry_id": self._entry.entry_id},
