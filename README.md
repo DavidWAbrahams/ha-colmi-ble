@@ -72,25 +72,10 @@ derived it from the accelerometer), `peak_g` and `velocity_g_s`.
 than showing a stale value. The other buttons and the sampling-interval number refuse to run until the
 stream is off. Streaming also drains the battery noticeably faster than polling does. The stream turns
 itself off after a configurable number of minutes (30 by default, restarted every time you make a
-gesture) so a forgotten switch cannot flatten the ring.
+gesture).
 
-**Tips.** A gesture has to be *sharp*: a slow lift is deliberately not a raise, and the detector also
-wants your hand to have been still just before the gesture and to settle just after it, which is what
-keeps walking, typing and vibrating from firing claps. If gestures are hard to trigger, raise the
-"Gesture sensitivity" option; if they fire when you did not mean it, lower it. The `peak_g` in each
-event tells you what your real gestures actually scored.
-
-**Status.** The gesture thresholds were tuned against simulated motion rather than a captured stream
-from this exact firmware, so they may need adjustment for a real wrist on a real finger. About five
-seconds after the stream turns on, the integration logs one line naming the measured sample rate and
-the median accelerometer magnitude, which is the quickest way to judge your setup: the rate should be
-at least 15 Hz for a clap to be derived from the stream (below that it comes from the ring's own
-built-in clap detector instead, which is enabled at the same time, so such events arrive with
-`source: ring`), and the magnitude should be near `1.00 g` while your hand is at rest. A magnitude far
-from that means the packet decode itself is wrong rather than the tuning being off, and is logged as a
-warning. Turning on "Log every accelerometer sample to the debug log" in the options shows what your
-wrist is actually producing, which is the fastest way to tell a wrong guess from a threshold that
-needs moving.
+**Tips.** If gestures are hard to trigger, raise the
+"Gesture sensitivity" option; if they fire when you did not mean it, lower it.
 
 ## Watching the raw accelerometer data
 
@@ -104,11 +89,13 @@ four sensors, all in units of `g` and in the ring's own axis frame:
 | `sensor.<ring>_acceleration_z` | Z axis, as the ring reports it |
 | `sensor.<ring>_acceleration` | `sqrt(x^2 + y^2 + z^2)` |
 
+On my R02 ring, the axis are like this:
+z: the axis through the finger hole
+Y: in the plane of the ring, roughly through the charging port
+x: in the plane of the ring, roughly through the red LED
+
 These are deliberately *unprocessed*: no low-pass filter, no gravity removal, no tilt or orientation
-solving. At rest you should see roughly `1.0 g` on whichever axis happens to point up and near `0` on
-the other two; a magnitude near `1.0 g` while still is also the sanity check that the packet decode is
-right for this firmware. Which axis is up depends on how the ring sits on your finger, so if you want a
-"hand is raised" style condition, prefer the gesture events over picking axes by hand.
+solving.
 
 The decode matches the published reference for this ring (the Colmi R02 MIDI demo and the
 [ATC_RF03_Ring](https://github.com/atc1441/ATC_RF03_Ring) work it is derived from), which its own
@@ -118,9 +105,9 @@ correspond.
 
 They read `unknown` whenever the stream is off, because that is the truth: the accelerometer is only
 reporting while the connection is open with streaming on. Updates are published about once a second
-rather than at the full stream rate (tens of Hz) - every state change is a recorder row, and a hundred
-rows a second per sensor would swamp your database. Automations that need the sharp signal should use
-the gesture events; the full-rate data is what the "Log every accelerometer sample" debug option dumps.
+rather than at the full stream rate - every state change is a recorder row, and a higher rate could
+swamp your database. Automations that need the sharp signal should use
+the gesture events.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
