@@ -8,7 +8,7 @@
   "documentation": "https://github.com/DavidWAbrahams/ha-colmi-ble",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/DavidWAbrahams/ha-colmi-ble/issues",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "integration_type": "device",
   "dependencies": [
     "bluetooth_adapters"

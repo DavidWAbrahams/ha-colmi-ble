@@ -104,7 +104,7 @@ the gesture event(s).
 
 `sensor.<ring>_vertical_angle` is the one derived motion sensor: how far the ring has tilted vertically away from its initial position when the mode began.
 It is always a positive value. If your hand started flat on a table and ended
-held straight up or down, it will ready "90". If you keep going, the
+held straight up or down, it will read "90". If you keep going, the
 reading will go up to 180 degrees.
 
 It measures *tilt*, not *roll*. Turning your hand like a doorknob leaves the value alone.
