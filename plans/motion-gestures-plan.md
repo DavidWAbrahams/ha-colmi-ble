@@ -39,9 +39,16 @@ required:
 |---|---|---|
 | the R02 *answers* `A1 04 04` at all, and **which command byte it reports accel on** | `CMD_RAW_MODE` in `colmi_codec/motion.py` | no samples arrive; see the note below on how we would see this |
 | position packets are `packet[1] == 3` **on the R02** | `colmi_codec/motion.py` | no samples are ever decoded |
-| which `packet[1]` values are the camera gesture *reporting* (as opposed to our own enable command being echoed back) | `GESTURE_REPORT_TYPES` | phantom claps at session start, or none at all |
 | the stream's real sample rate | `MOTION_MIN_HZ_FOR_STREAM_CLAP` | the stream clap is wrongly enabled/disabled |
 | which axis is vertical, and its sign | `gestures.py` (gravity-relative by construction) | raise and lower swap |
+
+**Two rows that used to be in that table have since been settled by the ring, and both answers
+changed the design.** The work is written up in [`plans/clap-detection-plan.md`](clap-detection-plan.md):
+
+| Question | Measured answer | Consequence |
+|---|---|---|
+| which `packet[1]` values are the camera gesture *reporting*, as opposed to our own enable command being echoed back | a report is `02 02 00 … 04`: `packet[1] == 2`, with the gesture id in that trailing `04`. Our own enable is `packet[1] == 4` | `GESTURE_REPORT_TYPES = frozenset({2})`. The original guess `frozenset({4, 5, 7})` both missed every real clap and invented phantom ones from the echo, so the `MOTION_STARTUP_MUTE_S` mute that existed to swallow that echo is gone |
+| **whether `02 04` is answered at all *while* RAW mode streams** | **No.** With RAW off, claps report straight away; with RAW streaming, the same command is followed by silence however hard you clap. The two features share the accelerometer and the firmware serves one at a time | the camera gesture cannot ride along on the motion session. It needs its own link, held with the stream off - which is why the `Clap Detection` and `Motion Stream` switches refuse each other rather than both running |
 
 Note the asymmetry in the first row: the reference classifies a notification **only** by `value[1]`
 and attaches its listener to *every* notifiable characteristic, so it never asserts that position
@@ -120,10 +127,13 @@ at 40 ms as an aspiration, not a measured rate). At a low native sample rate, de
 sub-120 ms clap impulse from the accel stream is unreliable - whereas the camera gesture is
 detected **on the ring**, costs no continuous connection, and arrives as an event.
 
-Both routes are therefore used **at the same time** (as built): a session arms the camera gesture and
-runs the stream clap in parallel, labelling each event `source=ring` or `source=stream`, and the
-measured rate decides only whether the stream route is kept. Which one ends up carrying clap is the
-Phase 0 probe's to report, not to decide.
+Both routes are therefore worth having, but **not at the same time** - which is what the ring settled.
+Stock firmware streams at roughly one packet per second, far below the fifteen a stream-derived clap
+needs, so on the stock image only the ring's own detector can report a clap at all; and because that
+detector goes silent while RAW streams, a clap needs a link held with the stream *off*. As built, they
+are two switches that refuse each other: `Motion Stream` runs the samples and its own gestures,
+`Clap Detection` holds the link for the ring's detector, and each event is still labelled
+`source=ring` or `source=stream` so a faster firmware can be told apart in the log.
 
 ---
 
@@ -183,14 +193,19 @@ packets whose `packet[0]` has no handler. That cannot represent an open-ended st
   listeners, preserving the existing length guard and `_command` timeout semantics.
 - Internal `_motion_stream(on_packet)` async context manager owns one long-lived
   `_RingConnection`: connect, register listeners, send RAW-on, yield; on exit (every exit path,
-  including an exception in the body) cancel the watchdog, unregister and send RAW-off. Listeners
-  are registered for **both** `CMD_RAW_MODE` and `CMD_CAMERA_GESTURE`, so one session sees the
-  samples and the ring's own gestures.
+  including an exception in the body) cancel the watchdog, unregister and send RAW-off. It listens
+  to `CMD_RAW_MODE` **only**. The `CMD_CAMERA_GESTURE` listener this session also used to register,
+  and the `02 04` the manager sent when it opened, are gone: the firmware answers that command only
+  while RAW is off, so on a streaming session it could do nothing but go unanswered.
 - Public `async_stream_motion(on_packet, should_run, on_session)` runs the session in a *loop*: it
-  hands the fresh `MotionSession` to `on_session` (where the manager arms auto-off, the rate probe
-  and the camera-gesture enable), awaits `session.wait_stopped()`, and reconnects after
-  `_STREAM_RETRY_S = 10` s if the session died by itself (`disconnected` / `silent`) while
-  `should_run()` is still true. A user-requested stop is final.
+  hands the fresh `MotionSession` to `on_session` (where the manager arms auto-off and the rate
+  probe), awaits `session.wait_stopped()`, and reconnects after `_STREAM_RETRY_S = 10` s if the
+  session died by itself (`disconnected` / `silent`) while `should_run()` is still true. A
+  user-requested stop is final.
+- That loop is shared code, not a copy: `async_listen_claps` runs the clap session through the same
+  `_run_sessions` with a `_SessionKind` naming the label, the opener, and which closing reasons mean
+  *worth another try* - `disconnected` / `silent` for the stream, `disconnected` / `unarmed` for the
+  listener, silence being that session's normal state rather than a fault.
 - `MotionSession` is how a stop is requested from outside the task: `request_stop(reason)` sets an
   `asyncio.Event` that the runner awaits, so `async_stop` needs no cancellation.
 - Silence detection lives in the connection: the listener calls `_RingConnection.touch_motion()` on
@@ -202,12 +217,14 @@ packets whose `packet[0]` has no handler. That cannot represent an open-ended st
   every poll opens its own connection ([`_RingConnection`](../custom_components/colmi_ring/api.py)
   connects and disconnects per call), so a long-lived stream and a poll cannot coexist. While a
   stream is live the coordinator performs **no** BLE I/O, and resumes the moment the stream
-  closes.
+  closes. The same rule now covers the clap listener, which holds the link for exactly the same
+  reason - see [`plans/clap-detection-plan.md`](clap-detection-plan.md).
 - **How the pause is implemented**: gate the top of
   [`_async_update_data`](../custom_components/colmi_ring/coordinator.py) on
-  `MotionManager.is_streaming` and return the cached `self.data` unchanged. Prefer this over
-  `async_shutdown()` (which has no supported restart) - the refresh timer keeps firing, each
-  tick just costs nothing, and `_apply_poll_interval` state survives untouched.
+  `MotionManager.holds_link` (i.e. `is_streaming or is_listening`) and return the cached
+  `self.data` unchanged. Prefer this over `async_shutdown()` (which has no supported restart) - the
+  refresh timer keeps firing, each tick just costs nothing, and `_apply_poll_interval` state
+  survives untouched.
 - **Side effects of pausing, all handled:**
   - Heart rate / steps / battery go **frozen, not `unavailable`**, because the coordinator keeps
     succeeding with cached data and
@@ -282,13 +299,18 @@ one continuous connection, not to the integration's uptime.
      keeps interrupting the ring-down until its very last half-cycle settles and would then be
      awarded a gesture a beat after the shaking stopped. The candidate is held **pending** until it
      rings down, costing that much latency.
-- **The ring's own clap is used too, not instead.** On session open the manager best-effort sends
-  the camera-gesture enable (`02 04`; firmware that lacks it simply answers nothing) and reports any
-  gesture packet as `source=ring`, after a `MOTION_STARTUP_MUTE_S = 2.0` mute, because the ring
-  echoes our own enable packet back at us. The stream-derived clap (`source=stream`) is disabled by
-  `MotionManager._async_check_rate` if the measured rate is under `MOTION_MIN_HZ_FOR_STREAM_CLAP =
-  15`, with a single INFO line naming the measured Hz - raise/lower still work, and only the
-  weakest-evidence detector is dropped.
+- **The ring's own clap is a separate feature, not part of this session.** It originally *was*: on
+  session open the manager best-effort sent the camera-gesture enable (`02 04`) and reported any
+  gesture packet as `source=ring`, behind a `MOTION_STARTUP_MUTE_S = 2.0` mute to swallow the ring
+  echoing our own enable back at us. The firmware ignores that command while RAW streams, so it could
+  never fire from here, and it now lives on its own link behind the `Clap Detection` switch
+  ([`plans/clap-detection-plan.md`](clap-detection-plan.md)). The `02 04`, the extra listener and the
+  startup mute are all removed from the stream path.
+- **The stream-derived clap (`source=stream`) is disabled by `MotionManager._async_check_rate` if the
+  measured rate is under `MOTION_MIN_HZ_FOR_STREAM_CLAP = 15`**, with a single INFO line naming the
+  measured Hz - raise/lower still work, and only the weakest-evidence detector is dropped. On stock
+  firmware that line is expected: it streams about one packet per second, so clap there means
+  `Clap Detection`.
 - **Design rule: sensitivity scales magnitudes only.** `GESTURE_SENSITIVITY_SCALE`
   (`low 0.6 / medium 1.0 / high 1.6`) is a *divisor* on the base thresholds, so a bigger number is
   more sensitive. The shape tests (rise, width, ring-down) and the orientation swing are
@@ -502,7 +524,12 @@ sensitivity scaling from the orientation test.
   - `const.ENABLE_RING_CAMERA_GESTURE = False`: `_on_session` no longer writes `02 04`, so the
     RAW-stream command is the only thing written to the ring for the duration of a session. Nothing
     is lost but the ring's own clap reporting; raise/lower and the stream-side clap come from the
-    accelerometer data. Re-enabling is one constant.
+    accelerometer data. Re-enabling is one constant. (**Since re-enabled**, then removed entirely:
+    later runs streamed reliably with the write in place, so it was never the link killer - and the
+    web capture in [`plans/clap-detection-plan.md`](clap-detection-plan.md) settled why it appeared to
+    do nothing. `02 04` *is* accepted while the stream runs; the firmware just refuses to report a
+    gesture over it, because RAW owns the accelerometer. A flag that no longer describes a choice
+    would only mislead, so the write, and the constant gating it, are gone.)
   - `async_stream_motion` no longer returns `None` at the first failure. It retries with a doubling
     delay (`_STREAM_RETRY_MIN_S` 1 s up to `_STREAM_RETRY_MAX_S` 30 s) for `_STREAM_GIVEUP_S` 180 s,
     resetting the budget whenever a session opens at all. The budget is bounded because the manager
@@ -648,7 +675,8 @@ sensitivity scaling from the orientation test.
 
 | Risk | Mitigation |
 |---|---|
-| Stock firmware streams too slowly for a stream-derived clap | rate probe disables *only* the stream clap and says so once, and raise/lower work at any rate. (The on-device camera gesture `02 04` *would* be the fallback, but it is switched off - `ENABLE_RING_CAMERA_GESTURE` - because that write is the leading suspect for killing the link; see the third run above.) |
+| Stock firmware streams too slowly for a stream-derived clap | rate probe disables *only* the stream clap and says so once, and raise/lower work at any rate. A clap then comes from the ring's own detector instead, on the separate `Clap Detection` switch. |
+| The ring's own detector is a feature this firmware may not have | settled for the ATC-writer-supported ring, which does report claps, and made unreachable-by-accident rather than guessed at: `scripts/_accel_probe.py` arms `02 04` **twice** - once with RAW off, once on top of a stream - and prints a verdict naming which case the firmware is, with `scripts/_gesture_report_check.py` testing that verdict logic offline. In the integration, a ring that refuses the `02 04` *write* ends the session with reason `unarmed` and the switch turns itself off with a line saying the firmware probably has no on-device clap. Caveat kept honest: the write is fire-and-forget, so a firmware that accepts the write and reports nothing is indistinguishable from one with no detector, and is reported only as silence. |
 | Low-nibble decode assumption is wrong | rest magnitude will be nowhere near 1 g, which the replay script shows immediately; unparsable/odd packets are logged with hex |
 | Axis order / sign misread (wire order is Y, Z, X) | largely moot: velocity is projected onto the *estimated gravity vector*, so raise/lower are correct for any axis mapping; only scale/nibble can break it wholesale |
 | Ring will not serve commands while streaming | **decided:** coordinator pauses polling for the session; HR reads `unknown`, other call sites refuse with `STREAM_BUSY_MESSAGE` |
@@ -664,19 +692,20 @@ sensitivity scaling from the orientation test.
 flowchart LR
   R[Ring accelerometer] -->|RAW notify 16B| H[_handle_tx fan-out]
   H --> Q[per-command queues]
-  H --> L[motion listeners: RAW + camera gesture]
-  R -->|camera gesture packet| H
+  H --> L[RAW listener]
+  R -->|clap report packet| H2[clap listener]
+  H2 --> M
   L --> P[MotionManager on_packet]
   P -->|accel sample| D[GestureDetector feed]
-  P -->|gesture packet| M
   D -->|GestureEvent| M[MotionManager]
   M -->|async_fire colmi_ring_gesture| F[HA event bus]
   M -->|event listeners| E[gesture event entities]
-  S[switch entity] -->|start/stop| M
+  S[Motion Stream / Clap Detection switches] -->|start/stop| M
   S -.->|state listener| M
-  M -->|is_streaming gate| C[DataUpdateCoordinator]
-  C -->|skips polls while streaming| K[_RingConnection]
+  M -->|holds_link gate| C[DataUpdateCoordinator]
+  C -->|skips polls while either is on| K[_RingConnection]
   M -->|async_stream_motion session| K
+  M -->|async_listen_claps session| K
   K --> R
   M -->|auto-off timer| M
 ```

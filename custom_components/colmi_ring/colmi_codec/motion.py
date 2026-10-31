@@ -16,18 +16,22 @@ checksum, and the axis decode over the whole 12-bit space - with no mismatches.
   order **Y, Z, X**, with the low bits in the *low* nibble of the next byte.
 * The range is +/-4 g, so ``g = (raw / 2048) * 4``.
 * The ring's on-device "camera button" gesture is enabled with ``02 04`` and
-  disabled with ``02 06``.
+  disabled with ``02 06``, and it works on its own: no RAW stream is needed, and
+  the setting survives a disconnect.
 
-*Unverified on our R02.* Parity with a web demo for a different ring is not the
-same as the R02 firmware agreeing, and two things go beyond anything the
-reference states: which ``packet[1]`` values are a camera-gesture *report* (see
-:data:`GESTURE_REPORT_TYPES`), and whether accel data really arrives on
-``CMD_RAW_MODE`` at all - the reference classifies notifications by ``packet[1]``
-alone and listens to every notifiable characteristic, so it never commits to a
-command byte. Those are the Phase 0 probe's to settle (:mod:`scripts._accel_probe`),
-and they are deliberately isolated in this module and in the ``MOTION_*``
-constants in ``const.py`` so a correction lands in one place without touching the
-detector or the Home Assistant surface.
+*Unverified on our R02.* Whether accel data really arrives on ``CMD_RAW_MODE`` at
+all is still an assumption - the reference classifies notifications by
+``packet[1]`` alone and listens to every notifiable characteristic, so it never
+commits to a command byte. That one belongs to the Phase 0 probe
+(:mod:`scripts._accel_probe`) and is isolated in this module and in the
+``MOTION_*`` constants in ``const.py`` so a correction lands in one place without
+touching the detector or the Home Assistant surface.
+
+*Measured on our R02.* The camera-gesture *report* byte is no longer a guess; see
+:data:`GESTURE_REPORT_TYPES`. Two facts came out of the same capture, via the
+ATC RF03 Writer web tool, and both matter to ``MotionManager``: a clap yields one
+packet only while a central is actually connected, and the ring does not echo the
+``02 04`` enable back at us.
 
 Like the rest of this subpackage this module is pure: no Home Assistant, no
 Bluetooth, no allocation on the hot path beyond the sample dataclass.
@@ -54,12 +58,19 @@ SUB_GESTURE_OFF = 6
 # ``packet[1]`` value that marks a notification as position/accelerometer data.
 TYPE_POSITION = 3
 
-# ``packet[1]`` values treated as "the on-device gesture just fired". The
-# reference only documents the on/off *commands*, so the report codes are a
-# guess; anything on ``CMD_CAMERA_GESTURE`` that is not an obvious command echo
-# is reported. See ``MotionManager`` for the startup mute that keeps the ring
-# echoing our own enable packet from producing a phantom clap.
-GESTURE_REPORT_TYPES = frozenset({4, 5, 7})
+# ``packet[1]`` value that means "the on-device gesture just fired".
+#
+# Measured on an R02 with the ATC RF03 Writer web tool: ``02 04`` (checksum 06)
+# starts camera mode on its own, with no RAW stream, and each clap then reports
+# exactly one 16-byte packet, ``02 02 00 00 00 00 00 00 00 00 00 00 00 00 00 04``
+# (checksum 04, well-formed, all-zero body). Subtype 2 is therefore the report.
+#
+# Note 2 is also ``SUB_RAW_OFF``: on ``CMD_CAMERA_GESTURE`` it is a clap, and the
+# command bytes keep the two apart. Nothing was seen echoed back after the
+# ``02 04`` write, so this set deliberately excludes 4 - accepting our own enable
+# as a report is what the old guess ({4, 5, 7}) got wrong in both directions: it
+# could not see real claps, and it could invent them.
+GESTURE_REPORT_TYPES = frozenset({2})
 
 # 12-bit signed accelerometer payload, scaled to +/-4 g.
 RAW_MAX = 2048

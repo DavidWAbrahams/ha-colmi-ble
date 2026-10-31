@@ -27,9 +27,10 @@
                     "poll_max_interval": "Maximum BLE polling interval in minutes (the integration polls at your heart-rate sampling period, up to this limit)",
                     "hr_backfill": "Log heart-rate samples recorded while out of Bluetooth range into history",
                     "steps_backfill": "Experimental: also backfill steps/distance/calories history (raw graph only, may not show in long-term statistics)",
-                    "motion_enabled": "Enable gesture detection (adds a Motion Stream switch and a clap event; streaming pauses normal polling and uses more battery)",
+                    "motion_enabled": "Enable gesture detection (adds a Motion Stream switch that detects gestures from the ring's live accelerometer stream; streaming pauses normal polling and uses more battery)",
                     "gesture_sensitivity": "Gesture sensitivity",
                     "motion_stream_timeout": "Turn the motion stream off automatically after this many minutes (0 = leave it on until switched off)",
+                    "clap_timeout": "Turn clap detection off automatically after this many minutes (0 = leave it on until switched off). Heart rate, battery and steps stop updating while it is on",
                     "motion_sensor_update_s": "Minimum seconds between accelerometer sensor updates (0 = update for every sample the ring sends; each update is a history row)",
                     "motion_log_samples": "Log every accelerometer sample to the debug log (for tuning gestures)"
                 }

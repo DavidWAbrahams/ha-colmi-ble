@@ -14,6 +14,12 @@ Only the clap is offered today. Raise and lower are recognised by
 cannot resolve a steady lift or drop (see ``_SUPPRESSED_GESTURES`` in
 ``motion_manager.py``), so publishing them would only produce unreliable
 automations.
+
+The clap can reach us two ways - derived from the RAW stream, or reported by
+the ring's own detector while the Clap Detection switch holds the link - and the
+event data says which via its ``source`` field. The entities are therefore
+created whether or not motion streaming is enabled: a user who only ever turns
+on Clap Detection still needs something to trigger on.
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from homeassistant.components.event import EventEntity, EventEntityDescription
 from homeassistant.core import callback
 
 from .const import (
-    CONF_MOTION_ENABLED,
     LOGGER,
 )
 from .entity import ColmiRingEntity
@@ -55,9 +60,12 @@ async def async_setup_entry(
     entry: ColmiRingConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the gesture event entities (only when motion is enabled)."""
-    if not entry.options.get(CONF_MOTION_ENABLED, False):
-        return
+    """Set up the gesture event entities.
+
+    Not gated on ``CONF_MOTION_ENABLED`` the way the stream switch is: the clap
+    has a second, independent source, so the entities exist for any setup. The
+    listeners they register are harmless while nothing publishes to them.
+    """
     coordinator: ColmiRingDataUpdateCoordinator = entry.runtime_data.coordinator
     async_add_entities(
         ColmiRingGestureEvent(
@@ -69,11 +77,11 @@ async def async_setup_entry(
 
 
 class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
-    """Fires when the ring's motion stream contains this gesture.
+    """Fires when this gesture is reported by either source.
 
     The entity's own event is named after the gesture, so it can be used as a
     per-gesture automation trigger. The integration *also* fires the
-    ``colmi_ring_gesture`` event on the bus (see ``MotionManager._publish``)
+    ``colmi_ring_gesture`` event on the bus (see ``MotionManager._announce``)
     with the same data, which catches every gesture with one trigger and does
     not depend on how the event component names its generated events.
     """

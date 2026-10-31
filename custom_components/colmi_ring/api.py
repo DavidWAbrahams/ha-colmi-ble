@@ -20,9 +20,10 @@ import asyncio
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -52,6 +53,7 @@ from .const import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
+    from contextlib import AbstractAsyncContextManager
 
     from homeassistant.core import HomeAssistant
 
@@ -75,6 +77,9 @@ POLL_LOCK_WAIT_S = 5.0
 # second of the refresh that ran when the previous stream closed, so a poll is
 # mid-flight. Those finish in a few seconds, so the stream waits rather than
 # reporting a failure the user cannot act on.
+#
+# The clap listener waits this long too, for the same reason: it is the other
+# kind of session that holds the link open indefinitely.
 STREAM_LOCK_WAIT_S = 90.0
 # Button presses and settings writes come from a person in the UI, so a poll
 # already on the air is worth a short wait rather than an instant refusal.
@@ -541,9 +546,12 @@ class _RingConnection:
     async def set_camera_gesture(self, enabled: bool) -> bool:
         """Toggle the ring's on-device camera-button (clap) detection.
 
-        Best-effort: the ring's answer to this command is not part of the
-        stream, so there is nothing to await beyond the write. Returns whether
-        the write reached the ring.
+        Best-effort: this is a write without response and the detection reports
+        are notifications rather than a reply, so there is nothing to await
+        beyond the write. Returns whether the write reached the ring.
+
+        Only the Clap Detection session uses this. Camera mode does not coexist
+        with RAW streaming, so it is deliberately not part of a motion session.
         """
         packet = (
             motion.get_camera_gesture_on_packet()
@@ -648,13 +656,13 @@ class _StreamTally:
         )
 
 
-class MotionSession:
-    """A live RAW-motion session: one open connection with the stream on.
+class _LinkSession:
+    """One open connection to the ring that its holder may end early.
 
-    Handed out by :meth:`ColmiRingApiClient.async_stream_motion`. The holder
-    may end the session early with :meth:`request_stop` (the auto-off timer does
-    this); the transport ends it itself if the link drops or the stream goes
-    silent.
+    Handed out by the session loops in :class:`ColmiRingApiClient`. The holder
+    ends it with :meth:`request_stop` (the auto-off timers do this); the
+    transport ends it itself if the link drops, or - where that is meaningful -
+    if the data stops arriving.
     """
 
     def __init__(self, conn: _RingConnection) -> None:
@@ -668,14 +676,53 @@ class MotionSession:
             self.reason = reason
         self._stopped.set()
 
-    async def enable_camera_gesture(self, enabled: bool) -> bool:
-        """Toggle the ring's on-device camera-button (clap) detection."""
-        return await self.conn.set_camera_gesture(enabled)
-
     async def wait_stopped(self) -> str | None:
         """Block until the session is over, returning the closing reason."""
         await self._stopped.wait()
         return self.reason
+
+
+class MotionSession(_LinkSession):
+    """A live RAW-motion session: one open connection with the stream on.
+
+    Ends by itself if the stream goes silent, since a stream that reports
+    nothing is not a working stream.
+    """
+
+
+class ClapSession(_LinkSession):
+    """A live on-device clap session: one connection with camera mode armed.
+
+    Silence is the normal state here - the ring reports one packet per clap and
+    nothing in between - so this kind of session is never closed for lack of
+    traffic, only for a dropped link.
+    """
+
+
+# Either kind of session, so the shared retry loop can be typed against both.
+_SessionT = TypeVar("_SessionT", bound=_LinkSession)
+
+
+@dataclass(frozen=True)
+class _SessionKind(Generic[_SessionT]):
+    """How one kind of long-lived session is opened, and when to reopen it.
+
+    The motion stream and the clap listener hold the ring's link in the same way
+    and want the same retry behaviour; what differs is the opening ritual and
+    which closing reasons are worth a reconnect, so those three things travel
+    together instead of as loose parameters.
+    """
+
+    #: What this kind of session is called in log lines.
+    label: str
+    #: Returns the context manager that holds the session open.
+    opener: Callable[
+        [Callable[[bytearray], None]],
+        AbstractAsyncContextManager[_SessionT],
+    ]
+    #: Closing reasons that mean "reconnect and try again"; anything else (a
+    #: user turning the switch off, a ring that refuses the enable) ends the loop.
+    retry_reasons: tuple[str, ...]
 
 
 class ColmiRingApiClient:
@@ -1031,6 +1078,14 @@ class ColmiRingApiClient:
         (see ``MotionManager``), but a poll already in flight when the user
         toggles the stream on can only be waited out, hence the generous
         :data:`STREAM_LOCK_WAIT_S`.
+
+        The RAW stream deliberately does *not* also arm the ring's on-device
+        clap detector. Measured on an R02 with the ATC RF03 Writer web tool,
+        camera mode (``02 04``) runs on its own with no stream and reports one
+        ``02 02`` packet per clap, but no clap report was ever seen while RAW
+        mode had the accelerometer - the two features read the same sensor and
+        one firmware appears to serve only at a time. So arming it here bought
+        nothing; it has its own session now, see :meth:`_clap_session`.
         """
         conn = self._connection("motion stream", STREAM_LOCK_WAIT_S)
         session = MotionSession(conn)
@@ -1040,10 +1095,9 @@ class ColmiRingApiClient:
         # still shows packets arriving, which is a different diagnosis and a
         # different fix.
         conn.observer = tally.add
-        listener = self._make_motion_listener(session, on_packet)
+        listener = self._make_packet_listener(session, on_packet)
         async with conn:
             conn.add_listener(motion.CMD_RAW_MODE, listener)
-            conn.add_listener(motion.CMD_CAMERA_GESTURE, listener)
             conn.touch_motion()
             await conn.start_motion_stream()
             watchdog = asyncio.create_task(self._watch_stream(session))
@@ -1058,17 +1112,118 @@ class ColmiRingApiClient:
                 except asyncio.CancelledError:
                     pass
                 conn.remove_listener(motion.CMD_RAW_MODE, listener)
-                conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
                 self._log_stream_session(session, tally)
                 await conn.stop_motion_stream()
-                # Undo the camera-gesture enable from the session start. It is a
-                # setting the ring remembers after we disconnect, so leaving it
-                # on would keep its detector running - and its battery cost -
-                # for as long as the ring is worn. Sent second because a stream
-                # still running is the more urgent thing to silence, and this
-                # write is the one that can be lost if that first write is what
-                # finally kills the link.
+
+    @asynccontextmanager
+    async def _clap_session(
+        self, on_packet: Callable[[bytearray], None]
+    ) -> AsyncIterator[ClapSession]:
+        """Hold the connection open with the ring's own clap detector armed.
+
+        This is the session behind the Clap Detection switch, and it exists
+        because a BLE notification only reaches a central that is connected at
+        that moment: a clap reported while we are disconnected is simply lost.
+        So hearing the ring's clap reports means holding its single link, which
+        is also why the switch warns about pausing polling.
+
+        The listener goes in *before* the ``02 04`` write so that a ring which
+        does answer the enable cannot have its reply fall on the floor, and the
+        matching ``02 06`` goes out on every exit path: the ring remembers the
+        setting after we disconnect, so leaving it armed would keep its detector
+        running - and costing battery - for as long as the ring is worn.
+
+        No silence timeout, unlike the RAW stream: this session is *expected* to
+        hear nothing between claps, which may be hours.
+        """
+        conn = self._connection("clap detection", STREAM_LOCK_WAIT_S)
+        session = ClapSession(conn)
+        tally = _StreamTally()
+        # Same reasoning as the RAW stream: the tally answers "did the ring send
+        # nothing, or did it send on a byte we do not listen to?", and only an
+        # observer over the whole link can tell those apart.
+        conn.observer = tally.add
+        listener = self._make_packet_listener(session, on_packet)
+        async with conn:
+            conn.add_listener(motion.CMD_CAMERA_GESTURE, listener)
+            conn.touch_motion()
+            armed = await conn.set_camera_gesture(True)
+            if not armed:
+                # The write did not reach the ring. Listening anyway would hold
+                # the link, freeze polling and report nothing, so end the
+                # session and let the retry loop (then the switch) deal with it.
+                session.request_stop("unarmed")
+            watchdog = asyncio.create_task(self._watch_link(session))
+            try:
+                yield session
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except asyncio.CancelledError:
+                    pass
+                conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
+                self._log_clap_session(session, tally, armed)
                 await conn.set_camera_gesture(False)
+
+    def _log_clap_session(
+        self, session: ClapSession, tally: _StreamTally, armed: bool
+    ) -> None:
+        """Report what a finished clap session saw, and whether it could work."""
+        lived = (
+            "an unknown time"
+            if session.conn.linked_at is None
+            else f"{time.monotonic() - session.conn.linked_at:.1f}s"
+        )
+        reason = session.reason or "ABORTED (never stopped by anyone)"
+        reports = tally.count_for(motion.CMD_CAMERA_GESTURE)
+        if not armed:
+            LOGGER.info(
+                "Colmi ring %s clap detection closed after %s (%s): the ring"
+                " never accepted the enable write (02 04), so no clap could be"
+                " reported",
+                self._ring_address,
+                lived,
+                reason,
+            )
+            return
+        if reports:
+            LOGGER.debug(
+                "Colmi ring %s clap detection closed (%s, after %s): %d"
+                " camera-gesture notification(s), %d total: %s",
+                self._ring_address,
+                reason,
+                lived,
+                reports,
+                tally.count,
+                tally.describe(),
+            )
+            return
+        # INFO because "the switch is on but nothing ever fires" is the question
+        # this answers, and a session that reported nothing after being armed is
+        # the evidence that this firmware does not announce the gesture.
+        LOGGER.info(
+            "Colmi ring %s clap detection closed after %s (%s) with %d"
+            " notification(s) and none of them a clap report (0x%02X/02): %s."
+            " If you clapped during this session, this firmware probably does"
+            " not report the on-device gesture",
+            self._ring_address,
+            lived,
+            reason,
+            tally.count,
+            motion.CMD_CAMERA_GESTURE,
+            tally.describe(),
+        )
+
+    @staticmethod
+    async def _watch_link(session: _LinkSession) -> None:
+        """Close the session when the link drops.
+
+        The clap listener's only failure mode. The RAW stream's silence rule is
+        deliberately absent: here, silence means "no claps", not "broken".
+        """
+        await session.conn.dead.wait()
+        session.request_stop("disconnected")
 
     def _log_stream_session(
         self, session: MotionSession, tally: _StreamTally
@@ -1120,11 +1275,11 @@ class ColmiRingApiClient:
         )
 
     @staticmethod
-    def _make_motion_listener(
-        session: MotionSession,
+    def _make_packet_listener(
+        session: _LinkSession,
         on_packet: Callable[[bytearray], None],
     ) -> Callable[[bytearray], None]:
-        """Wrap the caller's callback so silence tracking stays automatic."""
+        """Wrap the caller's callback so the link is marked active on traffic."""
 
         def listener(packet: bytearray) -> None:
             session.conn.touch_motion()
@@ -1170,35 +1325,89 @@ class ColmiRingApiClient:
     ) -> str | None:
         """Run motion-stream sessions, restarting them while still wanted.
 
-        ``on_packet`` receives every RAW/gesture notification. ``should_run``
-        is polled before each (re)connect and is what ends the loop when the
-        user turns the stream off. Returns the reason the stream finally
-        stopped, or ``None`` if it never managed to stay open.
+        ``on_packet`` receives every RAW/gesture notification, ``should_run`` is
+        polled before each (re)connect and is what ends the loop when the user
+        turns the stream off. Returns the reason the stream finally stopped, or
+        ``None`` if it never managed to stay open. See :meth:`_run_sessions` for
+        when a failure is retried and when it ends the loop.
+        """
+        return await self._run_sessions(
+            _SessionKind(
+                label="motion stream",
+                opener=self._motion_stream,
+                retry_reasons=("disconnected", "silent"),
+            ),
+            on_packet,
+            should_run,
+            on_session,
+        )
 
-        A stream that drops or cannot open is retried with a doubling delay
+    async def async_listen_claps(
+        self,
+        on_packet: Callable[[bytearray], None],
+        should_run: Callable[[], bool],
+        on_session: Callable[[ClapSession], None] | None = None,
+    ) -> str | None:
+        """Run clap-listener sessions, restarting them while still wanted.
+
+        The motion stream's loop over the clap session. What differs is which
+        closing reasons mean "worth another try": silence is this session's
+        normal state, so only a dropped link or a ring that refused the ``02 04``
+        enable is retried.
+        """
+        return await self._run_sessions(
+            _SessionKind(
+                label="clap detection",
+                opener=self._clap_session,
+                # Silence is normal here, so it is not a reason to reconnect. A
+                # ring that refused the enable might just have been busy, and the
+                # retry budget bounds how often we ask.
+                retry_reasons=("disconnected", "unarmed"),
+            ),
+            on_packet,
+            should_run,
+            on_session,
+        )
+
+    async def _run_sessions(
+        self,
+        kind: _SessionKind[_SessionT],
+        on_packet: Callable[[bytearray], None],
+        should_run: Callable[[], bool],
+        on_session: Callable[[_SessionT], None] | None = None,
+    ) -> str | None:
+        """Hold one kind of session open, reopening it while it is wanted.
+
+        Shared by the motion stream and the clap listener: they differ only in
+        how the session is opened and in which closing reasons are worth another
+        attempt, but both hold the ring's single link for their whole life, so
+        both owe the host the same courtesy about retrying and about knowing when
+        to stop.
+
+        A session that drops or cannot open is retried with a doubling delay
         (:data:`_STREAM_RETRY_MIN_S` up to :data:`_STREAM_RETRY_MAX_S`) for as
         long as :data:`_STREAM_GIVEUP_S`, rather than giving up at the first
         failure. Turning the switch off on the very first error made every brief
-        hiccup look like a broken feature, and it also threw away the evidence:
-        a stream that dies on every attempt at 1 s, 2 s, 4 s intervals reports
+        hiccup look like a broken feature, and it also threw away the evidence: a
+        session that dies on every attempt at 1 s, 2 s, 4 s intervals reports
         that pattern, where a single attempt reports nothing useful. The budget
-        is bounded because while it burns the manager still believes the stream
-        owns the ring and pauses polling; an unrecoverable failure has to end
-        with polling resuming and the switch off. A session that opens at all
-        resets the budget.
+        is bounded because while it burns the manager still believes this session
+        owns the ring and pauses polling; an unrecoverable failure has to end with
+        polling resuming and the switch off. A session that opens at all resets
+        the budget.
 
-        Failures are reported by return value rather than raised: a stream that
-        cannot start should let the caller log one line and mark its switch
-        off, not raise out of a service call.
+        Failures are reported by return value rather than raised: a session that
+        cannot start should let the caller log one line and mark its switch off,
+        not raise out of a service call.
         """
         failing_since: float | None = None
         delay = self._STREAM_RETRY_MIN_S
         while should_run():
             # Declared here so a failed ``__aenter__`` cannot leave the previous
             # attempt's session visible to the stability check below.
-            session: MotionSession | None = None
+            session: _SessionT | None = None
             try:
-                async with self._motion_stream(on_packet) as session:
+                async with kind.opener(on_packet) as session:
                     self._arm_session(session, on_session)
                     reason = await session.wait_stopped()
                 # Only a session that stayed up counts as a success for retry
@@ -1206,7 +1415,7 @@ class ColmiRingApiClient:
                 # means a fault that reproduces every time (a session that dies two
                 # milliseconds after opening, say) restarts the budget on every
                 # attempt and so retries at the minimum delay forever - while the
-                # manager believes the stream owns the ring and keeps polling
+                # manager believes this session owns the ring and keeps polling
                 # paused. Requiring a real lifetime lets the budget run out and the
                 # switch go off.
                 if self._session_lived(session) >= self._STREAM_STABLE_S:
@@ -1219,8 +1428,9 @@ class ColmiRingApiClient:
                 # the evidence for *why* (busy vs. out of range vs. no UART
                 # service all look different here).
                 LOGGER.warning(
-                    "Colmi ring %s motion stream could not start: %s",
+                    "Colmi ring %s %s could not start: %s",
                     self._ring_address,
+                    kind.label,
                     err,
                 )
                 if await self._stream_pause(should_run, failing_since, delay):
@@ -1233,12 +1443,13 @@ class ColmiRingApiClient:
                 # A session abandoned this way reports "closed (stopped)" with no
                 # reason, because cancellation unwinds the ``async with`` without
                 # ever setting one. Without this line that case is indistinguishable
-                # from the ring refusing to stream, so say it out loud before
+                # from the ring refusing to serve us, so say it out loud before
                 # handing the cancellation back to whoever started it.
                 LOGGER.warning(
-                    "Colmi ring %s motion stream task was cancelled while the"
-                    " session was open (reload, shutdown, or a cancelled task)",
+                    "Colmi ring %s %s task was cancelled while the session was"
+                    " open (reload, shutdown, or a cancelled task)",
                     self._ring_address,
+                    kind.label,
                 )
                 raise
             except Exception:  # noqa: BLE001
@@ -1254,15 +1465,17 @@ class ColmiRingApiClient:
                 # attempt gets one line per retry rather than a stack each time.
                 if failing_since is None:
                     LOGGER.exception(
-                        "Colmi ring %s motion stream aborted while the session"
-                        " was open; closing it and retrying",
+                        "Colmi ring %s %s aborted while the session was open;"
+                        " closing it and retrying",
                         self._ring_address,
+                        kind.label,
                     )
                 else:
                     LOGGER.warning(
-                        "Colmi ring %s motion stream aborted again (see the"
-                        " traceback from the first attempt)",
+                        "Colmi ring %s %s aborted again (see the traceback from"
+                        " the first attempt)",
                         self._ring_address,
+                        kind.label,
                     )
                 if await self._stream_pause(should_run, failing_since, delay):
                     failing_since, delay = self._next_retry(
@@ -1271,13 +1484,14 @@ class ColmiRingApiClient:
                     continue
                 return None
             # A session that died on its own is worth retrying only while the
-            # user still wants the stream; a user-requested stop is final.
-            if reason in ("disconnected", "silent") and should_run():
+            # user still wants it; a user-requested stop is final, and so is any
+            # reason the caller knows cannot be fixed by reconnecting.
+            if reason in kind.retry_reasons and should_run():
                 if await self._stream_pause(should_run, failing_since, delay):
                     LOGGER.info(
-                        "Colmi ring %s motion stream ended (%s); reconnecting"
-                        " in %.0fs",
+                        "Colmi ring %s %s ended (%s); reconnecting in %.0fs",
                         self._ring_address,
+                        kind.label,
                         reason,
                         delay,
                     )
@@ -1286,9 +1500,10 @@ class ColmiRingApiClient:
                     )
                     continue
                 LOGGER.warning(
-                    "Colmi ring %s motion stream keeps ending (%s); giving up"
-                    " after %.0fs of retries",
+                    "Colmi ring %s %s keeps ending (%s); giving up after %.0fs"
+                    " of retries",
                     self._ring_address,
+                    kind.label,
                     reason,
                     self._STREAM_GIVEUP_S,
                 )
@@ -1307,12 +1522,12 @@ class ColmiRingApiClient:
 
     @staticmethod
     def _arm_session(
-        session: MotionSession,
-        on_session: Callable[[MotionSession], None] | None,
+        session: _SessionT,
+        on_session: Callable[[_SessionT], None] | None,
     ) -> None:
         """Hand the open session to the caller, and say so if the arming fails.
 
-        The callback arms the stream (listeners, timers, the gesture detector). A
+        The callback arms the session (listeners, timers, the gesture detector). A
         fault there used to propagate straight out of the transport: the session
         closed a couple of milliseconds after opening with no reason set, and the
         traceback was written by Home Assistant's task handler under a
@@ -1328,13 +1543,12 @@ class ColmiRingApiClient:
             on_session(session)
         except Exception:  # noqa: BLE001
             LOGGER.exception(
-                "Colmi ring motion stream arming callback raised;"
-                " closing the session"
+                "Colmi ring session arming callback raised; closing the session"
             )
             raise
 
     @staticmethod
-    def _session_lived(session: MotionSession | None) -> float:
+    def _session_lived(session: _LinkSession | None) -> float:
         """Seconds a finished session held the link, or -1 if it never linked."""
         if session is None or session.conn.linked_at is None:
             return -1.0

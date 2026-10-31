@@ -15,7 +15,10 @@ gesture implementation:
      offsets, scale and sign together), and which axis/sign flips on a
      deliberate hand raise?
   4. Does the ring's on-device "camera button" gesture (``02 04`` / ``02 06``)
-     emit a packet we could use as a battery-free clap detector?
+     emit a packet we could use as a battery-free clap detector - and does it
+     still do so *while* RAW mode is streaming, or do the two claim the same
+     accelerometer? The gesture is therefore armed twice: once on its own, and
+     once on top of an open stream.
 
 The ring serves a single central. Pause or disable the Home Assistant config
 entry (and keep the ring close to this machine's Bluetooth adapter) before
@@ -231,18 +234,25 @@ async def run_stream_phases(client: BleakClient, capture: Capture) -> None:
 
 
 async def try_camera_gesture(
-    client: BleakClient, write_char: Any, capture: Capture
+    client: BleakClient, write_char: Any, capture: Capture, label: str, heading: str
 ) -> None:
-    """Toggle the ring's on-device camera-button gesture and watch for packets."""
-    print("\n--- camera-button gesture test (candidate battery-free clap) ---")
+    """Toggle the ring's on-device camera-button gesture and watch for packets.
+
+    ``label`` names the phase pair in the capture, so the same test can run with
+    RAW mode off and again with it on; ``report_camera_gesture`` compares the two.
+    The disable window is not a throwaway: packets during it mean the ring
+    reports gestures whether or not it was asked, so a count in the enable window
+    alone would prove nothing.
+    """
+    print(f"\n--- {heading} ---")
     await send(
         client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([4]))
     )
-    await phase(capture, "camera_gesture_on", 12, "Clap repeatedly")
+    await phase(capture, f"{label}_on", 12, "Clap repeatedly")
     await send(
         client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([6]))
     )
-    await phase(capture, "camera_gesture_off", 6, "Clap again (gesture disabled)")
+    await phase(capture, f"{label}_off", 6, "Clap again (gesture disabled)")
 
 
 # ---------------------------------------------------------------- reporting
@@ -334,22 +344,26 @@ def report_decode(capture: Capture, packets: list[Packet]) -> None:
         )
 
 
-def _in_span(capture: Capture, label: str, packets: list[Packet]) -> list[Packet]:
-    """The already-filtered sample packets that fall inside a named phase.
-
-    ``packets`` is the dominant-type subset, so command replies and other
-    chatter never get decoded as motion samples.
-    """
+def _phase_window(capture: Capture, label: str) -> tuple[float, float] | None:
+    """The time span of a named phase, ending at the next marker (or now)."""
     ordered = sorted(capture.marks)
-    window = None
     for index, (mark_t, name) in enumerate(ordered):
         if name != label:
             continue
         end = (
             ordered[index + 1][0] if index + 1 < len(ordered) else time.monotonic()
         )
-        window = (mark_t, end)
-        break
+        return (mark_t, end)
+    return None
+
+
+def _in_span(capture: Capture, label: str, packets: list[Packet]) -> list[Packet]:
+    """The already-filtered sample packets that fall inside a named phase.
+
+    ``packets`` is the dominant-type subset, so command replies and other
+    chatter never get decoded as motion samples.
+    """
+    window = _phase_window(capture, label)
     if window is None:
         return []
     start, end = window
@@ -364,7 +378,7 @@ def report_gestures(capture: Capture, packets: list[Packet]) -> None:
     """Which axis and sign distinguishes a raise from a lower, and the clap spike."""
     print("\n## Gesture signatures (per phase, mean axis in g)")
     still = _phase_means(capture, "still", packets)
-    for label in ("still", "raise_still_lower", "clap", "camera_gesture_on"):
+    for label in ("still", "raise_still_lower", "clap", "gesture_with_raw_on"):
         means = _phase_means(capture, label, packets)
         if means is None:
             continue
@@ -430,6 +444,94 @@ def _report_axis_extremes(
         print(f"  {name}: {min(column):+.2f} .. {max(column):+.2f} g")
 
 
+def _gesture_packets(capture: Capture, label: str, suffix: str) -> list[Packet]:
+    """Packets on the gesture command byte during one phase window."""
+    window = _phase_window(capture, f"{label}{suffix}")
+    if window is None:
+        return []
+    start, end = window
+    return [
+        pkt
+        for pkt in capture.packets
+        if pkt.data and pkt.data[0] == CMD_CAMERA_GESTURE and start <= pkt.t < end
+    ]
+
+
+_GESTURE_PHASES: tuple[tuple[str, str], ...] = (
+    ("gesture_alone", "RAW off"),
+    ("gesture_with_raw", "RAW on"),
+)
+
+
+def report_camera_gesture(capture: Capture) -> None:
+    """Whether ``02 04`` is answered, and whether RAW mode suppresses it.
+
+    Home Assistant used to arm the camera-button gesture only *while* RAW
+    streaming ran, so a firmware that feeds both from one accelerometer pipeline
+    looked like a firmware with no clap at all. The two are therefore tested
+    separately here, and that test is still worth running on an unknown ring:
+    Home Assistant's `Clap Detection` switch arms ``02 04`` with RAW off, so the
+    ``RAW off`` column below is what predicts whether that switch can work, and
+    the ``RAW on`` column is why the two switches refuse each other.
+    """
+    print("\n## Camera-button gesture, on its own and under RAW mode")
+    counts: dict[str, int] = {}
+    rows: list[str] = []
+    for label, note in _GESTURE_PHASES:
+        if _phase_window(capture, f"{label}_on") is None:
+            continue
+        on = _gesture_packets(capture, label, "_on")
+        off = _gesture_packets(capture, label, "_off")
+        counts[label] = len(on)
+        rows.append(
+            f"  {note:9s} 0x02 packets: {len(on)} while enabled,"
+            f" {len(off)} while disabled"
+        )
+    if not rows:
+        print("  (gesture phases not reached)")
+        return
+    print("\n".join(rows))
+    if "gesture_with_raw" not in counts:
+        # A run that died before the second phase would otherwise be reported as
+        # "no gesture at all", which is a statement about the firmware that the
+        # capture does not actually support.
+        print(
+            "\n  Verdict: inconclusive - the run ended before the gesture was armed"
+            " a second time under RAW mode, so the two were never compared."
+        )
+        return
+
+    alone = counts.get("gesture_alone", 0)
+    with_raw = counts["gesture_with_raw"]
+    print("\n  Verdict:")
+    if alone and with_raw:
+        print(
+            "    Camera mode CONFIRMED, and it coexists with RAW mode: the ring"
+            " answers 02 04 either way, so the Clap Detection switch can report"
+            " claps on this firmware (Motion Stream is then a separate, optional"
+            " feature)."
+        )
+    elif alone and not with_raw:
+        print(
+            "    Camera mode CONFIRMED, but ONLY while RAW mode is off: the two are"
+            " mutually exclusive. Use the Clap Detection switch with the Motion"
+            " Stream switch off - which is why those two switches refuse each other"
+            " in Home Assistant rather than both running."
+        )
+    elif not alone and not with_raw:
+        print(
+            "    No 0x02 packet either way, so this firmware appears to have no"
+            " camera-button gesture at all: the Clap Detection switch will turn"
+            " itself off, and a clap could only be derived from a fast enough RAW"
+            " stream."
+        )
+    else:
+        print(
+            "    0x02 packets appeared only under RAW mode, which is the wrong way"
+            " round; re-run in case a clap landed outside its window."
+        )
+
+
 def report(capture: Capture) -> None:
     report_types(capture)
     dominant = _dominant_type(capture)
@@ -437,6 +539,7 @@ def report(capture: Capture) -> None:
     report_variance(packets)
     report_decode(capture, packets)
     report_gestures(capture, packets)
+    report_camera_gesture(capture)
 
 
 def _dominant_type(capture: Capture) -> tuple[int, int] | None:
@@ -476,11 +579,29 @@ async def probe(address: str, passive_seconds: int, capture: Capture) -> None:
         await phase(
             capture, "passive", passive_seconds, "Listening (send nothing yet)"
         )
+        # The gesture is tested *before* RAW mode is enabled as well as during
+        # it. Home Assistant only ever arms it on top of a running stream, so if
+        # the firmware routes both features through one accelerometer pipeline
+        # then the stream is what silences the gesture - indistinguishable, from
+        # HA's side, from a firmware that has no gesture at all.
+        await try_camera_gesture(
+            client,
+            write_char,
+            capture,
+            "gesture_alone",
+            "camera-button gesture alone, RAW mode OFF (are the two exclusive?)",
+        )
         print("\n--- enabling RAW mode ---")
         await send(client, write_char, make_packet(CMD_RAW_MODE, bytearray([4, 4])))
         try:
             await run_stream_phases(client, capture)
-            await try_camera_gesture(client, write_char, capture)
+            await try_camera_gesture(
+                client,
+                write_char,
+                capture,
+                "gesture_with_raw",
+                "camera-button gesture over RAW mode ON (as Home Assistant runs it)",
+            )
         finally:
             print("\n--- disabling RAW mode ---")
             await send(client, write_char, make_packet(CMD_RAW_MODE, bytearray([2])))

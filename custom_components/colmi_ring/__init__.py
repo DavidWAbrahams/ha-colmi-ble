@@ -30,8 +30,9 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.NUMBER,
-    # Both are created only when the motion option is on; the platforms
-    # themselves check, so nothing appears when it is off.
+    # The platforms decide for themselves what to create: the stream switch is
+    # behind the motion option, while the clap switch and the gesture events are
+    # offered either way, since a clap has its own source.
     Platform.SWITCH,
     Platform.EVENT,
 ]

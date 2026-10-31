@@ -31,9 +31,11 @@ CONF_STEPS_BACKFILL = "steps_backfill"
 # custom event of the same name.
 GESTURE_EVENT_TYPE = "colmi_ring_gesture"
 
-# Everything that needs to open a connection of its own refuses with this while
-# the motion stream holds the ring's single GATT link (see MotionManager).
+# Everything that needs to open a connection of its own refuses with these while
+# a session holds the ring's single GATT link (see MotionManager). One message
+# per kind of session, so the refusal names the switch to turn off.
 STREAM_BUSY_MESSAGE = "Unavailable while the motion stream is on"
+CLAP_BUSY_MESSAGE = "Unavailable while clap detection is on"
 
 # Opt-in: creates the motion switch and the gesture event entities. Off by
 # default because streaming holds the single GATT link open (which pauses
@@ -58,6 +60,15 @@ GESTURE_SENSITIVITY_SCALE: dict[str, float] = {
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
 DEFAULT_MOTION_STREAM_TIMEOUT = 30
+
+# Minutes the clap listener holds the ring's link before switching itself off.
+# Its own option because the cost is different in kind: the clap listener does
+# not stream, so it is meant to be left on, but while it is on the ring's single
+# link is taken and heart rate, battery and steps stop updating. So it gets a
+# longer default than the stream, and 0 means "leave it on until I say
+# otherwise" (see CONF_MOTION_STREAM_TIMEOUT for the same convention).
+CONF_CLAP_TIMEOUT = "clap_timeout"
+DEFAULT_CLAP_TIMEOUT = 120
 
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
@@ -227,28 +238,25 @@ MOTION_TILT_DEADBAND_DEG = 1.5
 # How long the RAW stream may stay silent before the session is considered
 # dead and closed. Generous because the stock firmware is known to report
 # slowly, and proxy latency adds to it.
+#
+# Applies to the RAW stream only. The clap listener must never use it: silence is
+# that session's normal state, often for hours at a time.
 MOTION_STREAM_SILENCE_TIMEOUT_S = 30.0
 
 # Below this measured sample rate the stream cannot resolve a clap's ~50 ms
 # impulse, so the stream-derived clap detector stays off. Measured on stock R02
 # firmware, which streams at exactly 1 Hz, so in practice this always trips and a
-# clap can only come from the ring's own detector.
+# clap then has to come from the ring's own detector, via the Clap Detection
+# switch - which is a separate session, because that mode does not coexist with
+# RAW streaming.
 MOTION_MIN_HZ_FOR_STREAM_CLAP = 15.0
 
-# Duration of the startup mute: the ring echoes our own gesture-enable packet
-# back at us, which must not be read as a clap.
-MOTION_STARTUP_MUTE_S = 2.0
-
-# Whether to ask the ring to run its own on-device camera-button (clap) gesture
-# detector while a RAW stream is open.
+# Minimum seconds between published claps from the ring's own detector.
 #
-# On. This write is the only route to a clap on stock firmware: the ring streams
-# the accelerometer at exactly 1 Hz (measured), far too slow for the stream-side
-# detector, so without the ring's own detection nothing would ever fire.
-#
-# It was off while the stream link kept dying shortly after opening, but that
-# write was innocent - the deaths were our own bug in the auto-off scheduling,
-# fixed separately, and the stream now survives full sessions with the write in
-# flight. The remaining hazard is that the ring echoes the write back and the
-# echo looks like a gesture report; see MOTION_STARTUP_MUTE_S.
-ENABLE_RING_CAMERA_GESTURE = True
+# The detector is in the firmware, so a burst of report packets for one clap is
+# something we can only smooth here: ``GestureDetector.on_device_gesture`` has no
+# cooldown of its own (it is a report translation, not a detector), so without
+# this a ring that repeats itself fires one HA event per packet. Set below the
+# gap a deliberate double-clap has in practice, so two real claps stay two
+# events.
+CLAP_REPORT_COOLDOWN_S = 0.8

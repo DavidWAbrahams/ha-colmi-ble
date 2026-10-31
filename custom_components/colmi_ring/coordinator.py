@@ -44,8 +44,9 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # Imports off-ring HR/activity samples into the recorder each poll.
         self.backfill = backfill
         # Set by async_setup_entry once the manager exists (it needs us to be
-        # constructed first). While its ``is_streaming`` is set we must not open
-        # a connection of our own: the ring serves one central at a time.
+        # constructed first). While its ``holds_link`` is set we must not open
+        # a connection of our own: the ring serves one central at a time, and
+        # either of its two sessions (RAW stream, clap listener) owns that link.
         self.motion: MotionManager | None = None
         # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
         self.spo2_reading: dict[str, Any] | None = None
@@ -94,12 +95,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> Any:
         """Update data via library (merging persisted on-demand readings)."""
-        if self.motion is not None and self.motion.is_streaming:
-            # The RAW motion stream holds the ring's single GATT link. Rather
-            # than fight it for the connection, keep the last known values and
-            # resume as soon as the stream closes (the manager refreshes us).
-            # History backfill pauses too, which is harmless: it is idempotent
-            # and picks the backlog up on the next real poll.
+        if self.motion is not None and self.motion.holds_link:
+            # One of the two switches holds the ring's single GATT link - the
+            # RAW motion stream, or the clap listener that keeps a quiet
+            # connection open so the ring's own detector has a central to
+            # report to. Rather than fight either for the connection, keep the
+            # last known values and resume as soon as it closes (the manager
+            # refreshes us). History backfill pauses too, which is harmless: it
+            # is idempotent and picks the backlog up on the next real poll.
             return self.data
         hr_enabled, steps_enabled, include_previous_day = (
             await self._async_backfill_flags()
