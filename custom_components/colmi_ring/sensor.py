@@ -135,14 +135,15 @@ ACCELEROMETER_SENSORS: tuple[_AccelSensor, ...] = (
     ),
 )
 
-# How far the ring has tilted from the pose it was zeroed in. This is the one
-# derived value among the accelerometer entities, and it is deliberately its own
-# sensor rather than another face of the raw sample above: the axes stay exactly
-# as the ring sent them, while this number is filtered and relative.
+# How far the ring's hole axis is deflected from the horizontal plane, measured
+# absolutely against gravity. This is the one derived value among the
+# accelerometer entities, and it is deliberately its own sensor rather than
+# another face of the raw sample above: the axes stay exactly as the ring sent
+# them, while this number is filtered and orientation-independent.
 #
-# No device class and no unit enum: the angle is a plain degree count against a
-# user-chosen pose, not an orientation the ACCELEROMETER or ROTATION classes
-# mean, and the plain "°" unit keeps the import safe on older cores.
+# No device class and no unit enum: the angle is a plain degree count against
+# gravity, not an orientation the ACCELEROMETER or ROTATION classes mean, and
+# the plain "°" unit keeps the import safe on older cores.
 VERTICAL_ANGLE_SENSOR = SensorEntityDescription(
     key="vertical_angle",
     name="Vertical Angle",
@@ -290,22 +291,24 @@ class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):
 
 
 class ColmiRingVerticalAngleSensor(ColmiRingEntity, SensorEntity):
-    """How far the ring has tilted since its angle was last zeroed.
+    """How far the ring's hole axis is tilted from horizontal.
 
-    Push-driven like the axis sensors, but reading the tilt tracker's answer
-    rather than a raw sample. The value is the angle, in degrees, between the
-    pose the ring was zeroed in and the pose it is in now: ``0`` is that pose,
-    ``90`` is a quarter turn away from it, and ``180`` is upside down.
+    Push-driven like the axis sensors, but reading the vertical angle tracker's
+    answer rather than a raw sample. The value is the elevation, in degrees, of
+    the axis through the ring hole above the horizontal plane, always between
+    ``0`` and ``90``: ``0`` when the hole axis is horizontal (the ring is being
+    held flat, with little or no gravity along that axis), ``90`` when it points
+    at the sky or the floor (about 1 g along it, either sign).
 
-    Two properties are worth knowing before building an automation on it:
+    Three properties are worth knowing before building an automation on it:
 
-    * it is a tilt, not a roll. A still accelerometer cannot see rotation about
-      gravity, so turning the hand like a doorknob changes nothing;
-    * it cannot drift, because nothing is integrated. Returning the hand to the
-      zero pose returns the sensor to zero.
-
-    Zeroing happens by itself on the first still pose of a session, and on
-    demand from the Zero Vertical Angle button.
+    * it is absolute. Nothing is zeroed against a starting pose, so the reading
+      cannot drift and needs no calibration;
+    * it is insensitive to rotation in the horizontal plane: spinning the ring
+      like a doorknob (or turning the hand) leaves the elevation of the axis
+      alone, which is a property of gravity, not of this code;
+    * it folds the two vertical ends together: the ring tip pointing up and
+      pointing down both read 90.
     """
 
     _attr_has_entity_name = True
@@ -324,7 +327,7 @@ class ColmiRingVerticalAngleSensor(ColmiRingEntity, SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the current tilt, or None until the ring has been still."""
+        """Return the current angle, or None until the stream has a sample."""
         motion = self._motion_manager()
         return motion.last_angle_deg if motion is not None else None
 

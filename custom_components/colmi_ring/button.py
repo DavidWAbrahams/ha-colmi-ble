@@ -5,10 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
-from homeassistant.exceptions import HomeAssistantError
 
 from .api import ColmiRingApiClientError
-from .const import CONF_MOTION_ENABLED, LOGGER
+from .const import LOGGER
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -60,19 +59,6 @@ async def async_setup_entry(
             ),
         ),
     ]
-    # Zeroing the vertical angle only makes sense alongside the sensor it
-    # zeroes, and that sensor is gated on the motion option.
-    if entry.options.get(CONF_MOTION_ENABLED, False):
-        buttons.append(
-            ColmiRingZeroVerticalAngleButton(
-                coordinator=coordinator,
-                entity_description=ButtonEntityDescription(
-                    key="zero_vertical_angle",
-                    name="Zero Vertical Angle",
-                    icon="mdi:angle-acute",
-                ),
-            )
-        )
     async_add_entities(buttons)
 
 
@@ -201,40 +187,3 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
         self.coordinator.apply_heart_rate(reading)
 
 
-class ColmiRingZeroVerticalAngleButton(ColmiRingEntity, ButtonEntity):
-    """Make the Vertical Angle sensor read zero on the pose it is in now.
-
-    The one button that deliberately does *not* call :meth:`_assert_ring_free`:
-    re-zeroing mid-stream is the whole point. It writes nothing to the ring and
-    opens no connection, so the stream keeps running and the sensor simply
-    restarts counting from wherever the hand happens to be.
-
-    It overrides :meth:`async_press` rather than ``press`` because zeroing
-    republishes the angle sensor through the motion manager's callback
-    listeners, which has to happen on the event loop; unlike the other buttons
-    there is nothing slow to hand to a background task.
-    """
-
-    def __init__(
-        self,
-        coordinator: ColmiRingDataUpdateCoordinator,
-        entity_description: ButtonEntityDescription,
-    ) -> None:
-        """Initialize the button class."""
-        super().__init__(coordinator)
-        self.entity_description = entity_description
-        self._attr_unique_id = (
-            f"{coordinator.config_entry.entry_id}_{entity_description.key}"
-        )
-
-    async def async_press(self) -> None:
-        """Zero the angle on the pose the hand is in right now."""
-        motion = self._motion_manager()
-        if motion is None or not motion.async_zero_angle():
-            # Only reachable before the stream has produced a usable sample,
-            # i.e. in the first second of a session, or with the switch off.
-            raise HomeAssistantError(
-                "Colmi vertical angle cannot be zeroed yet: the motion stream"
-                " has not reported an accelerometer sample"
-            )
-        LOGGER.debug("Colmi vertical angle zeroed on the current pose")

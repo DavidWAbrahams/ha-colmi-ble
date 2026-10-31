@@ -61,7 +61,7 @@ from .gestures import (
     SOURCE_RING,
     GestureEvent,
     GestureDetector,
-    TiltTracker,
+    VerticalAngleTracker,
 )
 
 if TYPE_CHECKING:
@@ -116,7 +116,7 @@ class MotionManager:
         self._coordinator = coordinator
 
         self._detector = GestureDetector(sensitivity=self._sensitivity())
-        self._tilt = TiltTracker()
+        self._angle = VerticalAngleTracker()
         self._session: MotionSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._stream_timer: Callable[[], None] | None = None
@@ -146,9 +146,9 @@ class MotionManager:
         # Newest decoded sample, for the accelerometer sensors. None whenever no
         # stream is running, so the sensors go unknown instead of freezing.
         self.last_sample: AccelSample | None = None
-        # How far the ring has tilted since it was last zeroed, for the vertical
-        # angle sensor. None until the stream has seen a pose still enough to
-        # zero on.
+        # How far the ring's hole axis is tilted from horizontal, for the
+        # vertical angle sensor. None until the stream has seen a first sample
+        # whose magnitude was trustworthy enough to read gravity from.
         self.last_angle_deg: float | None = None
         self._last_sample_published = 0.0
 
@@ -278,7 +278,7 @@ class MotionManager:
         # Rebuilt per session: the gravity reference and the rate estimate both
         # belong to one continuous connection, not to the whole uptime.
         self._detector = GestureDetector(sensitivity=self._sensitivity())
-        self._tilt.reset()
+        self._angle.reset()
         self.last_angle_deg = None
         self._logged_rate = False
 
@@ -467,7 +467,7 @@ class MotionManager:
             "Colmi ring motion stream open; waiting for accelerometer data"
         )
         self._detector.reset()
-        self._tilt.reset()
+        self._angle.reset()
         self._unknown_kinds.clear()
         self._schedule_stream_auto_off()
         self._rate_timer = async_call_later(
@@ -563,11 +563,11 @@ class MotionManager:
             LOGGER.debug(
                 "colmi motion %.3f %.3f %.3f g", sample.x, sample.y, sample.z
             )
-        # The tilt tracker sees every sample, like the detector: its low-pass
-        # and its stillness window both need the uninterrupted stream, while
-        # the published angle is rate-limited with the sample itself.
-        self._tilt.feed(sample)
-        self.last_angle_deg = self._tilt.angle_deg
+        # The vertical angle tracker sees every sample, like the detector: its
+        # low-pass needs the uninterrupted stream, while the published angle is
+        # rate-limited with the sample itself.
+        self._angle.feed(sample)
+        self.last_angle_deg = self._angle.angle_deg
         self._publish_sample(sample)
         for event in self._detector.feed(sample):
             # Deliberately not published; see _SUPPRESSED_GESTURES. The detector
@@ -800,22 +800,6 @@ class MotionManager:
                 listener(streaming)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring stream state listener raised")
-
-    def async_zero_angle(self) -> bool:
-        """Zero the vertical angle on the pose the hand is in right now.
-
-        The zero button's action. Deliberately needs nothing from the ring, so
-        it works mid-stream; the angle simply restarts from wherever the hand
-        happens to be. Returns False if the stream has not yet seen a usable
-        sample, in which case nothing changed.
-        """
-        if not self._tilt.zero():
-            return False
-        self.last_angle_deg = self._tilt.angle_deg
-        # Re-notify now rather than wait for the next throttled sample, so the
-        # sensor visibly snaps to zero the moment the button is pressed.
-        self._notify_sample_listeners()
-        return True
 
     def async_notify_stream_finished(self) -> None:
         """Called once the stream task has returned: restore normal behaviour."""

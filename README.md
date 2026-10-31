@@ -49,7 +49,7 @@ that switch plus:
 
 - four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
   `Acceleration` (the magnitude) - see below, and
-- a `Vertical Angle` sensor with a `Zero Vertical Angle` button - see below.
+- a `Vertical Angle` sensor - see below.
 
 The two switches are mutually exclusive. Both want the same accelerometer over the same one link, so
 turning one on while the other is running is *refused*, with an error naming the switch to turn off,
@@ -102,15 +102,14 @@ the gesture event(s).
 
 ## Vertical angle
 
-`sensor.<ring>_vertical_angle` is the one derived motion sensor: how far the ring has tilted vertically away from its initial position when the mode began.
-It is always a positive value. If your hand started flat on a table and ended
-held straight up or down, it will read "90". If you keep going, the
-reading will go up to 180 degrees.
+`sensor.<ring>_vertical_angle` is the one derived motion sensor: how far the axis through the ring hole is deflected from the horizontal plane, measured absolutely against gravity. It reads between 0 and 90 degrees:
 
-It measures *tilt*, not *roll*. Turning your hand like a doorknob leaves the value alone.
+- about **0** when the ring is held horizontally (the hole axis is flat, so there is little or no gravity along it),
+- about **90** when the ring is held vertically (the hole axis points at the sky or at the floor - both read 90, the sensor does not care which end is up).
 
-The angle is zeroed automatically on the first still pose after the stream starts, and on demand by
-the `Zero Vertical Angle` button. That button is the one control that works *while* the stream is on.
+The reading is absolute: nothing is zeroed against a starting pose, nothing is integrated, so it cannot drift and needs no calibration. It is also insensitive to rotation in the horizontal plane - spinning the ring like a doorknob (or turning your hand) leaves the vertical angle alone; only the tilt of the hole axis up or down moves it.
+
+As with any worn sensor, the number describes the ring's axis, not your intent: what "horizontal" means on your finger depends on how you wear it.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
