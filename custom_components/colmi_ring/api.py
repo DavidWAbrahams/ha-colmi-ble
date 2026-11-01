@@ -78,7 +78,7 @@ POLL_LOCK_WAIT_S = 5.0
 # mid-flight. Those finish in a few seconds, so the stream waits rather than
 # reporting a failure the user cannot act on.
 #
-# The clap listener waits this long too, for the same reason: it is the other
+# The wave listener waits this long too, for the same reason: it is the other
 # kind of session that holds the link open indefinitely.
 STREAM_LOCK_WAIT_S = 90.0
 # Button presses and settings writes come from a person in the UI, so a poll
@@ -544,13 +544,13 @@ class _RingConnection:
             )
 
     async def set_camera_gesture(self, enabled: bool) -> bool:
-        """Toggle the ring's on-device camera-button (clap) detection.
+        """Toggle the ring's on-device camera-button (wave) detection.
 
         Best-effort: this is a write without response and the detection reports
         are notifications rather than a reply, so there is nothing to await
         beyond the write. Returns whether the write reached the ring.
 
-        Only the Clap Detection session uses this. Camera mode does not coexist
+        Only the Wave Detection session uses this. Camera mode does not coexist
         with RAW streaming, so it is deliberately not part of a motion session.
         """
         packet = (
@@ -690,10 +690,10 @@ class MotionSession(_LinkSession):
     """
 
 
-class ClapSession(_LinkSession):
-    """A live on-device clap session: one connection with camera mode armed.
+class WaveSession(_LinkSession):
+    """A live on-device wave session: one connection with camera mode armed.
 
-    Silence is the normal state here - the ring reports one packet per clap and
+    Silence is the normal state here - the ring reports one packet per wave and
     nothing in between - so this kind of session is never closed for lack of
     traffic, only for a dropped link.
     """
@@ -707,7 +707,7 @@ _SessionT = TypeVar("_SessionT", bound=_LinkSession)
 class _SessionKind(Generic[_SessionT]):
     """How one kind of long-lived session is opened, and when to reopen it.
 
-    The motion stream and the clap listener hold the ring's link in the same way
+    The motion stream and the wave listener hold the ring's link in the same way
     and want the same retry behaviour; what differs is the opening ritual and
     which closing reasons are worth a reconnect, so those three things travel
     together instead of as loose parameters.
@@ -1080,12 +1080,12 @@ class ColmiRingApiClient:
         :data:`STREAM_LOCK_WAIT_S`.
 
         The RAW stream deliberately does *not* also arm the ring's on-device
-        clap detector. Measured on an R02 with the ATC RF03 Writer web tool,
+        wave detector. Measured on an R02 with the ATC RF03 Writer web tool,
         camera mode (``02 04``) runs on its own with no stream and reports one
-        ``02 02`` packet per clap, but no clap report was ever seen while RAW
+        ``02 02`` packet per wave, but no wave report was ever seen while RAW
         mode had the accelerometer - the two features read the same sensor and
         one firmware appears to serve only at a time. So arming it here bought
-        nothing; it has its own session now, see :meth:`_clap_session`.
+        nothing; it has its own session now, see :meth:`_wave_session`.
         """
         conn = self._connection("motion stream", STREAM_LOCK_WAIT_S)
         session = MotionSession(conn)
@@ -1116,15 +1116,15 @@ class ColmiRingApiClient:
                 await conn.stop_motion_stream()
 
     @asynccontextmanager
-    async def _clap_session(
+    async def _wave_session(
         self, on_packet: Callable[[bytearray], None]
-    ) -> AsyncIterator[ClapSession]:
-        """Hold the connection open with the ring's own clap detector armed.
+    ) -> AsyncIterator[WaveSession]:
+        """Hold the connection open with the ring's own wave detector armed.
 
-        This is the session behind the Clap Detection switch, and it exists
+        This is the session behind the Wave Detection switch, and it exists
         because a BLE notification only reaches a central that is connected at
-        that moment: a clap reported while we are disconnected is simply lost.
-        So hearing the ring's clap reports means holding its single link, which
+        that moment: a wave reported while we are disconnected is simply lost.
+        So hearing the ring's wave reports means holding its single link, which
         is also why the switch warns about pausing polling.
 
         The listener goes in *before* the ``02 04`` write so that a ring which
@@ -1134,10 +1134,10 @@ class ColmiRingApiClient:
         running - and costing battery - for as long as the ring is worn.
 
         No silence timeout, unlike the RAW stream: this session is *expected* to
-        hear nothing between claps, which may be hours.
+        hear nothing between waves, which may be hours.
         """
-        conn = self._connection("clap detection", STREAM_LOCK_WAIT_S)
-        session = ClapSession(conn)
+        conn = self._connection("wave detection", STREAM_LOCK_WAIT_S)
+        session = WaveSession(conn)
         tally = _StreamTally()
         # Same reasoning as the RAW stream: the tally answers "did the ring send
         # nothing, or did it send on a byte we do not listen to?", and only an
@@ -1163,13 +1163,13 @@ class ColmiRingApiClient:
                 except asyncio.CancelledError:
                     pass
                 conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
-                self._log_clap_session(session, tally, armed)
+                self._log_wave_session(session, tally, armed)
                 await conn.set_camera_gesture(False)
 
-    def _log_clap_session(
-        self, session: ClapSession, tally: _StreamTally, armed: bool
+    def _log_wave_session(
+        self, session: WaveSession, tally: _StreamTally, armed: bool
     ) -> None:
-        """Report what a finished clap session saw, and whether it could work."""
+        """Report what a finished wave session saw, and whether it could work."""
         lived = (
             "an unknown time"
             if session.conn.linked_at is None
@@ -1179,8 +1179,8 @@ class ColmiRingApiClient:
         reports = tally.count_for(motion.CMD_CAMERA_GESTURE)
         if not armed:
             LOGGER.info(
-                "Colmi ring %s clap detection closed after %s (%s): the ring"
-                " never accepted the enable write (02 04), so no clap could be"
+                "Colmi ring %s wave detection closed after %s (%s): the ring"
+                " never accepted the enable write (02 04), so no wave could be"
                 " reported",
                 self._ring_address,
                 lived,
@@ -1189,7 +1189,7 @@ class ColmiRingApiClient:
             return
         if reports:
             LOGGER.debug(
-                "Colmi ring %s clap detection closed (%s, after %s): %d"
+                "Colmi ring %s wave detection closed (%s, after %s): %d"
                 " camera-gesture notification(s), %d total: %s",
                 self._ring_address,
                 reason,
@@ -1203,9 +1203,9 @@ class ColmiRingApiClient:
         # this answers, and a session that reported nothing after being armed is
         # the evidence that this firmware does not announce the gesture.
         LOGGER.info(
-            "Colmi ring %s clap detection closed after %s (%s) with %d"
-            " notification(s) and none of them a clap report (0x%02X/02): %s."
-            " If you clapped during this session, this firmware probably does"
+            "Colmi ring %s wave detection closed after %s (%s) with %d"
+            " notification(s) and none of them a wave report (0x%02X/02): %s."
+            " If you waved during this session, this firmware probably does"
             " not report the on-device gesture",
             self._ring_address,
             lived,
@@ -1219,8 +1219,8 @@ class ColmiRingApiClient:
     async def _watch_link(session: _LinkSession) -> None:
         """Close the session when the link drops.
 
-        The clap listener's only failure mode. The RAW stream's silence rule is
-        deliberately absent: here, silence means "no claps", not "broken".
+        The wave listener's only failure mode. The RAW stream's silence rule is
+        deliberately absent: here, silence means "no waves", not "broken".
         """
         await session.conn.dead.wait()
         session.request_stop("disconnected")
@@ -1342,23 +1342,23 @@ class ColmiRingApiClient:
             on_session,
         )
 
-    async def async_listen_claps(
+    async def async_listen_waves(
         self,
         on_packet: Callable[[bytearray], None],
         should_run: Callable[[], bool],
-        on_session: Callable[[ClapSession], None] | None = None,
+        on_session: Callable[[WaveSession], None] | None = None,
     ) -> str | None:
-        """Run clap-listener sessions, restarting them while still wanted.
+        """Run wave-listener sessions, restarting them while still wanted.
 
-        The motion stream's loop over the clap session. What differs is which
+        The motion stream's loop over the wave session. What differs is which
         closing reasons mean "worth another try": silence is this session's
         normal state, so only a dropped link or a ring that refused the ``02 04``
         enable is retried.
         """
         return await self._run_sessions(
             _SessionKind(
-                label="clap detection",
-                opener=self._clap_session,
+                label="wave detection",
+                opener=self._wave_session,
                 # Silence is normal here, so it is not a reason to reconnect. A
                 # ring that refused the enable might just have been busy, and the
                 # retry budget bounds how often we ask.
@@ -1378,7 +1378,7 @@ class ColmiRingApiClient:
     ) -> str | None:
         """Hold one kind of session open, reopening it while it is wanted.
 
-        Shared by the motion stream and the clap listener: they differ only in
+        Shared by the motion stream and the wave listener: they differ only in
         how the session is opened and in which closing reasons are worth another
         attempt, but both hold the ring's single link for their whole life, so
         both owe the host the same courtesy about retrying and about knowing when

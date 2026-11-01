@@ -5,7 +5,7 @@ Running the probe needs a real ring, but deciding what a capture *means* is pure
 logic over a packet list. This feeds the reporter synthetic captures for each
 firmware behaviour it has to tell apart - most importantly "the firmware has no
 camera-button gesture" versus "the gesture works, but RAW mode silences it",
-which is the difference between giving up on claps and turning the Motion Stream
+which is the difference between giving up on waves and turning the Motion Stream
 switch off to get them.
 
     python scripts/_gesture_report_check.py

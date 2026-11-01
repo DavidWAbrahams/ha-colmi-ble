@@ -7,7 +7,7 @@ Dev-only tool; not part of the integration. It talks to the ring with plain
 gesture implementation:
 
   1. How fast does the ring actually stream position packets (Hz)?  That number
-     decides whether a clap can be derived from the stream at all.
+     decides whether a wave can be derived from the stream at all.
   2. Which byte offsets carry the axes, and are the low bits parked in the
      *low* nibble of the following byte (what the demo masks with ``& 0xf``) or
      the high nibble (what other reverse-engineerings assume)?
@@ -15,7 +15,7 @@ gesture implementation:
      offsets, scale and sign together), and which axis/sign flips on a
      deliberate hand raise?
   4. Does the ring's on-device "camera button" gesture (``02 04`` / ``02 06``)
-     emit a packet we could use as a battery-free clap detector - and does it
+     emit a packet we could use as a battery-free wave detector - and does it
      still do so *while* RAW mode is streaming, or do the two claim the same
      accelerometer? The gesture is therefore armed twice: once on its own, and
      once on top of an open stream.
@@ -224,7 +224,7 @@ async def run_stream_phases(client: BleakClient, capture: Capture) -> None:
         "Rapidly raise the hand and lower it again, repeatedly, "
         "with ~2s pauses between",
     )
-    await phase(capture, "clap", 15, "Clap repeatedly, with ~2s pauses between")
+    await phase(capture, "wave", 15, "Wave repeatedly, with ~2s pauses between")
     await phase(
         capture,
         "raise_still_lower",
@@ -248,11 +248,11 @@ async def try_camera_gesture(
     await send(
         client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([4]))
     )
-    await phase(capture, f"{label}_on", 12, "Clap repeatedly")
+    await phase(capture, f"{label}_on", 12, "Wave repeatedly")
     await send(
         client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([6]))
     )
-    await phase(capture, f"{label}_off", 6, "Clap again (gesture disabled)")
+    await phase(capture, f"{label}_off", 6, "Wave again (gesture disabled)")
 
 
 # ---------------------------------------------------------------- reporting
@@ -375,10 +375,10 @@ def _decoded(packet: Packet) -> tuple[float, float, float] | None:
 
 
 def report_gestures(capture: Capture, packets: list[Packet]) -> None:
-    """Which axis and sign distinguishes a raise from a lower, and the clap spike."""
+    """Which axis and sign distinguishes a raise from a lower, and the wave spike."""
     print("\n## Gesture signatures (per phase, mean axis in g)")
     still = _phase_means(capture, "still", packets)
-    for label in ("still", "raise_still_lower", "clap", "gesture_with_raw_on"):
+    for label in ("still", "raise_still_lower", "wave", "gesture_with_raw_on"):
         means = _phase_means(capture, label, packets)
         if means is None:
             continue
@@ -386,7 +386,7 @@ def report_gestures(capture: Capture, packets: list[Packet]) -> None:
             f"{axis}={value:+.2f}" for axis, value in zip("xyz", means, strict=True)
         )
         print(f"  {label:20s} {text}")
-        if label == "clap" and still is not None:
+        if label == "wave" and still is not None:
             deltas = [m - s for m, s in zip(means, still, strict=True)]
             print(
                 f"  {'delta vs still':20s} "
@@ -395,7 +395,7 @@ def report_gestures(capture: Capture, packets: list[Packet]) -> None:
                     for axis, value in zip("xyz", deltas, strict=True)
                 )
             )
-    _report_peak(capture, "clap", packets)
+    _report_peak(capture, "wave", packets)
     _report_axis_extremes(capture, "raise_still_lower", packets)
 
 
@@ -423,7 +423,7 @@ def _report_peak(capture: Capture, label: str, packets: list[Packet]) -> None:
     )
     if not peaks:
         return
-    print("\n## Clap candidates (top magnitudes during the clap phase)")
+    print("\n## Wave candidates (top magnitudes during the wave phase)")
     for mag, when in peaks[:5]:
         print(f"  {mag:5.2f} g at t={when:.3f}")
 
@@ -468,9 +468,9 @@ def report_camera_gesture(capture: Capture) -> None:
 
     Home Assistant used to arm the camera-button gesture only *while* RAW
     streaming ran, so a firmware that feeds both from one accelerometer pipeline
-    looked like a firmware with no clap at all. The two are therefore tested
+    looked like a firmware with no wave at all. The two are therefore tested
     separately here, and that test is still worth running on an unknown ring:
-    Home Assistant's `Clap Detection` switch arms ``02 04`` with RAW off, so the
+    Home Assistant's `Wave Detection` switch arms ``02 04`` with RAW off, so the
     ``RAW off`` column below is what predicts whether that switch can work, and
     the ``RAW on`` column is why the two switches refuse each other.
     """
@@ -507,28 +507,28 @@ def report_camera_gesture(capture: Capture) -> None:
     if alone and with_raw:
         print(
             "    Camera mode CONFIRMED, and it coexists with RAW mode: the ring"
-            " answers 02 04 either way, so the Clap Detection switch can report"
-            " claps on this firmware (Motion Stream is then a separate, optional"
+            " answers 02 04 either way, so the Wave Detection switch can report"
+            " waves on this firmware (Motion Stream is then a separate, optional"
             " feature)."
         )
     elif alone and not with_raw:
         print(
             "    Camera mode CONFIRMED, but ONLY while RAW mode is off: the two are"
-            " mutually exclusive. Use the Clap Detection switch with the Motion"
+            " mutually exclusive. Use the Wave Detection switch with the Motion"
             " Stream switch off - which is why those two switches refuse each other"
             " in Home Assistant rather than both running."
         )
     elif not alone and not with_raw:
         print(
             "    No 0x02 packet either way, so this firmware appears to have no"
-            " camera-button gesture at all: the Clap Detection switch will turn"
-            " itself off, and a clap could only be derived from a fast enough RAW"
+            " camera-button gesture at all: the Wave Detection switch will turn"
+            " itself off, and a wave could only be derived from a fast enough RAW"
             " stream."
         )
     else:
         print(
             "    0x02 packets appeared only under RAW mode, which is the wrong way"
-            " round; re-run in case a clap landed outside its window."
+            " round; re-run in case a wave landed outside its window."
         )
 
 

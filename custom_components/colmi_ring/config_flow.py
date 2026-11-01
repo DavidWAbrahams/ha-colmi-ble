@@ -17,7 +17,6 @@ from .api import (
     ColmiRingApiClientError,
 )
 from .const import (
-    CONF_CLAP_TIMEOUT,
     CONF_GESTURE_SENSITIVITY,
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
@@ -27,11 +26,12 @@ from .const import (
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
-    DEFAULT_CLAP_TIMEOUT,
+    CONF_WAVE_TIMEOUT,
     DEFAULT_GESTURE_SENSITIVITY,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
+    DEFAULT_WAVE_TIMEOUT,
     DOMAIN,
     GESTURE_SENSITIVITY_SCALE,
     LOGGER,
@@ -53,7 +53,7 @@ _GESTURE_SENSITIVITY_OPTIONS = [
 class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for Blueprint."""
 
-    VERSION = 1
+    VERSION = 2
 
     # MAC of a ring we were started from (Bluetooth discovery), if any; used
     # to pre-populate the address field so the user just clicks Submit.
@@ -220,11 +220,11 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         )
                     ),
                     vol.Optional(
-                        # Not behind CONF_MOTION_ENABLED: the clap switch exists
+                        # Not behind CONF_MOTION_ENABLED: the wave switch exists
                         # whether or not gesture streaming is enabled.
-                        CONF_CLAP_TIMEOUT,
+                        CONF_WAVE_TIMEOUT,
                         default=self.config_entry.options.get(
-                            CONF_CLAP_TIMEOUT, DEFAULT_CLAP_TIMEOUT
+                            CONF_WAVE_TIMEOUT, DEFAULT_WAVE_TIMEOUT
                         ),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(

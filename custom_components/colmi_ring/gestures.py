@@ -42,21 +42,12 @@ from typing import TYPE_CHECKING
 
 from .colmi_codec.motion import AccelSample
 from .const import (
-    MOTION_CLAP_MAX_WIDTH_S,
-    MOTION_CLAP_QUIET_BAND_G,
-    MOTION_CLAP_QUIET_S,
-    MOTION_CLAP_REFRACTORY_S,
-    MOTION_CLAP_RING_DOWN_FRACTION,
-    MOTION_CLAP_RING_DOWN_S,
-    MOTION_CLAP_RISE_S,
-    MOTION_CLAP_SETTLE_S,
-    MOTION_CLAP_SPIKE_G,
     MOTION_GESTURE_COOLDOWN_S,
     MOTION_GESTURE_SUPPRESS_S,
     MOTION_GRAVITY_FAST_TAU_S,
     MOTION_GRAVITY_TAU_S,
     MOTION_GRAVITY_TRUST_G,
-    MOTION_MIN_HZ_FOR_STREAM_CLAP,
+    MOTION_MIN_HZ_FOR_STREAM_WAVE,
     MOTION_PITCH_RECENT_WINDOW_S,
     MOTION_RAISE_MAX_PEAK_S,
     MOTION_RAISE_PITCH_DEG,
@@ -64,15 +55,26 @@ from .const import (
     MOTION_VELOCITY_LEAK_TAU_S,
     MOTION_VERTICAL_AXIS,
     MOTION_VERTICAL_DEADBAND_DEG,
+    MOTION_VERTICAL_SNAP_DEG,
+    MOTION_VERTICAL_SNAP_TAU_S,
     MOTION_VERTICAL_TAU_S,
     MOTION_VERTICAL_TRUST_G,
+    MOTION_WAVE_MAX_WIDTH_S,
+    MOTION_WAVE_QUIET_BAND_G,
+    MOTION_WAVE_QUIET_S,
+    MOTION_WAVE_REFRACTORY_S,
+    MOTION_WAVE_RING_DOWN_FRACTION,
+    MOTION_WAVE_RING_DOWN_S,
+    MOTION_WAVE_RISE_S,
+    MOTION_WAVE_SETTLE_S,
+    MOTION_WAVE_SPIKE_G,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 # Gesture identifiers, used as the event entity key and in event data.
-GESTURE_CLAP = "clap"
+GESTURE_WAVE = "wave"
 GESTURE_RAISE = "hand_raise"
 GESTURE_LOWER = "hand_lower"
 
@@ -89,9 +91,9 @@ _BUFFER_S = 2.5
 _REARM_FRACTION = 0.3
 
 # An impulse counts as over once the magnitude falls back to this fraction of
-# the clap threshold. Used both to time how fast a spike rises and to decide
+# the wave threshold. Used both to time how fast a spike rises and to decide
 # when an impulse above the threshold has ended.
-_CLAP_LOW_FRACTION = 0.4
+_WAVE_LOW_FRACTION = 0.4
 
 # Below this gravity magnitude the vector is too noisy to define "up".
 _MIN_GRAVITY_G = 0.35
@@ -135,7 +137,7 @@ def _is_still(magnitude_g: float) -> bool:
     projected acceleration dips back through zero while its magnitude says
     undeniably "this hand is moving".
     """
-    return abs(magnitude_g - 1.0) <= MOTION_CLAP_QUIET_BAND_G
+    return abs(magnitude_g - 1.0) <= MOTION_WAVE_QUIET_BAND_G
 
 
 def _unit(vector: AccelSample) -> AccelSample | None:
@@ -154,15 +156,15 @@ def _angle_deg(a: AccelSample, b: AccelSample) -> float:
 class GestureDetector:
     """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`."""
 
-    def __init__(self, sensitivity: float = 1.0, stream_clap: bool = True) -> None:
+    def __init__(self, sensitivity: float = 1.0, stream_wave: bool = True) -> None:
         """Create a detector.
 
         ``sensitivity`` divides the thresholds (higher = more sensitive).
-        ``stream_clap`` enables the stream-derived clap; it is off unless the
-        measured sample rate can actually resolve a clap impulse.
+        ``stream_wave`` enables the stream-derived wave; it is off unless the
+        measured sample rate can actually resolve a wave impulse.
         """
         self._sensitivity = sensitivity if sensitivity > 0 else 1.0
-        self.stream_clap = stream_clap
+        self.stream_wave = stream_wave
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
@@ -170,7 +172,7 @@ class GestureDetector:
         self._dt_ema: float | None = None
         self._last_sample: float | None = None
 
-        # Clap impulse state machine. ``_rise_start`` is the last time the
+        # Wave impulse state machine. ``_rise_start`` is the last time the
         # |linear| signal sat below the low mark, so the next crossing can be
         # timed; ``_impulse_peak`` is non-None while a candidate impulse is
         # open, i.e. between crossing the threshold and falling back down.
@@ -185,7 +187,7 @@ class GestureDetector:
         self._quiet_len = 0.0
 
         # A finished impulse is not reported until the hand has rung down
-        # (see ``_resolve_pending_clap``), so it waits here with the time it
+        # (see ``_resolve_pending_wave``), so it waits here with the time it
         # completed and the start of its current quiet stretch.
         self._pending: GestureEvent | None = None
         self._pending_since = 0.0
@@ -211,8 +213,8 @@ class GestureDetector:
         return MOTION_RAISE_VELOCITY_G_S / self._sensitivity
 
     @property
-    def _clap_threshold(self) -> float:
-        return MOTION_CLAP_SPIKE_G / self._sensitivity
+    def _wave_threshold(self) -> float:
+        return MOTION_WAVE_SPIKE_G / self._sensitivity
 
     @property
     def _pitch_threshold_deg(self) -> float:
@@ -245,22 +247,22 @@ class GestureDetector:
         )
 
     @property
-    def stream_clap_supported(self) -> bool:
-        """True once the measured rate can resolve a clap impulse.
+    def stream_wave_supported(self) -> bool:
+        """True once the measured rate can resolve a wave impulse.
 
         Before any samples arrive this reports False; callers that want to
         decide configuration should use :meth:`rate_is_too_low` instead, which
         distinguishes "not yet known" from "measured too slow".
         """
         rate = self.sample_rate_hz
-        return self.stream_clap and rate is not None and rate >= (
-            MOTION_MIN_HZ_FOR_STREAM_CLAP
+        return self.stream_wave and rate is not None and rate >= (
+            MOTION_MIN_HZ_FOR_STREAM_WAVE
         )
 
     def rate_is_too_low(self) -> bool:
-        """True when the stream is definitely too slow for a stream clap."""
+        """True when the stream is definitely too slow for a stream wave."""
         rate = self.sample_rate_hz
-        return rate is not None and rate < MOTION_MIN_HZ_FOR_STREAM_CLAP
+        return rate is not None and rate < MOTION_MIN_HZ_FOR_STREAM_WAVE
 
     # -- main entry point -------------------------------------------------
 
@@ -317,11 +319,11 @@ class GestureDetector:
         self.last_velocity_g_s = self._velocity
 
         self._track_still(_is_still(sample.magnitude_g), now)
-        if self.stream_clap_supported:
-            settled = self._resolve_pending_clap(peak, now)
+        if self.stream_wave_supported:
+            settled = self._resolve_pending_wave(peak, now)
             if settled is not None:
                 events.append(settled)
-            candidate = self._check_clap(peak, now)
+            candidate = self._check_wave(peak, now)
             if candidate is not None:
                 self._pending = candidate
                 self._pending_since = now
@@ -334,23 +336,23 @@ class GestureDetector:
         return events
 
     def on_device_gesture(self, now: float | None = None) -> GestureEvent:
-        """Report a gesture the ring detected itself (a clap).
+        """Report a gesture the ring detected itself (a wave).
 
         The on-device detector owns its own debouncing, and it is the preferred
-        clap source because it needs no continuous connection, so this bypasses
-        our thresholds; it does still respect the shared cooldown so one clap
+        wave source because it needs no continuous connection, so this bypasses
+        our thresholds; it does still respect the shared cooldown so one wave
         cannot produce both a ring and a stream event.
         """
         if now is None:
             now = time.monotonic()
-        self.last_peak_g = max(self.last_peak_g, self._clap_threshold)
+        self.last_peak_g = max(self.last_peak_g, self._wave_threshold)
         event = GestureEvent(
-            gesture=GESTURE_CLAP,
+            gesture=GESTURE_WAVE,
             source=SOURCE_RING,
             peak_g=self.last_peak_g,
             velocity_g_s=0.0,
         )
-        self._record_fire(GESTURE_CLAP, now)
+        self._record_fire(GESTURE_WAVE, now)
         self.events_seen += 1
         return event
 
@@ -419,23 +421,23 @@ class GestureDetector:
         decayed = self._velocity * math.exp(-dt / MOTION_VELOCITY_LEAK_TAU_S)
         return decayed + vertical * dt
 
-    def _check_clap(self, peak: float, now: float) -> GestureEvent | None:
-        """Short, sharp, self-limiting spike: the stream-derived clap.
+    def _check_wave(self, peak: float, now: float) -> GestureEvent | None:
+        """Short, sharp, self-limiting spike: the stream-derived wave.
 
-        A peak threshold alone cannot tell a clap from a forceful arm
+        A peak threshold alone cannot tell a wave from a forceful arm
         movement, so the impulse is judged by its shape:
 
         * it must reach the threshold from well below within
-          ``MOTION_CLAP_RISE_S``,
-        * it must fall back down again within ``MOTION_CLAP_MAX_WIDTH_S``, and
+          ``MOTION_WAVE_RISE_S``,
+        * it must fall back down again within ``MOTION_WAVE_MAX_WIDTH_S``, and
         * the hand must have been *still* immediately before it.
 
-        A clap impulse lasts tens of milliseconds; a clench or a swung arm
+        A wave impulse lasts tens of milliseconds; a clench or a swung arm
         holds the acceleration high for hundreds, so the gesture is reported on
-        the falling edge, a sample or two after the clap itself. The stillness
+        the falling edge, a sample or two after the wave itself. The stillness
         requirement is the only test that rejects a vibration: each half-cycle
         of a shake rises and falls fast enough to look like an impulse, so
-        without it a shaking hand reports a machine-gun of claps.
+        without it a shaking hand reports a machine-gun of waves.
         """
         if self._impulse_peak is None:
             self._open_impulse(peak, now)
@@ -443,12 +445,12 @@ class GestureDetector:
         return self._finish_impulse(peak, now)
 
     def _track_still(self, still: bool, now: float) -> None:
-        """Time runs of non-accelerating samples, for the clap's stillness test.
+        """Time runs of non-accelerating samples, for the wave's stillness test.
 
         ``_quiet_len`` is the length of the still run that ended on this sample,
         and is zeroed on every later one: only stillness *immediately* before a
         spike counts as stillness. Carrying an old run along would let the last
-        half-cycle of a vibration pass for a clap, since nothing interrupts a
+        half-cycle of a vibration pass for a wave, since nothing interrupts a
         sustained shake long enough to start a new run.
         """
         if still:
@@ -463,20 +465,20 @@ class GestureDetector:
 
     def _open_impulse(self, peak: float, now: float) -> None:
         """Start tracking an impulse once a still hand accelerates sharply."""
-        threshold = self._clap_threshold
+        threshold = self._wave_threshold
         if peak < threshold:
-            if peak < threshold * _CLAP_LOW_FRACTION:
+            if peak < threshold * _WAVE_LOW_FRACTION:
                 # Comfortably low: a rise from here can be timed.
                 self._rise_start = now
             return
 
-        if self._quiet_len < MOTION_CLAP_QUIET_S:
+        if self._quiet_len < MOTION_WAVE_QUIET_S:
             # The hand was already moving. Without this test a vibration reads
             # as a machine-gun of well-shaped impulses, because each half-cycle
-            # rises fast and falls fast; a clap is preceded by a still hand.
+            # rises fast and falls fast; a wave is preceded by a still hand.
             self._rise_start = None
             return
-        if self._rise_start is None or (now - self._rise_start) > MOTION_CLAP_RISE_S:
+        if self._rise_start is None or (now - self._rise_start) > MOTION_WAVE_RISE_S:
             # Rose slowly, or we joined mid-rise: not an impulse. Stays closed
             # until the signal drops below the low mark again.
             self._rise_start = None
@@ -488,61 +490,61 @@ class GestureDetector:
     def _finish_impulse(self, peak: float, now: float) -> GestureEvent | None:
         """Return the impulse as a candidate once it falls back down."""
         self._impulse_peak = max(self._impulse_peak, peak)
-        if peak >= self._clap_threshold * _CLAP_LOW_FRACTION:
-            if now - self._impulse_start > MOTION_CLAP_MAX_WIDTH_S:
-                self._close_impulse()  # held too long to be a clap
+        if peak >= self._wave_threshold * _WAVE_LOW_FRACTION:
+            if now - self._impulse_start > MOTION_WAVE_MAX_WIDTH_S:
+                self._close_impulse()  # held too long to be a wave
             return None
 
         peak_g = self._impulse_peak or 0.0
         width = now - self._impulse_start
         self._close_impulse()
         self._rise_start = now
-        if width > MOTION_CLAP_MAX_WIDTH_S:
+        if width > MOTION_WAVE_MAX_WIDTH_S:
             return None
         return GestureEvent(
-            gesture=GESTURE_CLAP,
+            gesture=GESTURE_WAVE,
             source=SOURCE_STREAM,
             peak_g=round(peak_g, 3),
             velocity_g_s=0.0,
         )
 
-    def _resolve_pending_clap(self, peak: float, now: float) -> GestureEvent | None:
+    def _resolve_pending_wave(self, peak: float, now: float) -> GestureEvent | None:
         """Award a completed impulse only once the hand has rung down.
 
-        A clap and the first half-cycle of a shake have near-identical shapes
-        while they happen, but a clap is followed by a coasting hand (constant
+        A wave and the first half-cycle of a shake have near-identical shapes
+        while they happen, but a wave is followed by a coasting hand (constant
         velocity is no acceleration) whereas a shake follows itself with another
         half-cycle at nearly full amplitude. So the residual must fall to
-        ``MOTION_CLAP_RING_DOWN_FRACTION`` of the impulse's own peak and stay
-        there for ``MOTION_CLAP_SETTLE_S``; failing that within
-        ``MOTION_CLAP_RING_DOWN_S`` discards the candidate. Judged relative to
-        the peak because the back stroke of a real clap, the hand decelerating,
-        is part of the clap. Costs ``MOTION_CLAP_SETTLE_S`` of latency.
+        ``MOTION_WAVE_RING_DOWN_FRACTION`` of the impulse's own peak and stay
+        there for ``MOTION_WAVE_SETTLE_S``; failing that within
+        ``MOTION_WAVE_RING_DOWN_S`` discards the candidate. Judged relative to
+        the peak because the back stroke of a real wave, the hand decelerating,
+        is part of the wave. Costs ``MOTION_WAVE_SETTLE_S`` of latency.
         """
         event = self._pending
         if event is None:
             return None
 
-        if peak > event.peak_g * MOTION_CLAP_RING_DOWN_FRACTION:
+        if peak > event.peak_g * MOTION_WAVE_RING_DOWN_FRACTION:
             self._ring_down_since = None
-            if now - self._pending_since > MOTION_CLAP_RING_DOWN_S:
+            if now - self._pending_since > MOTION_WAVE_RING_DOWN_S:
                 self._pending = None
             return None
         if self._ring_down_since is None:
             self._ring_down_since = now
             return None
-        if now - self._ring_down_since < MOTION_CLAP_SETTLE_S:
+        if now - self._ring_down_since < MOTION_WAVE_SETTLE_S:
             return None
 
         self._pending = None
         self._ring_down_since = None
-        if not self._can_fire(event.gesture, now, MOTION_CLAP_REFRACTORY_S):
+        if not self._can_fire(event.gesture, now, MOTION_WAVE_REFRACTORY_S):
             return None
         self._record_fire(event.gesture, now)
         return event
 
     def _close_impulse(self) -> None:
-        """Forget an impulse that turned out to be too wide to be a clap."""
+        """Forget an impulse that turned out to be too wide to be a wave."""
         self._impulse_peak = None
         self._rise_start = None
 
@@ -699,7 +701,11 @@ class VerticalAngleTracker:
 
     The precision comes from the filtering: the raw signal quantizes at about
     0.11 degrees at 1 g and ``asin`` amplifies that near vertical, so a
-    resting hand would otherwise produce degrees of wander.
+    resting hand would otherwise produce degrees of wander. The filter is
+    adaptive, though: while the raw target sits more than
+    ``MOTION_VERTICAL_SNAP_DEG`` away from the estimate the smoothing uses the
+    short ``MOTION_VERTICAL_SNAP_TAU_S``, so a deliberate flip of the ring
+    settles in well under a second instead of visibly sliding.
     """
 
     def __init__(self) -> None:
@@ -739,7 +745,15 @@ class VerticalAngleTracker:
         if self._elevation is None:
             self._elevation = target
         elif dt > 0:
-            alpha = 1.0 - math.exp(-dt / MOTION_VERTICAL_TAU_S)
+            # Adaptive: follow quickly while far from the estimate (a real,
+            # large movement, not noise), slowly when close (a resting hand).
+            gap = abs(target - self._elevation)
+            tau = (
+                MOTION_VERTICAL_SNAP_TAU_S
+                if gap > MOTION_VERTICAL_SNAP_DEG
+                else MOTION_VERTICAL_TAU_S
+            )
+            alpha = 1.0 - math.exp(-dt / tau)
             self._elevation += alpha * (target - self._elevation)
         # dt <= 0 (a gap, or two stamps in one tick): hold the estimate.
 

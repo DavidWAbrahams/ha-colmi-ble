@@ -35,7 +35,7 @@ GESTURE_EVENT_TYPE = "colmi_ring_gesture"
 # a session holds the ring's single GATT link (see MotionManager). One message
 # per kind of session, so the refusal names the switch to turn off.
 STREAM_BUSY_MESSAGE = "Unavailable while the motion stream is on"
-CLAP_BUSY_MESSAGE = "Unavailable while clap detection is on"
+WAVE_BUSY_MESSAGE = "Unavailable while wave detection is on"
 
 # Opt-in: creates the motion switch and the gesture event entities. Off by
 # default because streaming holds the single GATT link open (which pauses
@@ -61,14 +61,14 @@ GESTURE_SENSITIVITY_SCALE: dict[str, float] = {
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
 DEFAULT_MOTION_STREAM_TIMEOUT = 30
 
-# Minutes the clap listener holds the ring's link before switching itself off.
-# Its own option because the cost is different in kind: the clap listener does
+# Minutes the wave listener holds the ring's link before switching itself off.
+# Its own option because the cost is different in kind: the wave listener does
 # not stream, so it is meant to be left on, but while it is on the ring's single
 # link is taken and heart rate, battery and steps stop updating. So it gets a
 # longer default than the stream, and 0 means "leave it on until I say
 # otherwise" (see CONF_MOTION_STREAM_TIMEOUT for the same convention).
-CONF_CLAP_TIMEOUT = "clap_timeout"
-DEFAULT_CLAP_TIMEOUT = 120
+CONF_WAVE_TIMEOUT = "wave_timeout"
+DEFAULT_WAVE_TIMEOUT = 120
 
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
@@ -132,43 +132,43 @@ MOTION_RAISE_MAX_PEAK_S = 0.6
 MOTION_RAISE_PITCH_DEG = 15.0
 MOTION_PITCH_RECENT_WINDOW_S = 0.25
 
-# Stream-derived clap: a near-instantaneous spike of this much *linear*
-# acceleration (gravity removed), rising within MOTION_CLAP_RISE_S and falling
-# back within MOTION_CLAP_MAX_WIDTH_S. The width limit is what keeps a clench
+# Stream-derived wave: a near-instantaneous spike of this much *linear*
+# acceleration (gravity removed), rising within MOTION_WAVE_RISE_S and falling
+# back within MOTION_WAVE_MAX_WIDTH_S. The width limit is what keeps a clench
 # or a swung arm (hundreds of ms of sustained acceleration) from reading as a
-# clap; a clap impulse is tens of milliseconds.
-MOTION_CLAP_SPIKE_G = 1.1
-MOTION_CLAP_RISE_S = 0.15
-MOTION_CLAP_MAX_WIDTH_S = 0.25
+# wave; a wave impulse is tens of milliseconds.
+MOTION_WAVE_SPIKE_G = 1.1
+MOTION_WAVE_RISE_S = 0.15
+MOTION_WAVE_MAX_WIDTH_S = 0.25
 
 # The ring must have been essentially still for this long before the spike.
 # Without it a vibration (a shaking hand, a mower, a steering wheel) reads as a
 # machine-gun of well-shaped impulses, because each half-cycle rises fast and
-# falls fast. A clap is preceded by a still hand.
-MOTION_CLAP_QUIET_S = 0.4
+# falls fast. A wave is preceded by a still hand.
+MOTION_WAVE_QUIET_S = 0.4
 
 # The hand must also *ring down* after the spike and stay quiet for this long
-# before the clap is reported. This is the test that separates a clap from the
+# before the wave is reported. This is the test that separates a wave from the
 # first half-cycle of a shake: with a still hand beforehand the two have
-# near-identical shapes, but a clap is followed by a coasting hand (constant
+# near-identical shapes, but a wave is followed by a coasting hand (constant
 # velocity is no acceleration) while a shake is followed by more shaking.
 # Costs this much latency.
-MOTION_CLAP_SETTLE_S = 0.2
+MOTION_WAVE_SETTLE_S = 0.2
 
 # How far below its own peak the motion has to fall to count as ringing down, as
-# well as how long it may take to get there. The counter-stroke of a real clap
-# (the hand decelerating) is part of the clap, so an absolute "must be near 1 g"
-# would reject genuine claps; relative to the impulse it still excludes a shake,
+# well as how long it may take to get there. The counter-stroke of a real wave
+# (the hand decelerating) is part of the wave, so an absolute "must be near 1 g"
+# would reject genuine waves; relative to the impulse it still excludes a shake,
 # whose next half-cycle returns at nearly full amplitude.
-MOTION_CLAP_RING_DOWN_FRACTION = 0.25
+MOTION_WAVE_RING_DOWN_FRACTION = 0.25
 
-# How long the impulse is allowed to take ringing down. A clap's own back stroke
+# How long the impulse is allowed to take ringing down. A wave's own back stroke
 # is over in tens of milliseconds and the hand coasts soon after, so this is
 # generous at well under a second. It matters as much as the fraction: a shake
 # keeps interrupting the ring-down, and without a deadline its very last
 # half-cycle would eventually settle, be awarded the gesture, and be reported a
 # beat after the shaking stopped.
-MOTION_CLAP_RING_DOWN_S = 0.6
+MOTION_WAVE_RING_DOWN_S = 0.6
 
 # How far the raw magnitude may stray from 1 g and still count as "still" for
 # the window above. Measured on the magnitude rather than the gravity-projected
@@ -176,15 +176,15 @@ MOTION_CLAP_RING_DOWN_S = 0.6
 # dips back through zero, so only the magnitude says undeniably "this hand is
 # moving". Deliberately generous, since a real wrist at rest is not perfectly
 # quiet; tighten against captured data.
-MOTION_CLAP_QUIET_BAND_G = 0.15
+MOTION_WAVE_QUIET_BAND_G = 0.15
 
-# A clap impulse lasts a few tens of ms and two claps in a row are a
-# deliberate double-clap, not one gesture.
-MOTION_CLAP_REFRACTORY_S = 0.6
+# A wave impulse lasts a few tens of ms and two waves in a row are a
+# deliberate double-wave, not one gesture.
+MOTION_WAVE_REFRACTORY_S = 0.6
 
 # Minimum interval between reports of the *same* gesture, and the shorter
 # window in which one gesture suppresses the others (a hard raise can also
-# look like a clap).
+# look like a wave).
 MOTION_GESTURE_COOLDOWN_S = 1.2
 MOTION_GESTURE_SUPPRESS_S = 0.5
 
@@ -202,12 +202,26 @@ MOTION_GESTURE_SUPPRESS_S = 0.5
 # one constant is the only thing to change.
 MOTION_VERTICAL_AXIS = "z"
 
-# Time constant of the low-pass applied to the gravity direction. The angle is
-# taken from the filtered vector rather than from each raw sample: the
-# accelerometer's least significant bit is 4 g / 2048, which at 1 g is about
-# 0.11 degrees, and asin has an infinite derivative at +/-1 - so raw samples
-# would jitter by several degrees around a hand that is not moving at all.
+# Time constant of the low-pass applied to the elevation angle. The angle is
+# smoothed rather than read from each raw sample: the accelerometer's least
+# significant bit is 4 g / 2048, which at 1 g is about 0.11 degrees, and asin
+# has an infinite derivative at +/-1 - so raw samples would jitter by several
+# degrees around a hand that is not moving at all.
 MOTION_VERTICAL_TAU_S = 0.5
+
+# Once the raw target is this far from the current estimate, follow it with the
+# short time constant below. Without this a large, deliberate change of pose -
+# laying a vertical ring flat, say - looks like the reading is stuck, because
+# an exponential chases the last part of a step slowly, and the flip itself is
+# excluded by the trust gate, so the chase only starts once the hand settles.
+# Above this divergence the movement is unambiguous, not noise, so following it
+# quickly costs nothing in stability.
+MOTION_VERTICAL_SNAP_DEG = 15.0
+
+# Time constant used while the estimate and the raw target disagree by more
+# than MOTION_VERTICAL_SNAP_DEG. Short enough that a snap of the wrist reads as
+# one move rather than a slow slide.
+MOTION_VERTICAL_SNAP_TAU_S = 0.1
 
 # Discard samples whose magnitude strays this far from 1 g. Their direction is
 # then mostly the movement rather than gravity, so letting them in would drag the
@@ -224,24 +238,24 @@ MOTION_VERTICAL_DEADBAND_DEG = 1.5
 # dead and closed. Generous because the stock firmware is known to report
 # slowly, and proxy latency adds to it.
 #
-# Applies to the RAW stream only. The clap listener must never use it: silence is
+# Applies to the RAW stream only. The wave listener must never use it: silence is
 # that session's normal state, often for hours at a time.
 MOTION_STREAM_SILENCE_TIMEOUT_S = 30.0
 
-# Below this measured sample rate the stream cannot resolve a clap's ~50 ms
-# impulse, so the stream-derived clap detector stays off. Measured on stock R02
+# Below this measured sample rate the stream cannot resolve a wave's ~50 ms
+# impulse, so the stream-derived wave detector stays off. Measured on stock R02
 # firmware, which streams at exactly 1 Hz, so in practice this always trips and a
-# clap then has to come from the ring's own detector, via the Clap Detection
+# wave then has to come from the ring's own detector, via the Wave Detection
 # switch - which is a separate session, because that mode does not coexist with
 # RAW streaming.
-MOTION_MIN_HZ_FOR_STREAM_CLAP = 15.0
+MOTION_MIN_HZ_FOR_STREAM_WAVE = 15.0
 
-# Minimum seconds between published claps from the ring's own detector.
+# Minimum seconds between published waves from the ring's own detector.
 #
-# The detector is in the firmware, so a burst of report packets for one clap is
+# The detector is in the firmware, so a burst of report packets for one wave is
 # something we can only smooth here: ``GestureDetector.on_device_gesture`` has no
 # cooldown of its own (it is a report translation, not a detector), so without
 # this a ring that repeats itself fires one HA event per packet. Set below the
-# gap a deliberate double-clap has in practice, so two real claps stay two
+# gap a deliberate double-wave has in practice, so two real waves stay two
 # events.
-CLAP_REPORT_COOLDOWN_S = 0.8
+WAVE_REPORT_COOLDOWN_S = 0.8

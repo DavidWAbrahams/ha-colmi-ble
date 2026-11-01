@@ -41,7 +41,7 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 
 | Switch | What it does | What it costs |
 | --- | --- | --- |
-| `Clap Detection` | Asks the ring to run its own on-device clap detector and report when it fires | Holds the ring's single Bluetooth link, so polling freezes while it is on; turns itself off after a configurable number of minutes (120 by default) |
+| `Wave Detection` | Asks the ring to run its own on-device wave detector and report when it fires | Holds the ring's single Bluetooth link, so polling freezes while it is on; turns itself off after a configurable number of minutes (120 by default) |
 | `Motion Stream` | Makes the ring stream raw accelerometer data continuously, so you can build your own gestures in HA | Also freezes polling, and drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
 `Motion Stream` is opt-in from the integration's options ("Enable gesture detection"). Enabling it adds
@@ -63,13 +63,13 @@ trigger:
   - platform: event
     event_type: colmi_ring_gesture
     event_data:
-      gesture: clap
+      gesture: wave
 action:
   - variables:
       peak_g: "{{ trigger.event.data.peak_g }}"
 ```
 
-The event data includes `gesture`, `source` (`ring` if the ring detected its own clap, `stream` if we
+The event data includes `gesture`, `source` (`ring` if the ring detected its own wave, `stream` if we
 derived it from the accelerometer), `peak_g` and `velocity_g_s`.
 
 ## Watching the raw accelerometer data

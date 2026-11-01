@@ -204,6 +204,26 @@ check(
     f"angle={tracker.angle_deg}",
 )
 
+# 11. a step from vertical to flat settles quickly, not at the slow-tau pace.
+# With a single 0.5 s tau a 90->0 step still reads ~33 after 0.5 s; the
+# adaptive snap must bring that under 10, and to rest within ~2 s.
+tracker = VerticalAngleTracker()
+run(tracker, hold(90.0, 1.0), t0=1000.0)
+run(tracker, hold(0.0, 0.5), t0=1010.0)
+settled_fast = tracker.angle_deg
+check(
+    "step 90->0 mostly settled after 0.5 s",
+    settled_fast is not None and settled_fast < 10.0,
+    f"angle={settled_fast}",
+)
+run(tracker, hold(0.0, 1.5), t0=1010.5)
+settled = tracker.angle_deg
+check(
+    "step 90->0 at rest after 2 s",
+    settled is not None and settled < 1.5,
+    f"angle={settled}",
+)
+
 if failures:
     print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")
     raise SystemExit(1)

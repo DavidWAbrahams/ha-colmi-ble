@@ -29,7 +29,7 @@ touching the detector or the Home Assistant surface.
 
 *Measured on our R02.* The camera-gesture *report* byte is no longer a guess; see
 :data:`GESTURE_REPORT_TYPES`. Two facts came out of the same capture, via the
-ATC RF03 Writer web tool, and both matter to ``MotionManager``: a clap yields one
+ATC RF03 Writer web tool, and both matter to ``MotionManager``: a wave yields one
 packet only while a central is actually connected, and the ring does not echo the
 ``02 04`` enable back at us.
 
@@ -61,15 +61,15 @@ TYPE_POSITION = 3
 # ``packet[1]`` value that means "the on-device gesture just fired".
 #
 # Measured on an R02 with the ATC RF03 Writer web tool: ``02 04`` (checksum 06)
-# starts camera mode on its own, with no RAW stream, and each clap then reports
+# starts camera mode on its own, with no RAW stream, and each wave then reports
 # exactly one 16-byte packet, ``02 02 00 00 00 00 00 00 00 00 00 00 00 00 00 04``
 # (checksum 04, well-formed, all-zero body). Subtype 2 is therefore the report.
 #
-# Note 2 is also ``SUB_RAW_OFF``: on ``CMD_CAMERA_GESTURE`` it is a clap, and the
+# Note 2 is also ``SUB_RAW_OFF``: on ``CMD_CAMERA_GESTURE`` it is a wave, and the
 # command bytes keep the two apart. Nothing was seen echoed back after the
 # ``02 04`` write, so this set deliberately excludes 4 - accepting our own enable
 # as a report is what the old guess ({4, 5, 7}) got wrong in both directions: it
-# could not see real claps, and it could invent them.
+# could not see real waves, and it could invent them.
 GESTURE_REPORT_TYPES = frozenset({2})
 
 # 12-bit signed accelerometer payload, scaled to +/-4 g.
@@ -94,7 +94,7 @@ def get_raw_stop_packet() -> bytearray:
 
 
 def get_camera_gesture_on_packet() -> bytearray:
-    """Enable the ring's on-device camera-button (clap) gesture detection."""
+    """Enable the ring's on-device camera-button (wave) gesture detection."""
     return make_packet(CMD_CAMERA_GESTURE, bytearray([SUB_GESTURE_ON]))
 
 

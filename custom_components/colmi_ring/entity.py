@@ -8,7 +8,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CLAP_BUSY_MESSAGE, STREAM_BUSY_MESSAGE
+from .const import STREAM_BUSY_MESSAGE, WAVE_BUSY_MESSAGE
 from .coordinator import ColmiRingDataUpdateCoordinator
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         """Refuse a ring command while a session owns the connection.
 
         The ring answers exactly one central, so a button press while the
-        stream or the clap listener holds the link would either fail confusingly
+        stream or the wave listener holds the link would either fail confusingly
         or tear that session down; better to say so plainly and name the switch
         to turn off.
         """
@@ -47,5 +47,5 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         if motion is None or not motion.holds_link:
             return
         raise HomeAssistantError(
-            CLAP_BUSY_MESSAGE if motion.is_listening else STREAM_BUSY_MESSAGE
+            WAVE_BUSY_MESSAGE if motion.is_listening else STREAM_BUSY_MESSAGE
         )

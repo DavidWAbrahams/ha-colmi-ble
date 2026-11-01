@@ -2,7 +2,7 @@
 """Synthesise a labelled accelerometer stream and replay it through the detector.
 
 A hardware-free check that the gesture thresholds do something sensible: it
-writes a CSV of a resting wrist, a clap, a fast hand raise and a fast hand
+writes a CSV of a resting wrist, a wave, a fast hand raise and a fast hand
 lower, then (unless ``--out`` is given) feeds it straight to
 :mod:`scripts/_motion_replay.py`'s machinery and prints what fires.
 
@@ -95,7 +95,7 @@ def build() -> list[tuple[float, float, float, float]]:
 
     hold(2.0, rest)
 
-    # Clap: a hard, very short spike with no change in wrist orientation.
+    # Wave: a hard, very short spike with no change in wrist orientation.
     for _ in range(2):
         t = _push(rows, t, rest, 1.0, 2.4)
     hold(0.06, rest)
@@ -147,7 +147,7 @@ def build_negatives() -> list[tuple[float, float, float, float]]:
     hold(2.0, rest)
 
     # 1. Sustained clench / swung arm: high acceleration, but far too wide to
-    #    be a clap, and with no pitch change it is no gesture either.
+    #    be a wave, and with no pitch change it is no gesture either.
     hold(0.6, rest, linear=1.8)
     hold(2.0, rest)
 
@@ -200,7 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sensitivity", type=float, default=1.0)
     parser.add_argument(
-        "--no-stream-clap", action="store_true", help="disable the stream clap"
+        "--no-stream-wave", action="store_true", help="disable the stream wave"
     )
     parser.add_argument(
         "--scenario",
@@ -224,12 +224,12 @@ def main(argv: list[str] | None = None) -> int:
     rows = to_rows(raw)
     report_signal(rows)
     expectation = (
-        "one clap, one hand_raise, one hand_lower"
+        "one wave, one hand_raise, one hand_lower"
         if args.scenario == "gestures"
         else "none at all"
     )
     print(f"\n## Events (expect {expectation})")
-    fired = run_detector(rows, args.sensitivity, not args.no_stream_clap)
+    fired = run_detector(rows, args.sensitivity, not args.no_stream_wave)
     report_gestures(fired)
     return 0
 

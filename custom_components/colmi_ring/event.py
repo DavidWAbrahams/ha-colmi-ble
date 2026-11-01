@@ -7,19 +7,19 @@ Assistant event type, so an automation can trigger on either::
       - platform: event
         event_type: colmi_ring_gesture
         event_data:
-          gesture: clap
+          gesture: wave
 
-Only the clap is offered today. Raise and lower are recognised by
+Only the wave is offered today. Raise and lower are recognised by
 ``GestureDetector`` but are not published, because a ring streaming at 1 Hz
 cannot resolve a steady lift or drop (see ``_SUPPRESSED_GESTURES`` in
 ``motion_manager.py``), so publishing them would only produce unreliable
 automations.
 
-The clap can reach us two ways - derived from the RAW stream, or reported by
-the ring's own detector while the Clap Detection switch holds the link - and the
+The wave can reach us two ways - derived from the RAW stream, or reported by
+the ring's own detector while the Wave Detection switch holds the link - and the
 event data says which via its ``source`` field. The entities are therefore
 created whether or not motion streaming is enabled: a user who only ever turns
-on Clap Detection still needs something to trigger on.
+on Wave Detection still needs something to trigger on.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from .const import (
     LOGGER,
 )
 from .entity import ColmiRingEntity
-from .gestures import GESTURE_CLAP, GestureEvent
+from .gestures import GESTURE_WAVE, GestureEvent
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,9 +48,9 @@ if TYPE_CHECKING:
 # in the event data, so automations can rely on either.
 ENTITY_DESCRIPTIONS = (
     EventEntityDescription(
-        key=GESTURE_CLAP,
-        name="Clap",
-        icon="mdi:hand-back-right",
+        key=GESTURE_WAVE,
+        name="Wave",
+        icon="mdi:hand-waving",
     ),
 )
 
@@ -62,7 +62,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the gesture event entities.
 
-    Not gated on ``CONF_MOTION_ENABLED`` the way the stream switch is: the clap
+    Not gated on ``CONF_MOTION_ENABLED`` the way the stream switch is: the wave
     has a second, independent source, so the entities exist for any setup. The
     listeners they register are harmless while nothing publishes to them.
     """

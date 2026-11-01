@@ -46,7 +46,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # Set by async_setup_entry once the manager exists (it needs us to be
         # constructed first). While its ``holds_link`` is set we must not open
         # a connection of our own: the ring serves one central at a time, and
-        # either of its two sessions (RAW stream, clap listener) owns that link.
+        # either of its two sessions (RAW stream, wave listener) owns that link.
         self.motion: MotionManager | None = None
         # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
         self.spo2_reading: dict[str, Any] | None = None
@@ -97,7 +97,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         """Update data via library (merging persisted on-demand readings)."""
         if self.motion is not None and self.motion.holds_link:
             # One of the two switches holds the ring's single GATT link - the
-            # RAW motion stream, or the clap listener that keeps a quiet
+            # RAW motion stream, or the wave listener that keeps a quiet
             # connection open so the ring's own detector has a central to
             # report to. Rather than fight either for the connection, keep the
             # last known values and resume as soon as it closes (the manager

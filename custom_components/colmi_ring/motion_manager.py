@@ -2,17 +2,17 @@
 
 The manager is the only place that knows a session is open, which matters
 because the ring serves a single central: while either the RAW motion stream or
-the clap listener holds the link, the data coordinator performs no BLE I/O at
+the wave listener holds the link, the data coordinator performs no BLE I/O at
 all (see its ``_async_update_data`` gate), so this class is also what tells the
 coordinator to pause and resume.
 
 Lifecycle
 ---------
-``async_start`` and :meth:`async_start_claps` flip :attr:`is_streaming` and
+``async_start`` and :meth:`async_start_waves` flip :attr:`is_streaming` and
 :attr:`is_listening` *before* the connection is opened and clear the published
 heart rate, so nothing can race a poll onto the link, and so a frozen heart rate
 can never be mistaken for a live one. ``async_stop`` and
-:meth:`async_stop_claps` (or the matching auto-off timer) end the session; when
+:meth:`async_stop_waves` (or the matching auto-off timer) end the session; when
 the task finally returns, the coordinator is refreshed so the frozen sensors are
 replaced with real data.
 
@@ -31,21 +31,21 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
-from .api import ClapSession, ColmiRingApiClient, MotionSession
+from .api import WaveSession, ColmiRingApiClient, MotionSession
 from .colmi_codec.motion import (
     AccelSample,
     parse_accel_packet,
     parse_gesture_packet,
 )
 from .const import (
-    CLAP_BUSY_MESSAGE,
-    CLAP_REPORT_COOLDOWN_S,
-    CONF_CLAP_TIMEOUT,
+    WAVE_BUSY_MESSAGE,
+    WAVE_REPORT_COOLDOWN_S,
+    CONF_WAVE_TIMEOUT,
     CONF_GESTURE_SENSITIVITY,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
-    DEFAULT_CLAP_TIMEOUT,
+    DEFAULT_WAVE_TIMEOUT,
     DEFAULT_GESTURE_SENSITIVITY,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
@@ -55,7 +55,7 @@ from .const import (
     STREAM_BUSY_MESSAGE,
 )
 from .gestures import (
-    GESTURE_CLAP,
+    GESTURE_WAVE,
     GESTURE_LOWER,
     GESTURE_RAISE,
     SOURCE_RING,
@@ -100,7 +100,7 @@ _SUPPRESSED_GESTURES = frozenset({GESTURE_LOWER, GESTURE_RAISE})
 
 
 class MotionManager:
-    """Own the ring's RAW stream and its on-device clap listener."""
+    """Own the ring's RAW stream and its on-device wave listener."""
 
     def __init__(
         self,
@@ -129,18 +129,18 @@ class MotionManager:
         # (command, subtype) -> first payload seen for that kind this session.
         self._unknown_kinds: dict[tuple[int, int], str] = {}
 
-        # -- clap detection -------------------------------------------------
-        self._clap_session: ClapSession | None = None
-        self._clap_task: asyncio.Task[None] | None = None
-        self._clap_timer: Callable[[], None] | None = None
-        self._want_clap = False
-        # When the last clap report was published, for the dedupe below.
-        self._last_clap_at = 0.0
-        # Clap reports this session that were published, for the closing line.
-        self._clap_reports = 0
+        # -- wave detection -------------------------------------------------
+        self._wave_session: WaveSession | None = None
+        self._wave_task: asyncio.Task[None] | None = None
+        self._wave_timer: Callable[[], None] | None = None
+        self._want_wave = False
+        # When the last wave report was published, for the dedupe below.
+        self._last_wave_at = 0.0
+        # Wave reports this session that were published, for the closing line.
+        self._wave_reports = 0
 
         self.is_streaming = False
-        # True while the clap listener holds the link. Independent of
+        # True while the wave listener holds the link. Independent of
         # ``is_streaming``: the two are mutually exclusive, never both.
         self.is_listening = False
         # Newest decoded sample, for the accelerometer sensors. None whenever no
@@ -155,7 +155,7 @@ class MotionManager:
         self._event_listeners: list[Callable[[GestureEvent], None]] = []
         self._sample_listeners: list[Callable[[], None]] = []
         self._state_listeners: list[Callable[[bool], None]] = []
-        self._clap_state_listeners: list[Callable[[bool], None]] = []
+        self._wave_state_listeners: list[Callable[[bool], None]] = []
 
     # -- configuration ------------------------------------------------------
 
@@ -193,12 +193,12 @@ class MotionManager:
         # Non-positive means "stay on until I say otherwise".
         return value if value > 0 else 0.0
 
-    def _clap_timeout_minutes(self) -> float:
-        raw = self._entry.options.get(CONF_CLAP_TIMEOUT, DEFAULT_CLAP_TIMEOUT)
+    def _wave_timeout_minutes(self) -> float:
+        raw = self._entry.options.get(CONF_WAVE_TIMEOUT, DEFAULT_WAVE_TIMEOUT)
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            value = float(DEFAULT_CLAP_TIMEOUT)
+            value = float(DEFAULT_WAVE_TIMEOUT)
         return value if value > 0 else 0.0
 
     # -- listeners ----------------------------------------------------------
@@ -242,31 +242,31 @@ class MotionManager:
         if listener in self._state_listeners:
             self._state_listeners.remove(listener)
 
-    def add_clap_state_listener(
+    def add_wave_state_listener(
         self, listener: Callable[[bool], None]
     ) -> Callable[[], None]:
-        """Learn when clap detection actually turns on or off (for the switch)."""
-        self._clap_state_listeners.append(listener)
-        return lambda: self._remove_clap_state_listener(listener)
+        """Learn when wave detection actually turns on or off (for the switch)."""
+        self._wave_state_listeners.append(listener)
+        return lambda: self._remove_wave_state_listener(listener)
 
-    def _remove_clap_state_listener(self, listener: Callable[[bool], None]) -> None:
-        if listener in self._clap_state_listeners:
-            self._clap_state_listeners.remove(listener)
+    def _remove_wave_state_listener(self, listener: Callable[[bool], None]) -> None:
+        if listener in self._wave_state_listeners:
+            self._wave_state_listeners.remove(listener)
 
     # -- start / stop -------------------------------------------------------
 
     async def async_start(self) -> None:
         """Open the stream. Safe to call when it is already running.
 
-        Raises :class:`HomeAssistantError` while clap detection is on: the ring
+        Raises :class:`HomeAssistantError` while wave detection is on: the ring
         serves a single central, so the stream cannot have the link the listener
         is holding - and its camera mode does not report while RAW mode owns the
         accelerometer either.
         """
         if self._want_stream:
             return
-        if self._want_clap:
-            raise HomeAssistantError(CLAP_BUSY_MESSAGE)
+        if self._want_wave:
+            raise HomeAssistantError(WAVE_BUSY_MESSAGE)
 
         self._want_stream = True
         self._log_samples = bool(
@@ -343,84 +343,84 @@ class MotionManager:
             return
         session.request_stop(reason)
 
-    # -- clap detection -----------------------------------------------------
+    # -- wave detection -----------------------------------------------------
 
-    async def async_start_claps(self) -> None:
-        """Hold the link so the ring's own clap detector can reach us.
+    async def async_start_waves(self) -> None:
+        """Hold the link so the ring's own wave detector can reach us.
 
         Safe to call when it is already listening. Raises
         :class:`HomeAssistantError` while the motion stream is running, for the
         same reasons :meth:`async_start` refuses the other way round.
         """
-        if self._want_clap:
+        if self._want_wave:
             return
         if self._want_stream:
             raise HomeAssistantError(STREAM_BUSY_MESSAGE)
 
-        self._want_clap = True
+        self._want_wave = True
         # Set before connecting, like the stream does: the coordinator stops
         # polling and the ring's buttons refuse to fire for as long as the link
         # is ours, and a heart rate frozen at its last value must not read
         # as live.
         self._set_listening(True)
         self._coordinator.async_clear_heart_rate()
-        self._last_clap_at = 0.0
-        self._clap_reports = 0
+        self._last_wave_at = 0.0
+        self._wave_reports = 0
 
-        self._clap_task = self._hass.async_create_task(
-            self._run_claps(), "colmi_ring_clap_detection"
+        self._wave_task = self._hass.async_create_task(
+            self._run_waves(), "colmi_ring_wave_detection"
         )
 
-    async def _run_claps(self) -> None:
-        """Listen for clap reports until the session ends or we end it."""
+    async def _run_waves(self) -> None:
+        """Listen for wave reports until the session ends or we end it."""
         aborted = False
         try:
-            reason = await self._client.async_listen_claps(
-                self._on_clap_packet,
-                lambda: self._want_clap,
-                self._on_clap_session,
+            reason = await self._client.async_listen_waves(
+                self._on_wave_packet,
+                lambda: self._want_wave,
+                self._on_wave_session,
             )
         except Exception:  # noqa: BLE001
             # Same reasoning as _run: the traceback belongs on *this* logger, or
             # a log filtered to custom_components.colmi_ring shows the listener
             # closing cleanly with no explanation of why.
-            LOGGER.exception("Colmi ring clap detection task failed")
+            LOGGER.exception("Colmi ring wave detection task failed")
             reason, aborted = None, True
         finally:
-            self.async_notify_clap_finished()
+            self.async_notify_wave_finished()
         if aborted:
             # The traceback above is the explanation; do not also claim the
             # listener never opened, which describes the retry-budget case.
             return
         if reason is None:
             LOGGER.warning(
-                "Colmi ring clap detection could not be opened; the switch has"
+                "Colmi ring wave detection could not be opened; the switch has"
                 " been turned off (see the log above for the reason)"
             )
         elif reason == "unarmed":
             LOGGER.warning(
-                "Colmi ring clap detection turned itself off: the ring never"
-                " accepted the write that enables its clap detector (02 04), so"
-                " this firmware probably has no on-device clap to report"
+                "Colmi ring wave detection turned itself off: the ring never"
+                " accepted the write that enables its wave detector (02 04), so"
+                " this firmware probably has no on-device wave to report"
             )
         elif reason not in ("user", "timeout"):
             # Worth an INFO line: a session that ends by itself (link dropped) is
             # the case a user needs help with, and without it the switch just
             # goes off with nothing in the default log level.
-            LOGGER.info("Colmi ring clap detection ended (%s)", reason)
+            LOGGER.info("Colmi ring wave detection ended (%s)", reason)
         else:
-            LOGGER.debug("Colmi ring clap detection finished (%s)", reason)
+            LOGGER.debug("Colmi ring wave detection finished (%s)", reason)
 
-    def async_stop_claps(self, reason: str = "user") -> None:
-        """Close the clap listener. Safe to call when it is not listening."""
-        if not self._want_clap:
+    def async_stop_waves(self, reason: str = "user") -> None:
+        """Close the wave listener. Safe to call when it is not listening."""
+        if not self._want_wave:
             return
-        self._want_clap = False
-        self._cancel_clap_auto_off()
-        session = self._clap_session
+        self._want_wave = False
+        self._cancel_wave_auto_off()
+        session = self._wave_session
         if session is None:
             # Still connecting: finish now so the switch reflects reality, and
-            # _on_clap_session will close the session that opens afterwards.
+            # _on_wave_session will close the session that opens afterwards.
             self._set_listening(False)
             self._request_refresh()
             return
@@ -429,20 +429,20 @@ class MotionManager:
     async def async_shutdown(self) -> None:
         """Stop both sessions on unload/reload and wait briefly for them."""
         self._want_stream = False
-        self._want_clap = False
+        self._want_wave = False
         self._cancel_stream_timers()
-        self._cancel_clap_auto_off()
+        self._cancel_wave_auto_off()
         if self._session is not None:
             self._session.request_stop("shutdown")
-        if self._clap_session is not None:
-            self._clap_session.request_stop("shutdown")
+        if self._wave_session is not None:
+            self._wave_session.request_stop("shutdown")
         tasks = {
             task
-            for task in (self._task, self._clap_task)
+            for task in (self._task, self._wave_task)
             if task is not None and not task.done()
         }
         self._task = None
-        self._clap_task = None
+        self._wave_task = None
         if not tasks:
             return
         _done, pending = await asyncio.wait(tasks, timeout=10.0)
@@ -474,15 +474,15 @@ class MotionManager:
             self._hass, _RATE_PROBE_S, self._async_check_rate
         )
 
-    def _on_clap_session(self, session: ClapSession) -> None:
-        """The link is held with the ring's clap detector armed: arm the session."""
-        if not self._want_clap:
+    def _on_wave_session(self, session: WaveSession) -> None:
+        """The link is held with the ring's wave detector armed: arm the session."""
+        if not self._want_wave:
             # Turned off while we were connecting.
             session.request_stop("user")
             return
-        self._clap_session = session
-        LOGGER.info("Colmi ring clap detection open; polling is paused")
-        self._schedule_clap_auto_off()
+        self._wave_session = session
+        LOGGER.info("Colmi ring wave detection open; polling is paused")
+        self._schedule_wave_auto_off()
 
     def _async_check_rate(self, _now: Any) -> None:
         """Report once per session what the stream actually looks like.
@@ -511,11 +511,11 @@ class MotionManager:
                 self._unknown_summary(),
             )
         elif self._detector.rate_is_too_low():
-            self._detector.stream_clap = False
+            self._detector.stream_wave = False
             LOGGER.info(
                 "Colmi ring motion stream: %.1f Hz over %d samples%s; too slow to"
-                " detect a clap from the accelerometer, so a clap can only come"
-                " from the Clap Detection switch",
+                " detect a wave from the accelerometer, so a wave can only come"
+                " from the Wave Detection switch",
                 rate,
                 self._detector.samples_seen,
                 magnitude,
@@ -539,13 +539,13 @@ class MotionManager:
     def _on_packet(self, packet: bytearray) -> None:
         """Feed one notification from the stream into the detector.
 
-        A clap is not reported from here. The ring only announces its own clap
+        A wave is not reported from here. The ring only announces its own wave
         while camera mode is armed and nothing else is holding the accelerometer,
-        so claps come from the Clap Detection switch instead (see
-        ``MOTION_MIN_HZ_FOR_STREAM_CLAP`` for why the samples cannot yield one).
+        so waves come from the Wave Detection switch instead (see
+        ``MOTION_MIN_HZ_FOR_STREAM_WAVE`` for why the samples cannot yield one).
         A gesture frame that does turn up mid-stream is still worth one DEBUG
         line, because how the two modes interact is exactly what a report here
-        would tell us - but it is not published, so one clap cannot fire twice.
+        would tell us - but it is not published, so one wave cannot fire twice.
         """
         if parse_gesture_packet(packet) is not None:
             LOGGER.debug(
@@ -639,8 +639,8 @@ class MotionManager:
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring sample listener raised")
 
-    def _on_clap_packet(self, packet: bytearray) -> None:
-        """Publish one clap from the ring's own detector, deduplicated.
+    def _on_wave_packet(self, packet: bytearray) -> None:
+        """Publish one wave from the ring's own detector, deduplicated.
 
         Anything on the link that is not a gesture report is dropped silently:
         the session's own tally in ``api.py`` already counts and describes every
@@ -650,19 +650,19 @@ class MotionManager:
         if parse_gesture_packet(packet) is None:
             return
         now = time.monotonic()
-        if now - self._last_clap_at < CLAP_REPORT_COOLDOWN_S:
+        if now - self._last_wave_at < WAVE_REPORT_COOLDOWN_S:
             LOGGER.debug(
-                "Colmi ring reported a clap again within %.1f s; treating it as"
-                " the same clap (%s)",
-                CLAP_REPORT_COOLDOWN_S,
+                "Colmi ring reported a wave again within %.1f s; treating it as"
+                " the same wave (%s)",
+                WAVE_REPORT_COOLDOWN_S,
                 packet.hex(),
             )
             return
-        self._last_clap_at = now
-        self._clap_reports += 1
+        self._last_wave_at = now
+        self._wave_reports += 1
         self._announce(
             GestureEvent(
-                gesture=GESTURE_CLAP,
+                gesture=GESTURE_WAVE,
                 source=SOURCE_RING,
                 # The ring reports a gesture, not a measurement: there are no
                 # acceleration figures behind it to report.
@@ -675,7 +675,7 @@ class MotionManager:
         """Announce a stream gesture, and restart the stream's auto-off timer.
 
         The restart is what makes that option mean "turn off after N minutes of
-        *no gestures*" rather than "N minutes of use". A clap deliberately does
+        *no gestures*" rather than "N minutes of use". A wave deliberately does
         not come through here - see :meth:`_announce`.
         """
         self._announce(event)
@@ -729,37 +729,37 @@ class MotionManager:
             self._stream_timer()
             self._stream_timer = None
 
-    def _schedule_clap_auto_off(self) -> None:
-        """Arm the clap listener's auto-off timer, once, when it opens.
+    def _schedule_wave_auto_off(self) -> None:
+        """Arm the wave listener's auto-off timer, once, when it opens.
 
-        Never rearmed by a clap. That is the deliberate difference from the
-        stream above: a listener restarted by every clap would let someone who
-        claps every few minutes hold the ring's link indefinitely, and polling
+        Never rearmed by a wave. That is the deliberate difference from the
+        stream above: a listener restarted by every wave would let someone who
+        waves every few minutes hold the ring's link indefinitely, and polling
         would never come back - which is the exact cost this switch warns about.
         """
-        self._cancel_clap_auto_off()
-        minutes = self._clap_timeout_minutes()
+        self._cancel_wave_auto_off()
+        minutes = self._wave_timeout_minutes()
         if minutes <= 0:
             return
-        self._clap_timer = async_call_later(
-            self._hass, minutes * 60.0, self._async_clap_auto_off
+        self._wave_timer = async_call_later(
+            self._hass, minutes * 60.0, self._async_wave_auto_off
         )
 
-    def _async_clap_auto_off(self, _now: Any) -> None:
-        self._clap_timer = None
-        if not self._want_clap:
+    def _async_wave_auto_off(self, _now: Any) -> None:
+        self._wave_timer = None
+        if not self._want_wave:
             return
         LOGGER.info(
-            "Colmi ring clap detection turned off after %s minutes; the ring's"
+            "Colmi ring wave detection turned off after %s minutes; the ring's"
             " single link is free again for polling",
-            self._clap_timeout_minutes(),
+            self._wave_timeout_minutes(),
         )
-        self.async_stop_claps(reason="timeout")
+        self.async_stop_waves(reason="timeout")
 
-    def _cancel_clap_auto_off(self) -> None:
-        if self._clap_timer is not None:
-            self._clap_timer()
-            self._clap_timer = None
+    def _cancel_wave_auto_off(self) -> None:
+        if self._wave_timer is not None:
+            self._wave_timer()
+            self._wave_timer = None
 
     def _cancel_rate_probe(self) -> None:
         if self._rate_timer is not None:
@@ -811,13 +811,13 @@ class MotionManager:
         self._set_streaming(False)
         self._request_refresh()
 
-    def async_notify_clap_finished(self) -> None:
-        """Called once the clap task has returned: restore normal behaviour."""
-        self._clap_session = None
-        self._cancel_clap_auto_off()
-        if self._want_clap:
+    def async_notify_wave_finished(self) -> None:
+        """Called once the wave task has returned: restore normal behaviour."""
+        self._wave_session = None
+        self._cancel_wave_auto_off()
+        if self._want_wave:
             # The client gave up on its own, so the switch must not stay on.
-            self._want_clap = False
+            self._want_wave = False
         self._set_listening(False)
         self._request_refresh()
 
@@ -825,11 +825,11 @@ class MotionManager:
         if self.is_listening == listening:
             return
         self.is_listening = listening
-        for listener in list(self._clap_state_listeners):
+        for listener in list(self._wave_state_listeners):
             try:
                 listener(listening)
             except Exception:  # noqa: BLE001
-                LOGGER.exception("Colmi ring clap state listener raised")
+                LOGGER.exception("Colmi ring wave state listener raised")
 
     def _request_refresh(self) -> None:
         """Kick the coordinator now that the ring is free again.

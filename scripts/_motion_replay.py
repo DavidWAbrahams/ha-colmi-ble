@@ -70,13 +70,13 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
     parse_accel_packet,
 )
 from custom_components.colmi_ring.gestures import (  # noqa: E402
-    GESTURE_CLAP,
     GESTURE_LOWER,
     GESTURE_RAISE,
+    GESTURE_WAVE,
     GestureDetector,
 )
 
-ALL_GESTURES = (GESTURE_CLAP, GESTURE_RAISE, GESTURE_LOWER)
+ALL_GESTURES = (GESTURE_WAVE, GESTURE_RAISE, GESTURE_LOWER)
 
 
 @dataclass(slots=True)
@@ -176,10 +176,10 @@ def report_signal(rows: list[Row]) -> None:
 
 
 def run_detector(
-    rows: list[Row], sensitivity: float, stream_clap: bool
+    rows: list[Row], sensitivity: float, stream_wave: bool
 ) -> dict[str, list[float]]:
     """Feed the whole capture through one detector; return fire times."""
-    detector = GestureDetector(sensitivity=sensitivity, stream_clap=stream_clap)
+    detector = GestureDetector(sensitivity=sensitivity, stream_wave=stream_wave)
     fired: dict[str, list[float]] = {gesture: [] for gesture in ALL_GESTURES}
     for row in rows:
         for event in detector.feed(row.sample, now=row.t):
@@ -252,9 +252,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="detector sensitivity multiplier (higher fires sooner)",
     )
     parser.add_argument(
-        "--no-stream-clap",
+        "--no-stream-wave",
         action="store_true",
-        help="disable the stream-derived clap detector",
+        help="disable the stream-derived wave detector",
     )
     parser.add_argument(
         "--resample",
@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n## Events")
     if not any(math.isfinite(row.sample.x) for row in rows):
         print("  non-finite samples present; results are meaningless")
-    fired = run_detector(rows, args.sensitivity, not args.no_stream_clap)
+    fired = run_detector(rows, args.sensitivity, not args.no_stream_wave)
     report_gestures(fired)
 
     if args.plot_out is not None and not args.events_only:

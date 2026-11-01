@@ -15,7 +15,7 @@ from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
 from .backfill import BackfillManager
-from .const import DOMAIN, LOGGER
+from .const import CONF_WAVE_TIMEOUT, DOMAIN, LOGGER
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
 from .motion_manager import MotionManager
@@ -31,11 +31,44 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.NUMBER,
     # The platforms decide for themselves what to create: the stream switch is
-    # behind the motion option, while the clap switch and the gesture events are
-    # offered either way, since a clap has its own source.
+    # behind the motion option, while the wave switch and the gesture events are
+    # offered either way, since a wave has its own source.
     Platform.SWITCH,
     Platform.EVENT,
 ]
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant,
+    entry: ColmiRingConfigEntry,
+) -> bool:
+    """Migrate an old config entry to the current version.
+
+    Version 2 renamed the clap gesture to wave, including the persisted
+    auto-off option key; move the stored value so the user's setting
+    survives the rename. (The gesture/switch entity unique ids also
+    changed, which orphans the old entities; HA recreates the new ones,
+    and the old leftovers can be removed from the UI.)
+    """
+    if entry.version > 1:
+        # Downgrade or already current: nothing to do.
+        return True
+
+    old_options = dict(entry.options)
+    new_options = dict(old_options)
+    if "clap_timeout" in new_options:
+        new_options[CONF_WAVE_TIMEOUT] = new_options.pop("clap_timeout")
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options=new_options,
+        version=2,
+    )
+    LOGGER.info(
+        "Config entry %s migrated to version 2 (clap gesture renamed to wave)",
+        entry.entry_id,
+    )
+    return True
 
 
 # https://developers.home-assistant.io/docs/config_entries_index/#setting-up-an-entry
