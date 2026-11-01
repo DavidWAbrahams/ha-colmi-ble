@@ -2,8 +2,8 @@
 """Synthesise a labelled accelerometer stream and replay it through the detector.
 
 A hardware-free check that the gesture thresholds do something sensible: it
-writes a CSV of a resting wrist, a wave, a fast hand raise and a fast hand
-lower, then (unless ``--out`` is given) feeds it straight to
+writes a CSV of a resting wrist, a wave-shaped impulse, a fast hand raise and
+a fast hand lower, then (unless ``--out`` is given) feeds it straight to
 :mod:`scripts/_motion_replay.py`'s machinery and prints what fires.
 
     python scripts/_motion_synth.py                 # generate + report
@@ -95,7 +95,9 @@ def build() -> list[tuple[float, float, float, float]]:
 
     hold(2.0, rest)
 
-    # Wave: a hard, very short spike with no change in wrist orientation.
+    # Wave-shaped impulse: a hard, very short spike with no change in wrist
+    # orientation. The stream no longer derives waves (the ring's own detector
+    # reports those), so this must fire nothing here.
     for _ in range(2):
         t = _push(rows, t, rest, 1.0, 2.4)
     hold(0.06, rest)
@@ -146,8 +148,8 @@ def build_negatives() -> list[tuple[float, float, float, float]]:
 
     hold(2.0, rest)
 
-    # 1. Sustained clench / swung arm: high acceleration, but far too wide to
-    #    be a wave, and with no pitch change it is no gesture either.
+    # 1. Sustained clench / swung arm: high acceleration, but with no pitch
+    #    change it is no gesture.
     hold(0.6, rest, linear=1.8)
     hold(2.0, rest)
 
@@ -200,9 +202,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sensitivity", type=float, default=1.0)
     parser.add_argument(
-        "--no-stream-wave", action="store_true", help="disable the stream wave"
-    )
-    parser.add_argument(
         "--scenario",
         choices=("gestures", "negatives"),
         default="gestures",
@@ -224,12 +223,12 @@ def main(argv: list[str] | None = None) -> int:
     rows = to_rows(raw)
     report_signal(rows)
     expectation = (
-        "one wave, one hand_raise, one hand_lower"
+        "one hand_raise, one hand_lower"
         if args.scenario == "gestures"
         else "none at all"
     )
     print(f"\n## Events (expect {expectation})")
-    fired = run_detector(rows, args.sensitivity, not args.no_stream_wave)
+    fired = run_detector(rows, args.sensitivity)
     report_gestures(fired)
     return 0
 

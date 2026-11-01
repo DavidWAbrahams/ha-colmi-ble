@@ -510,16 +510,6 @@ class MotionManager:
                 magnitude,
                 self._unknown_summary(),
             )
-        elif self._detector.rate_is_too_low():
-            self._detector.stream_wave = False
-            LOGGER.info(
-                "Colmi ring motion stream: %.1f Hz over %d samples%s; too slow to"
-                " detect a wave from the accelerometer, so a wave can only come"
-                " from the Wave Detection switch",
-                rate,
-                self._detector.samples_seen,
-                magnitude,
-            )
         else:
             LOGGER.info(
                 "Colmi ring motion stream: %.1f Hz over %d samples%s",
@@ -539,13 +529,12 @@ class MotionManager:
     def _on_packet(self, packet: bytearray) -> None:
         """Feed one notification from the stream into the detector.
 
-        A wave is not reported from here. The ring only announces its own wave
-        while camera mode is armed and nothing else is holding the accelerometer,
-        so waves come from the Wave Detection switch instead (see
-        ``MOTION_MIN_HZ_FOR_STREAM_WAVE`` for why the samples cannot yield one).
-        A gesture frame that does turn up mid-stream is still worth one DEBUG
-        line, because how the two modes interact is exactly what a report here
-        would tell us - but it is not published, so one wave cannot fire twice.
+        A wave is not reported from here. Waves come from the ring's own
+        detector, via the Wave Detection switch, which is a separate session
+        because that mode does not coexist with RAW streaming. A gesture frame
+        that does turn up mid-stream is still worth one DEBUG line, because how
+        the two modes interact is exactly what a report here would tell us - but
+        it is not published, so one wave cannot fire twice.
         """
         if parse_gesture_packet(packet) is not None:
             LOGGER.debug(

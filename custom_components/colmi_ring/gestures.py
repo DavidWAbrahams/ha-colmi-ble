@@ -47,7 +47,6 @@ from .const import (
     MOTION_GRAVITY_FAST_TAU_S,
     MOTION_GRAVITY_TAU_S,
     MOTION_GRAVITY_TRUST_G,
-    MOTION_MIN_HZ_FOR_STREAM_WAVE,
     MOTION_PITCH_RECENT_WINDOW_S,
     MOTION_RAISE_MAX_PEAK_S,
     MOTION_RAISE_PITCH_DEG,
@@ -59,15 +58,6 @@ from .const import (
     MOTION_VERTICAL_SNAP_TAU_S,
     MOTION_VERTICAL_TAU_S,
     MOTION_VERTICAL_TRUST_G,
-    MOTION_WAVE_MAX_WIDTH_S,
-    MOTION_WAVE_QUIET_BAND_G,
-    MOTION_WAVE_QUIET_S,
-    MOTION_WAVE_REFRACTORY_S,
-    MOTION_WAVE_RING_DOWN_FRACTION,
-    MOTION_WAVE_RING_DOWN_S,
-    MOTION_WAVE_RISE_S,
-    MOTION_WAVE_SETTLE_S,
-    MOTION_WAVE_SPIKE_G,
 )
 
 if TYPE_CHECKING:
@@ -89,11 +79,6 @@ _BUFFER_S = 2.5
 # before it will arm again. Without it, the braking at the top of a raise reads
 # as a lower.
 _REARM_FRACTION = 0.3
-
-# An impulse counts as over once the magnitude falls back to this fraction of
-# the wave threshold. Used both to time how fast a spike rises and to decide
-# when an impulse above the threshold has ended.
-_WAVE_LOW_FRACTION = 0.4
 
 # Below this gravity magnitude the vector is too noisy to define "up".
 _MIN_GRAVITY_G = 0.35
@@ -129,17 +114,6 @@ class _Movement:
     peak_time: float
 
 
-def _is_still(magnitude_g: float) -> bool:
-    """True if a raw magnitude says the ring is not accelerating.
-
-    Judged on the magnitude rather than the gravity-projected acceleration on
-    purpose: gravity is only an estimate, and twice per cycle a vibration's
-    projected acceleration dips back through zero while its magnitude says
-    undeniably "this hand is moving".
-    """
-    return abs(magnitude_g - 1.0) <= MOTION_WAVE_QUIET_BAND_G
-
-
 def _unit(vector: AccelSample) -> AccelSample | None:
     magnitude = vector.magnitude_g
     if magnitude < _MIN_GRAVITY_G:
@@ -156,42 +130,18 @@ def _angle_deg(a: AccelSample, b: AccelSample) -> float:
 class GestureDetector:
     """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`."""
 
-    def __init__(self, sensitivity: float = 1.0, stream_wave: bool = True) -> None:
+    def __init__(self, sensitivity: float = 1.0) -> None:
         """Create a detector.
 
         ``sensitivity`` divides the thresholds (higher = more sensitive).
-        ``stream_wave`` enables the stream-derived wave; it is off unless the
-        measured sample rate can actually resolve a wave impulse.
         """
         self._sensitivity = sensitivity if sensitivity > 0 else 1.0
-        self.stream_wave = stream_wave
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
         self._velocity = 0.0
         self._dt_ema: float | None = None
         self._last_sample: float | None = None
-
-        # Wave impulse state machine. ``_rise_start`` is the last time the
-        # |linear| signal sat below the low mark, so the next crossing can be
-        # timed; ``_impulse_peak`` is non-None while a candidate impulse is
-        # open, i.e. between crossing the threshold and falling back down.
-        self._rise_start: float | None = None
-        self._impulse_peak: float | None = None
-        self._impulse_start = 0.0
-
-        # Stillness, tracked on the raw magnitude: ``_still_start`` is the start
-        # of a run of non-accelerating samples still in progress, and
-        # ``_quiet_len`` how long the most recent completed run lasted.
-        self._still_start: float | None = None
-        self._quiet_len = 0.0
-
-        # A finished impulse is not reported until the hand has rung down
-        # (see ``_resolve_pending_wave``), so it waits here with the time it
-        # completed and the start of its current quiet stretch.
-        self._pending: GestureEvent | None = None
-        self._pending_since = 0.0
-        self._ring_down_since: float | None = None
 
         # When the vertical velocity was last negligible, so the next movement
         # can be timed from the start of its acceleration.
@@ -211,10 +161,6 @@ class GestureDetector:
     @property
     def _velocity_threshold(self) -> float:
         return MOTION_RAISE_VELOCITY_G_S / self._sensitivity
-
-    @property
-    def _wave_threshold(self) -> float:
-        return MOTION_WAVE_SPIKE_G / self._sensitivity
 
     @property
     def _pitch_threshold_deg(self) -> float:
@@ -245,24 +191,6 @@ class GestureDetector:
         return statistics.median(
             [sample.magnitude_g for _, sample in self._samples]
         )
-
-    @property
-    def stream_wave_supported(self) -> bool:
-        """True once the measured rate can resolve a wave impulse.
-
-        Before any samples arrive this reports False; callers that want to
-        decide configuration should use :meth:`rate_is_too_low` instead, which
-        distinguishes "not yet known" from "measured too slow".
-        """
-        rate = self.sample_rate_hz
-        return self.stream_wave and rate is not None and rate >= (
-            MOTION_MIN_HZ_FOR_STREAM_WAVE
-        )
-
-    def rate_is_too_low(self) -> bool:
-        """True when the stream is definitely too slow for a stream wave."""
-        rate = self.sample_rate_hz
-        return rate is not None and rate < MOTION_MIN_HZ_FOR_STREAM_WAVE
 
     # -- main entry point -------------------------------------------------
 
@@ -318,43 +246,11 @@ class GestureDetector:
         self._velocity = self._integrate(vertical, dt)
         self.last_velocity_g_s = self._velocity
 
-        self._track_still(_is_still(sample.magnitude_g), now)
-        if self.stream_wave_supported:
-            settled = self._resolve_pending_wave(peak, now)
-            if settled is not None:
-                events.append(settled)
-            candidate = self._check_wave(peak, now)
-            if candidate is not None:
-                self._pending = candidate
-                self._pending_since = now
-                self._ring_down_since = None
-
         events.extend(self._check_vertical(now))
 
         self.events_seen += len(events)
         self.samples_seen += 1
         return events
-
-    def on_device_gesture(self, now: float | None = None) -> GestureEvent:
-        """Report a gesture the ring detected itself (a wave).
-
-        The on-device detector owns its own debouncing, and it is the preferred
-        wave source because it needs no continuous connection, so this bypasses
-        our thresholds; it does still respect the shared cooldown so one wave
-        cannot produce both a ring and a stream event.
-        """
-        if now is None:
-            now = time.monotonic()
-        self.last_peak_g = max(self.last_peak_g, self._wave_threshold)
-        event = GestureEvent(
-            gesture=GESTURE_WAVE,
-            source=SOURCE_RING,
-            peak_g=self.last_peak_g,
-            velocity_g_s=0.0,
-        )
-        self._record_fire(GESTURE_WAVE, now)
-        self.events_seen += 1
-        return event
 
     def reset(self) -> None:
         """Forget everything (call when a stream session restarts)."""
@@ -363,14 +259,6 @@ class GestureDetector:
         self._velocity = 0.0
         self._dt_ema = None
         self._last_sample = None
-        self._rise_start = None
-        self._impulse_peak = None
-        self._impulse_start = 0.0
-        self._still_start = None
-        self._quiet_len = 0.0
-        self._pending = None
-        self._pending_since = 0.0
-        self._ring_down_since = None
         self._last_slow_time = None
         self._last_fire.clear()
         self._last_any_fire = None
@@ -420,133 +308,6 @@ class GestureDetector:
             return self._velocity
         decayed = self._velocity * math.exp(-dt / MOTION_VELOCITY_LEAK_TAU_S)
         return decayed + vertical * dt
-
-    def _check_wave(self, peak: float, now: float) -> GestureEvent | None:
-        """Short, sharp, self-limiting spike: the stream-derived wave.
-
-        A peak threshold alone cannot tell a wave from a forceful arm
-        movement, so the impulse is judged by its shape:
-
-        * it must reach the threshold from well below within
-          ``MOTION_WAVE_RISE_S``,
-        * it must fall back down again within ``MOTION_WAVE_MAX_WIDTH_S``, and
-        * the hand must have been *still* immediately before it.
-
-        A wave impulse lasts tens of milliseconds; a clench or a swung arm
-        holds the acceleration high for hundreds, so the gesture is reported on
-        the falling edge, a sample or two after the wave itself. The stillness
-        requirement is the only test that rejects a vibration: each half-cycle
-        of a shake rises and falls fast enough to look like an impulse, so
-        without it a shaking hand reports a machine-gun of waves.
-        """
-        if self._impulse_peak is None:
-            self._open_impulse(peak, now)
-            return None
-        return self._finish_impulse(peak, now)
-
-    def _track_still(self, still: bool, now: float) -> None:
-        """Time runs of non-accelerating samples, for the wave's stillness test.
-
-        ``_quiet_len`` is the length of the still run that ended on this sample,
-        and is zeroed on every later one: only stillness *immediately* before a
-        spike counts as stillness. Carrying an old run along would let the last
-        half-cycle of a vibration pass for a wave, since nothing interrupts a
-        sustained shake long enough to start a new run.
-        """
-        if still:
-            if self._still_start is None:
-                self._still_start = now
-            return
-        if self._still_start is not None:
-            self._quiet_len = now - self._still_start
-            self._still_start = None
-        else:
-            self._quiet_len = 0.0
-
-    def _open_impulse(self, peak: float, now: float) -> None:
-        """Start tracking an impulse once a still hand accelerates sharply."""
-        threshold = self._wave_threshold
-        if peak < threshold:
-            if peak < threshold * _WAVE_LOW_FRACTION:
-                # Comfortably low: a rise from here can be timed.
-                self._rise_start = now
-            return
-
-        if self._quiet_len < MOTION_WAVE_QUIET_S:
-            # The hand was already moving. Without this test a vibration reads
-            # as a machine-gun of well-shaped impulses, because each half-cycle
-            # rises fast and falls fast; a wave is preceded by a still hand.
-            self._rise_start = None
-            return
-        if self._rise_start is None or (now - self._rise_start) > MOTION_WAVE_RISE_S:
-            # Rose slowly, or we joined mid-rise: not an impulse. Stays closed
-            # until the signal drops below the low mark again.
-            self._rise_start = None
-            return
-
-        self._impulse_peak = peak
-        self._impulse_start = now
-
-    def _finish_impulse(self, peak: float, now: float) -> GestureEvent | None:
-        """Return the impulse as a candidate once it falls back down."""
-        self._impulse_peak = max(self._impulse_peak, peak)
-        if peak >= self._wave_threshold * _WAVE_LOW_FRACTION:
-            if now - self._impulse_start > MOTION_WAVE_MAX_WIDTH_S:
-                self._close_impulse()  # held too long to be a wave
-            return None
-
-        peak_g = self._impulse_peak or 0.0
-        width = now - self._impulse_start
-        self._close_impulse()
-        self._rise_start = now
-        if width > MOTION_WAVE_MAX_WIDTH_S:
-            return None
-        return GestureEvent(
-            gesture=GESTURE_WAVE,
-            source=SOURCE_STREAM,
-            peak_g=round(peak_g, 3),
-            velocity_g_s=0.0,
-        )
-
-    def _resolve_pending_wave(self, peak: float, now: float) -> GestureEvent | None:
-        """Award a completed impulse only once the hand has rung down.
-
-        A wave and the first half-cycle of a shake have near-identical shapes
-        while they happen, but a wave is followed by a coasting hand (constant
-        velocity is no acceleration) whereas a shake follows itself with another
-        half-cycle at nearly full amplitude. So the residual must fall to
-        ``MOTION_WAVE_RING_DOWN_FRACTION`` of the impulse's own peak and stay
-        there for ``MOTION_WAVE_SETTLE_S``; failing that within
-        ``MOTION_WAVE_RING_DOWN_S`` discards the candidate. Judged relative to
-        the peak because the back stroke of a real wave, the hand decelerating,
-        is part of the wave. Costs ``MOTION_WAVE_SETTLE_S`` of latency.
-        """
-        event = self._pending
-        if event is None:
-            return None
-
-        if peak > event.peak_g * MOTION_WAVE_RING_DOWN_FRACTION:
-            self._ring_down_since = None
-            if now - self._pending_since > MOTION_WAVE_RING_DOWN_S:
-                self._pending = None
-            return None
-        if self._ring_down_since is None:
-            self._ring_down_since = now
-            return None
-        if now - self._ring_down_since < MOTION_WAVE_SETTLE_S:
-            return None
-
-        self._pending = None
-        self._ring_down_since = None
-        if not self._can_fire(event.gesture, now, MOTION_WAVE_REFRACTORY_S):
-            return None
-        self._record_fire(event.gesture, now)
-        return event
-
-    def _close_impulse(self) -> None:
-        """Forget an impulse that turned out to be too wide to be a wave."""
-        self._impulse_peak = None
-        self._rise_start = None
 
     def _check_vertical(self, now: float) -> list[GestureEvent]:
         """Raise/lower from the vertical velocity, corroborated by the swing.

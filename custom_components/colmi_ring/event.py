@@ -15,11 +15,10 @@ cannot resolve a steady lift or drop (see ``_SUPPRESSED_GESTURES`` in
 ``motion_manager.py``), so publishing them would only produce unreliable
 automations.
 
-The wave can reach us two ways - derived from the RAW stream, or reported by
-the ring's own detector while the Wave Detection switch holds the link - and the
-event data says which via its ``source`` field. The entities are therefore
-created whether or not motion streaming is enabled: a user who only ever turns
-on Wave Detection still needs something to trigger on.
+The wave is reported by the ring's own detector while the Wave Detection switch
+holds the link; the event data's ``source`` field says so via ``ring``. The
+entities are therefore created whether or not motion streaming is enabled: a
+user who only ever turns on Wave Detection still needs something to trigger on.
 """
 
 from __future__ import annotations
@@ -77,7 +76,7 @@ async def async_setup_entry(
 
 
 class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
-    """Fires when this gesture is reported by either source.
+    """Fires when this gesture is reported by the ring.
 
     The entity's own event is named after the gesture, so it can be used as a
     per-gesture automation trigger. The integration *also* fires the

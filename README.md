@@ -69,8 +69,8 @@ action:
       peak_g: "{{ trigger.event.data.peak_g }}"
 ```
 
-The event data includes `gesture`, `source` (`ring` if the ring detected its own wave, `stream` if we
-derived it from the accelerometer), `peak_g` and `velocity_g_s`.
+The event data includes `gesture`, `source` (`ring`, since the wave is detected by the ring's own
+detector), `peak_g` and `velocity_g_s`.
 
 ## Watching the raw accelerometer data
 

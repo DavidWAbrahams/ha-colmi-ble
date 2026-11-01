@@ -132,59 +132,9 @@ MOTION_RAISE_MAX_PEAK_S = 0.6
 MOTION_RAISE_PITCH_DEG = 15.0
 MOTION_PITCH_RECENT_WINDOW_S = 0.25
 
-# Stream-derived wave: a near-instantaneous spike of this much *linear*
-# acceleration (gravity removed), rising within MOTION_WAVE_RISE_S and falling
-# back within MOTION_WAVE_MAX_WIDTH_S. The width limit is what keeps a clench
-# or a swung arm (hundreds of ms of sustained acceleration) from reading as a
-# wave; a wave impulse is tens of milliseconds.
-MOTION_WAVE_SPIKE_G = 1.1
-MOTION_WAVE_RISE_S = 0.15
-MOTION_WAVE_MAX_WIDTH_S = 0.25
-
-# The ring must have been essentially still for this long before the spike.
-# Without it a vibration (a shaking hand, a mower, a steering wheel) reads as a
-# machine-gun of well-shaped impulses, because each half-cycle rises fast and
-# falls fast. A wave is preceded by a still hand.
-MOTION_WAVE_QUIET_S = 0.4
-
-# The hand must also *ring down* after the spike and stay quiet for this long
-# before the wave is reported. This is the test that separates a wave from the
-# first half-cycle of a shake: with a still hand beforehand the two have
-# near-identical shapes, but a wave is followed by a coasting hand (constant
-# velocity is no acceleration) while a shake is followed by more shaking.
-# Costs this much latency.
-MOTION_WAVE_SETTLE_S = 0.2
-
-# How far below its own peak the motion has to fall to count as ringing down, as
-# well as how long it may take to get there. The counter-stroke of a real wave
-# (the hand decelerating) is part of the wave, so an absolute "must be near 1 g"
-# would reject genuine waves; relative to the impulse it still excludes a shake,
-# whose next half-cycle returns at nearly full amplitude.
-MOTION_WAVE_RING_DOWN_FRACTION = 0.25
-
-# How long the impulse is allowed to take ringing down. A wave's own back stroke
-# is over in tens of milliseconds and the hand coasts soon after, so this is
-# generous at well under a second. It matters as much as the fraction: a shake
-# keeps interrupting the ring-down, and without a deadline its very last
-# half-cycle would eventually settle, be awarded the gesture, and be reported a
-# beat after the shaking stopped.
-MOTION_WAVE_RING_DOWN_S = 0.6
-
-# How far the raw magnitude may stray from 1 g and still count as "still" for
-# the window above. Measured on the magnitude rather than the gravity-projected
-# acceleration on purpose: twice per cycle a vibration's linear acceleration
-# dips back through zero, so only the magnitude says undeniably "this hand is
-# moving". Deliberately generous, since a real wrist at rest is not perfectly
-# quiet; tighten against captured data.
-MOTION_WAVE_QUIET_BAND_G = 0.15
-
-# A wave impulse lasts a few tens of ms and two waves in a row are a
-# deliberate double-wave, not one gesture.
-MOTION_WAVE_REFRACTORY_S = 0.6
-
 # Minimum interval between reports of the *same* gesture, and the shorter
-# window in which one gesture suppresses the others (a hard raise can also
-# look like a wave).
+# window in which one gesture suppresses the others (a hard raise ends with a
+# lower, and either can bleed into the other's window).
 MOTION_GESTURE_COOLDOWN_S = 1.2
 MOTION_GESTURE_SUPPRESS_S = 0.5
 
@@ -242,20 +192,11 @@ MOTION_VERTICAL_DEADBAND_DEG = 1.5
 # that session's normal state, often for hours at a time.
 MOTION_STREAM_SILENCE_TIMEOUT_S = 30.0
 
-# Below this measured sample rate the stream cannot resolve a wave's ~50 ms
-# impulse, so the stream-derived wave detector stays off. Measured on stock R02
-# firmware, which streams at exactly 1 Hz, so in practice this always trips and a
-# wave then has to come from the ring's own detector, via the Wave Detection
-# switch - which is a separate session, because that mode does not coexist with
-# RAW streaming.
-MOTION_MIN_HZ_FOR_STREAM_WAVE = 15.0
-
 # Minimum seconds between published waves from the ring's own detector.
 #
 # The detector is in the firmware, so a burst of report packets for one wave is
-# something we can only smooth here: ``GestureDetector.on_device_gesture`` has no
-# cooldown of its own (it is a report translation, not a detector), so without
-# this a ring that repeats itself fires one HA event per packet. Set below the
-# gap a deliberate double-wave has in practice, so two real waves stay two
-# events.
+# something we can only smooth here: ``MotionManager._on_wave_packet`` is a
+# report translation, not a detector, so without this a ring that repeats itself
+# fires one HA event per packet. Set below the gap a deliberate double-wave has
+# in practice, so two real waves stay two events.
 WAVE_REPORT_COOLDOWN_S = 0.8

@@ -7,7 +7,8 @@ Dev-only tool; not part of the integration. It talks to the ring with plain
 gesture implementation:
 
   1. How fast does the ring actually stream position packets (Hz)?  That number
-     decides whether a wave can be derived from the stream at all.
+     decides how usable the RAW stream is for raise/lower and the vertical
+     angle sensor.
   2. Which byte offsets carry the axes, and are the low bits parked in the
      *low* nibble of the following byte (what the demo masks with ``& 0xf``) or
      the high nibble (what other reverse-engineerings assume)?
@@ -522,8 +523,7 @@ def report_camera_gesture(capture: Capture) -> None:
         print(
             "    No 0x02 packet either way, so this firmware appears to have no"
             " camera-button gesture at all: the Wave Detection switch will turn"
-            " itself off, and a wave could only be derived from a fast enough RAW"
-            " stream."
+            " itself off, and this ring has no wave source."
         )
     else:
         print(
