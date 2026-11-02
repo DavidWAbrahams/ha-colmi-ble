@@ -3,6 +3,9 @@ Integrate the Colmi line of smart rings with Home Assistant.
 Colmi rings (like the R02, R06, R10 etc) can be found for udner $20 on AliExpress.
 It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
 
+There is also partial support for some clones that are sold interchangably on AliExpress, i.e. the YCBT R20 and R99. I've been burned by sellers mislabeling their
+product and wanted something to work for you in that case.
+
 # How?
 Home Assistant will periodically pull data from your ring via Bluetooth Low Energy.
 This is built on top of tahnok's Python API (https://github.com/tahnok/colmi_r02_client) and ludeeus's Home Assistant Integration blueprint (https://github.com/ludeeus/integration_blueprint)
