@@ -168,6 +168,12 @@ async def async_unload_entry(
     motion = entry.runtime_data.motion
     if motion is not None:
         await motion.async_shutdown()
+    # The Colmi client keeps its shared link open after its last user leaves
+    # (the sessions above are gone by now); close it rather than let the idle
+    # timer hold a GATT connection for a dead entry.
+    client = entry.runtime_data.client
+    if isinstance(client, ColmiRingApiClient):
+        await client.async_close()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

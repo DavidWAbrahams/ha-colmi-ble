@@ -70,9 +70,10 @@ CONF_STEPS_BACKFILL = "steps_backfill"
 # custom event of the same name.
 GESTURE_EVENT_TYPE = "colmi_ring_gesture"
 
-# Everything that needs to open a connection of its own refuses with these while
-# a session holds the ring's single GATT link (see MotionManager). One message
-# per kind of session, so the refusal names the switch to turn off.
+# The two sessions refuse each other with these (see MotionManager): RAW mode
+# takes the accelerometer for itself and silences the ring's camera-gesture
+# reports, so the modes cannot run at once even though they now share one link.
+# One message per kind of session, so the refusal names the switch to turn off.
 STREAM_BUSY_MESSAGE = "Unavailable while the motion stream is on"
 WAVE_BUSY_MESSAGE = "Unavailable while wave detection is on"
 

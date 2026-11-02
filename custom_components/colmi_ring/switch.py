@@ -1,17 +1,19 @@
 """Switch platform for colmi_ring: the two things that hold the ring's link.
 
-``Motion Stream`` holds the ring's single Bluetooth link open and streams raw
-accelerometer data, which is what makes gesture detection possible and is also
-why it is opt-in: normal polling stops for the duration and the ring's battery
-drains noticeably faster. The integration turns it off by itself after the
-configured timeout (see ``MotionManager``).
+``Motion Stream`` takes the ring's shared Bluetooth link for itself and streams
+raw accelerometer data, which is what makes gesture detection possible and is
+also why it is opt-in: normal polling stops for the duration and the ring's
+battery drains noticeably faster. The integration turns it off by itself after
+the configured timeout (see ``MotionManager``).
 
-``Wave Detection`` holds that same link without streaming, so the ring's own
-on-device wave detector has a central to report to. It costs less than the
-stream but freezes the sensors for as long as it is on, so it gets its own,
-longer auto-off. The two are mutually exclusive: one link, one session, so
-turning one on while the other runs raises rather than silently killing the
-user's session.
+``Wave Detection`` keeps that same link open without streaming, so the ring's
+own on-device wave detector has a central to report to. It costs less than the
+stream and *shares* the link: polling and the ring's buttons keep working
+while it is on, queueing briefly behind its arm/disarm writes. It still gets
+its own, longer auto-off. The two sessions are mutually exclusive with each
+other, though: RAW mode takes the accelerometer and silences the ring's
+gesture reports, so turning one on while the other runs raises rather than
+silently killing the user's session.
 
 Both report the state of their session rather than the last request, so if the
 ring refuses to connect, or an auto-off timer fires, or a reload shuts a

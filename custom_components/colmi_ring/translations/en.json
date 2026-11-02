@@ -31,7 +31,7 @@
                     "motion_enabled": "Enable gesture detection (adds a Motion Stream switch that detects gestures from the ring's live accelerometer stream; streaming pauses normal polling and uses more battery)",
                     "gesture_sensitivity": "Gesture sensitivity",
                     "motion_stream_timeout": "Turn the motion stream off automatically after this many minutes (0 = leave it on until switched off)",
-                    "wave_timeout": "Turn wave detection off automatically after this many minutes (0 = leave it on until switched off). Heart rate, battery and steps stop updating while it is on",
+                    "wave_timeout": "Turn wave detection off automatically after this many minutes (0 = leave it on until switched off). Heart rate, battery and steps keep updating while it is on",
                     "motion_sensor_update_s": "Minimum seconds between accelerometer sensor updates (0 = update for every sample the ring sends; each update is a history row)",
                     "motion_log_samples": "Log every accelerometer sample to the debug log (for tuning gestures)"
                 }

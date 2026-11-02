@@ -8,7 +8,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import STREAM_BUSY_MESSAGE, WAVE_BUSY_MESSAGE
+from .const import STREAM_BUSY_MESSAGE
 from .coordinator import ColmiRingDataUpdateCoordinator
 
 if TYPE_CHECKING:
@@ -36,16 +36,15 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         return self.coordinator.motion
 
     def _assert_ring_free(self) -> None:
-        """Refuse a ring command while a session owns the connection.
+        """Refuse a ring command while the motion stream owns the connection.
 
-        The ring answers exactly one central, so a button press while the
-        stream or the wave listener holds the link would either fail confusingly
-        or tear that session down; better to say so plainly and name the switch
-        to turn off.
+        RAW mode takes the ring's single sensor pipeline for itself, so a button
+        press while the stream holds the link exclusively would fail confusingly
+        or tear the session down; better to say so plainly and name the switch to
+        turn off. Wave detection is deliberately absent: it shares the link, so
+        commands just queue briefly behind its arm/disarm writes.
         """
         motion = self._motion_manager()
         if motion is None or not motion.holds_link:
             return
-        raise HomeAssistantError(
-            WAVE_BUSY_MESSAGE if motion.is_listening else STREAM_BUSY_MESSAGE
-        )
+        raise HomeAssistantError(STREAM_BUSY_MESSAGE)

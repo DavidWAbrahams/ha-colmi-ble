@@ -120,13 +120,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> Any:
         """Update data via library (merging persisted on-demand readings)."""
         if self.motion is not None and self.motion.holds_link:
-            # One of the two switches holds the ring's single GATT link - the
-            # RAW motion stream, or the wave listener that keeps a quiet
-            # connection open so the ring's own detector has a central to
-            # report to. Rather than fight either for the connection, keep the
+            # The RAW motion stream holds the ring's single GATT link
+            # exclusively. Rather than fight it for the connection, keep the
             # last known values and resume as soon as it closes (the manager
             # refreshes us). History backfill pauses too, which is harmless: it
             # is idempotent and picks the backlog up on the next real poll.
+            # Wave detection is deliberately absent from this gate: it shares
+            # the link, and its commands only queue briefly behind the link's
+            # transaction lock.
             return self.data
         hr_enabled, steps_enabled, include_previous_day = (
             await self._async_backfill_flags()
@@ -138,10 +139,12 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 )
             )
         except ColmiRingApiClientBusyError:
-            # The motion stream claimed the ring's one link between the gate
-            # above and here: toggling it on races a poll already in flight.
-            # That is not a fault to report, so keep the last known values and
-            # let the next poll proceed normally.
+            # The link was busy for longer than the poll's short wait: the
+            # motion stream claimed it between the gate above and here
+            # (toggling it on races a poll already in flight), or a wave
+            # arm/disarm write is just finishing. That is not a fault to
+            # report, so keep the last known values and let the next poll
+            # proceed normally.
             LOGGER.debug(
                 "Colmi ring poll skipped: the ring is busy with another session"
             )

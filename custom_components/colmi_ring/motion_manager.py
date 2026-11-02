@@ -1,19 +1,21 @@
 """Owns the ring's two long-lived sessions and publishes what they report.
 
 The manager is the only place that knows a session is open, which matters
-because the ring serves a single central: while either the RAW motion stream or
-the wave listener holds the link, the data coordinator performs no BLE I/O at
-all (see its ``_async_update_data`` gate), so this class is also what tells the
-coordinator to pause and resume.
+because the ring serves a single central: while the RAW motion stream holds the
+link exclusively, the data coordinator performs no BLE I/O at all (see its
+``_async_update_data`` gate), so this class is also what tells the coordinator
+to pause and resume. Wave detection, by contrast, shares the link: its reports
+arrive as notifications and its occasional arm/disarm writes queue behind the
+link's transaction lock, so polling continues while it is on.
 
 Lifecycle
 ---------
 ``async_start`` and :meth:`async_start_waves` flip :attr:`is_streaming` and
-:attr:`is_listening` *before* the connection is opened and clear the published
-heart rate, so nothing can race a poll onto the link, and so a frozen heart rate
-can never be mistaken for a live one. ``async_stop`` and
+:attr:`is_listening` *before* the connection is opened; the stream also clears
+the published heart rate, so nothing can race a poll onto the link and a frozen
+heart rate can never be mistaken for a live one. ``async_stop`` and
 :meth:`async_stop_waves` (or the matching auto-off timer) end the session; when
-the task finally returns, the coordinator is refreshed so the frozen sensors are
+the task finally returns, the coordinator is refreshed so any frozen sensors are
 replaced with real data.
 
 Everything here runs on the Home Assistant event loop. Packets arrive from a
@@ -258,10 +260,11 @@ class MotionManager:
     async def async_start(self) -> None:
         """Open the stream. Safe to call when it is already running.
 
-        Raises :class:`HomeAssistantError` while wave detection is on: the ring
-        serves a single central, so the stream cannot have the link the listener
-        is holding - and its camera mode does not report while RAW mode owns the
-        accelerometer either.
+        Raises :class:`HomeAssistantError` while wave detection is on. This is a
+        firmware mode conflict, not a link conflict: RAW mode takes over the
+        accelerometer, and the ring stops announcing camera gestures while it is
+        on - so a stream layered onto a live wave listener would silently break
+        the gestures the user enabled.
         """
         if self._want_stream:
             return
@@ -346,7 +349,11 @@ class MotionManager:
     # -- wave detection -----------------------------------------------------
 
     async def async_start_waves(self) -> None:
-        """Hold the link so the ring's own wave detector can reach us.
+        """Hold a shared lease so the ring's own wave detector can reach us.
+
+        Unlike the stream this coexists with polling and the ring's buttons:
+        wave reports arrive as notifications, and the occasional command only
+        needs the link's transaction lock for a moment.
 
         Safe to call when it is already listening. Raises
         :class:`HomeAssistantError` while the motion stream is running, for the
@@ -358,12 +365,7 @@ class MotionManager:
             raise HomeAssistantError(STREAM_BUSY_MESSAGE)
 
         self._want_wave = True
-        # Set before connecting, like the stream does: the coordinator stops
-        # polling and the ring's buttons refuse to fire for as long as the link
-        # is ours, and a heart rate frozen at its last value must not read
-        # as live.
         self._set_listening(True)
-        self._coordinator.async_clear_heart_rate()
         self._last_wave_at = 0.0
         self._wave_reports = 0
 
@@ -481,7 +483,9 @@ class MotionManager:
             session.request_stop("user")
             return
         self._wave_session = session
-        LOGGER.info("Colmi ring wave detection open; polling is paused")
+        LOGGER.info(
+            "Colmi ring wave detection open; polling continues on the shared link"
+        )
         self._schedule_wave_auto_off()
 
     def _async_check_rate(self, _now: Any) -> None:
@@ -763,12 +767,13 @@ class MotionManager:
 
     @property
     def holds_link(self) -> bool:
-        """True while either session owns the ring's single GATT link.
+        """True while the RAW stream exclusively owns the ring's GATT link.
 
-        This is what the coordinator and the ring's buttons are gated on: neither
-        session can coexist with a poll, so both have to answer for it.
+        This is what the coordinator and the ring's buttons are gated on. Wave
+        detection no longer appears here: it shares the link, and its reports
+        are notifications that never block a poll.
         """
-        return self.is_streaming or self.is_listening
+        return self.is_streaming
 
     def _set_streaming(self, streaming: bool) -> None:
         if self.is_streaming == streaming:

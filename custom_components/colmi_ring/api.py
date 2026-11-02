@@ -22,7 +22,6 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from types import TracebackType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from bleak import BleakClient
@@ -67,23 +66,32 @@ UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 # proxy, so we raise it.
 REPLY_TIMEOUT = 10.0
 
-# How long each kind of session will wait for the ring's single GATT link.
+# How long each kind of caller will wait for the ring's shared link.
 #
-# A poll in flight must not queue behind an open stream: the ring has no spare
-# link, so waiting would only block the coordinator for the whole session. It
-# fails fast instead and the caller keeps its last known data.
+# Under the shared link (see ``SharedLink``) a caller never waits behind a
+# whole session, only behind a single command exchange - except against an
+# exclusive lease (the RAW motion stream), which refuses transactions outright
+# rather than making them queue for its lifetime. So a poll fails fast here and
+# the coordinator keeps its last known data.
 POLL_LOCK_WAIT_S = 5.0
-# The reverse case is common and harmless: toggling the stream on lands within a
-# second of the refresh that ran when the previous stream closed, so a poll is
-# mid-flight. Those finish in a few seconds, so the stream waits rather than
-# reporting a failure the user cannot act on.
+# An exclusive lease must let the transaction already in flight finish before it
+# can take the link to itself. Transactions finish in seconds (their commands
+# have their own timeouts), so this generous budget is really for the case
+# where the previous lease's teardown is still unwinding.
 #
-# The wave listener waits this long too, for the same reason: it is the other
-# kind of session that holds the link open indefinitely.
+# The wave listener's ``wait_s`` means the same thing nominally, but a shared
+# lease never waits for the transaction lock; it only names how long its
+# arm/disarm writes (``SharedLink.gate``) will queue behind other traffic.
 STREAM_LOCK_WAIT_S = 90.0
 # Button presses and settings writes come from a person in the UI, so a poll
 # already on the air is worth a short wait rather than an instant refusal.
 USER_LOCK_WAIT_S = 15.0
+# The shared link is opened on demand and closed this long after its last user
+# leaves. Lazy persistence: overlapping callers reuse one connection instead of
+# racing to connect one each, while a ring nobody is talking to costs no more
+# battery than under the old connect-per-session client (10 s comfortably
+# covers a poll's command gaps and a button pressed straight after a refresh).
+LINK_IDLE_DISCONNECT_S = 10.0
 
 
 def _latest_sample_is_zero(
@@ -142,32 +150,26 @@ class ColmiRingApiClientBusyError(ColmiRingApiClientCommunicationError):
 class _RingConnection:
     """A single active GATT connection to the ring, managed by HA's BT stack.
 
-    The ring serves exactly one central, and opening a second connection while
-    one is live does not queue politely - it drops one of the two links. So a
-    connection also holds the client-wide :attr:`_lock` for its whole life,
-    which is what keeps a scheduled poll from tearing down an open motion
-    stream (and vice versa).
+    The ring serves exactly one central, so this integration keeps at most one
+    connection open at a time and lets every caller share it; that sharing -
+    refcounting, the transaction lock, exclusive leases and the idle disconnect
+    - lives in :class:`SharedLink`. This class is pure transport: connect,
+    dispatch, command. Command handlers are installed per *transaction* (see
+    :meth:`begin_transaction`) so stateful multi-packet parsers never leak
+    between the users of one long-lived link.
     """
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        address: str,
-        *,
-        lock: asyncio.Lock | None = None,
-        lock_wait_s: float = POLL_LOCK_WAIT_S,
-        purpose: str = "poll",
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, address: str) -> None:
         """Store the resolved HA instance and the ring MAC address."""
         self._hass = hass
         self._address = address
-        self._lock = lock
-        self._lock_wait_s = lock_wait_s
-        self._purpose = purpose
-        self._locked = False
+        # What the link is being used for right now, for log lines only; the
+        # shared link restamps it as each user takes the transaction lock.
+        self.purpose = "link"
         self._client: BleakClient | None = None
         self._rx_char: BleakGATTCharacteristic | None = None
-        # Fresh, stateful parsers per connection so multi-packet logs don't leak.
+        # Fresh, stateful parsers per *transaction* so multi-packet logs cannot
+        # leak between users of the same link (see begin_transaction).
         self._handlers: dict[int, Callable[[bytearray], Any]] = {}
         self._queues: dict[int, asyncio.Queue] = {}
         # Open-ended streams (the RAW accelerometer) need every packet for a
@@ -233,64 +235,11 @@ class _RingConnection:
                 raise ColmiRingApiClientCommunicationError(msg)
             await asyncio.sleep(self._RESOLVE_POLL_S)
 
-    _LOCK_POLL_S = 0.25
-
-    async def _async_acquire_lock(self) -> None:
-        """Claim the ring's single-link lock, waiting up to the caller's budget.
-
-        Polls :meth:`asyncio.Lock.locked` instead of wrapping ``acquire()`` in a
-        timeout: cancelling an acquire that is queued on the lock can leave the
-        lock held forever, which would silently brick every later session. A
-        free lock is claimed synchronously by the next ``acquire()``, so
-        checking and then acquiring cannot be slipped between, and a caller that
-        must not wait simply runs out its deadline here.
-        """
-        assert self._lock is not None
-        deadline = time.monotonic() + self._lock_wait_s
-        while True:
-            if not self._lock.locked():
-                await self._lock.acquire()
-                self._locked = True
-                return
-            if time.monotonic() >= deadline:
-                msg = (
-                    f"Ring {self._address} is busy with another session"
-                    f" (this one is a {self._purpose})"
-                )
-                raise ColmiRingApiClientBusyError(msg)
-            await asyncio.sleep(self._LOCK_POLL_S)
-
-    def _release_lock(self) -> None:
-        if self._locked and self._lock is not None:
-            self._locked = False
-            self._lock.release()
-
-    async def __aenter__(self) -> _RingConnection:
-        """Take the ring's one link, then resolve + connect through HA's stack."""
-        if self._lock is not None:
-            await self._async_acquire_lock()
-        try:
-            return await self._async_connect()
-        except BaseException:
-            self._release_lock()
-            raise
-
-    async def _async_connect(self) -> _RingConnection:
+    async def connect(self) -> _RingConnection:
         """Resolve + connect the device through HA's Bluetooth stack."""
         # Resolve to HA's BLEDevice so the connection is routed to the
         # adapter / ESPHome proxy that actually sees the ring.
         target: BLEDevice = await self._async_resolve_device()
-
-        self._handlers = {
-            battery.CMD_BATTERY: battery.parse_battery,
-            hr.CMD_READ_HEART_RATE: HeartRateLogParser().parse,
-            hr_settings.CMD_HEART_RATE_LOG_SETTINGS: (
-                hr_settings.parse_heart_rate_log_settings
-            ),
-            real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
-            steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
-        }
-        self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
 
         try:
             self._client = await establish_connection(
@@ -313,34 +262,49 @@ class _RingConnection:
             await self._client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
             self.linked_at = time.monotonic()
         except ColmiRingApiClientError:
-            await self._safe_disconnect()
+            await self.close()
             raise
         except (BleakError, asyncio.TimeoutError, OSError) as err:
-            await self._safe_disconnect()
+            await self.close()
             raise ColmiRingApiClientCommunicationError(
                 f"Could not connect to Colmi ring {self._address}: {err}"
             ) from err
 
         return self
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        """Disconnect and release the GATT connection."""
-        try:
-            await self._safe_disconnect()
-        finally:
-            self._release_lock()
+    def begin_transaction(self) -> None:
+        """Install the command handlers for one transaction on this link.
+
+        Built fresh each time because the log parsers are stateful across the
+        multiple packets of one reply: a parser left over from an earlier user
+        of the shared link could finish a *later* user's log mid-stream. The
+        handlers live only for the transaction that owns the transaction lock,
+        and :meth:`end_transaction` removes them, so a reply that arrives late
+        (after its command already timed out) is just an unexpected packet
+        rather than an answer handed to the wrong caller.
+        """
+        self._handlers = {
+            battery.CMD_BATTERY: battery.parse_battery,
+            hr.CMD_READ_HEART_RATE: HeartRateLogParser().parse,
+            hr_settings.CMD_HEART_RATE_LOG_SETTINGS: (
+                hr_settings.parse_heart_rate_log_settings
+            ),
+            real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
+            steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
+        }
+        self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
+
+    def end_transaction(self) -> None:
+        """Tear down the handlers installed by :meth:`begin_transaction`."""
+        self._handlers = {}
+        self._queues = {}
 
     def _on_disconnect(self, _client: BleakClient) -> None:
         """Best-effort: wake any waiting readers so they don't hang.
 
-        The session *purpose*, who closed the link, and the link's age are in
-        the message because a bare "disconnected" is useless when several
-        sessions share an address: the line that killed the motion stream and
+        The link *purpose*, who closed the link, and the link's age are in the
+        message because a bare "disconnected" is useless when several kinds of
+        caller share an address: the line that killed the motion stream and
         the line for an ordinary poll finishing look identical, and only the
         age distinguishes "dropped by something else 29 ms after opening" from
         "closed normally at the end of a session".
@@ -352,9 +316,9 @@ class _RingConnection:
         )
         who = "closed by us" if self.closing else "DROPPED BY PEER"
         LOGGER.debug(
-            "Colmi ring %s %s session disconnected (%s, %s)",
+            "Colmi ring %s link (%s) disconnected (%s, %s)",
             self._address,
-            self._purpose,
+            self.purpose,
             age,
             who,
         )
@@ -378,7 +342,8 @@ class _RingConnection:
         """Record that motion data just arrived (feeds the stream watchdog)."""
         self.last_motion = time.monotonic()
 
-    async def _safe_disconnect(self) -> None:
+    async def close(self) -> None:
+        """Disconnect the GATT link; safe to call twice or on a dead link."""
         if self._client is None:
             return
         # Set before disconnecting so the callback can tell our own teardown
@@ -423,16 +388,16 @@ class _RingConnection:
             # table, so an unfamiliar one is easier to recognise (and look up)
             # as 0x2F than as 47, and the body is the only evidence available
             # when the ring invents a notification type we have no parser for.
-            # The purpose says *which* session received it - the deciding detail
-            # when a stream and a poll overlap.
+            # The purpose says *what* the link was being used for when it
+            # arrived - the deciding detail when a stream and a poll overlap.
             if not listeners and cmd not in self._logged_unexpected:
                 self._logged_unexpected.add(cmd)
                 LOGGER.debug(
-                    "Unexpected packet type %s (0x%02X) from ring during %s"
-                    " session: %s",
+                    "Unexpected packet type %s (0x%02X) from ring during %s:"
+                    " %s",
                     cmd,
                     cmd,
-                    self._purpose,
+                    self.purpose,
                     packet.hex(),
                 )
             return
@@ -455,16 +420,38 @@ class _RingConnection:
             ) from err
 
     async def _command(self, packet: bytearray, cmd: int) -> Any:
-        """Send a command and await its (final) parsed reply."""
+        """Send a command and await its (final) parsed reply.
+
+        The reply wait races the link's ``dead`` event rather than only the
+        timeout: under the shared link the connection can drop *between*
+        transactions (the peer ends it, or a lease tears it down), and a caller
+        sitting out the full :data:`REPLY_TIMEOUT` for a ring that is already
+        gone would make every retry slower than it needs to be.
+        """
         await self._send(packet)
+        reply = asyncio.ensure_future(self._queues[cmd].get())
+        dropped = asyncio.ensure_future(self.dead.wait())
         try:
-            return await asyncio.wait_for(
-                self._queues[cmd].get(), timeout=REPLY_TIMEOUT
+            done, _ = await asyncio.wait(
+                {reply, dropped}, timeout=REPLY_TIMEOUT
             )
-        except asyncio.TimeoutError as err:
-            raise ColmiRingApiClientCommunicationError(
-                f"Timed out waiting for command {cmd} from ring {self._address}"
-            ) from err
+            if not done:
+                raise ColmiRingApiClientCommunicationError(
+                    f"Timed out waiting for command {cmd} from ring"
+                    f" {self._address}"
+                )
+            if dropped in done:
+                raise ColmiRingApiClientCommunicationError(
+                    f"Link to Colmi ring {self._address} dropped while waiting"
+                    f" for command {cmd}"
+                )
+            return reply.result()
+        finally:
+            # ``asyncio.wait`` leaves the loser running; both waiters are
+            # internal, so cancel whatever is still pending.
+            for waiter in (reply, dropped):
+                if not waiter.done():
+                    waiter.cancel()
 
     async def get_battery(self) -> battery.BatteryInfo:
         """Read the battery level + charging state."""
@@ -599,6 +586,14 @@ class _RingConnection:
         # even if the ring never streams (per-sample timeout stays generous for
         # proxy latency).
         while len(valid) < 6 and empty_waits < 5:
+            # On a shared link the connection can drop mid-measurement; noticing
+            # it here beats timing out five more times on a queue nothing will
+            # ever feed again.
+            if self.dead.is_set():
+                raise ColmiRingApiClientCommunicationError(
+                    f"Link to Colmi ring {self._address} dropped during"
+                    f" real-time {reading_type.name} measurement"
+                )
             try:
                 data: real_time.Reading | real_time.ReadingError = (
                     await asyncio.wait_for(queue.get(), timeout=REPLY_TIMEOUT)
@@ -618,6 +613,266 @@ class _RingConnection:
 
         await self._send(real_time.get_stop_packet(reading_type))
         return valid
+
+
+class SharedLink:
+    """The one GATT link to a ring, shared by every caller in this client.
+
+    The firmware serves a single central, but that is a constraint on the
+    *connection*, not on the callers: command replies correlate by command
+    byte only, so what actually has to be serialised is one command exchange
+    at a time. This class owns that:
+
+    - **Lazy persistence** - the connection is opened on demand by the first
+      user and closed :data:`LINK_IDLE_DISCONNECT_S` after the last one
+      leaves, so overlapping callers reuse one link while an idle ring costs
+      no battery.
+    - **Transactions** (:meth:`acquire`) - take the transaction lock, install
+      fresh command handlers on the connection, run one logical exchange (a
+      poll, a button measurement, a settings write). Callers wait only behind
+      another *exchange*, never a whole session.
+    - **Exclusive leases** (:meth:`hold` with ``exclusive=True``) - the RAW
+      motion stream owns the accelerometer and the ring's attention outright;
+      it parks the transaction lock for its life so transactions refuse fast
+      instead of queueing behind an open-ended session.
+    - **Shared leases** (:meth:`hold` with ``exclusive=False``) - the wave
+      listener just needs the connection to stay up so notifications reach
+      us; transactions keep interleaving around it, and the lease's own
+      arm/disarm writes go through :meth:`gate` so they too are single
+      exchanges rather than an unruly send.
+
+    Reconnect supervision deliberately lives *outside* this class (in the
+    session retry loop): a link that dies is simply discarded by the next
+    :meth:`_ensure_connected`, and whoever was using it fails with a plain
+    communication error.
+    """
+
+    # Same rationale as the old single-link lock: poll ``locked()`` instead of
+    # cancelling a queued acquire, because cancelling an acquire can leave the
+    # lock held forever.
+    _LOCK_POLL_S = 0.25
+
+    def __init__(self, hass: HomeAssistant, address: str) -> None:
+        self._hass = hass
+        self._address = address
+        self._conn: _RingConnection | None = None
+        # Guards connect/disconnect/idle-disconnect so two callers never open
+        # two links to a one-central ring.
+        self._connect_lock = asyncio.Lock()
+        # One command exchange at a time (held for a whole lease when that
+        # lease is exclusive).
+        self._tx_lock = asyncio.Lock()
+        self._users = 0
+        self._exclusive = False
+        self._idle_handle: asyncio.TimerHandle | None = None
+
+    @property
+    def exclusive(self) -> bool:
+        """True while an exclusive lease (the RAW stream) owns the link."""
+        return self._exclusive
+
+    async def _ensure_connected(self, purpose: str) -> _RingConnection:
+        """Return a live connection, opening one if needed; never two at once."""
+        async with self._connect_lock:
+            conn = self._conn
+            if conn is not None and conn.dead.is_set():
+                # A lease that is still unwinding keeps its own dead object;
+                # everyone else gets a fresh link from here on.
+                self._conn = None
+                await conn.close()
+                conn = None
+            if conn is None:
+                conn = _RingConnection(self._hass, self._address)
+                await conn.connect()
+                self._conn = conn
+            conn.purpose = purpose
+            return conn
+
+    def _busy(self, purpose: str, holder: str) -> ColmiRingApiClientBusyError:
+        return ColmiRingApiClientBusyError(
+            f"Ring {self._address} is busy with {holder}"
+            f" (this one is a {purpose})"
+        )
+
+    @asynccontextmanager
+    async def acquire(
+        self, purpose: str, wait_s: float
+    ) -> AsyncIterator[_RingConnection]:
+        """One serialised command exchange on the shared link.
+
+        The connection is (re)opened outside the wait budget, mirroring the
+        old lock-then-connect ordering: connect time is the caller's own cost,
+        not contention with another caller.
+        """
+        self._cancel_idle()
+        try:
+            conn = await self._ensure_connected(purpose)
+            # Counted as a user the moment the link is in hand - with no await
+            # between - so an idle disconnect that was already scheduled can
+            # never close the connection out from under a caller who just
+            # resolved it (the disconnect double-checks the count under the
+            # connect lock).
+            self._users += 1
+        except BaseException:
+            self._maybe_idle()
+            raise
+        have_tx = False
+        try:
+            deadline = time.monotonic() + wait_s
+            while True:
+                if conn.dead.is_set():
+                    # The link died (or an idle disconnect raced us) between
+                    # the connect above and this iteration: get a fresh one,
+                    # still within the same wait budget.
+                    conn = await self._ensure_connected(purpose)
+                if not self._exclusive and not self._tx_lock.locked():
+                    await self._tx_lock.acquire()
+                    have_tx = True
+                    break
+                if time.monotonic() >= deadline:
+                    raise self._busy(
+                        purpose,
+                        "an exclusive session"
+                        if self._exclusive
+                        else "another transaction",
+                    )
+                await asyncio.sleep(self._LOCK_POLL_S)
+            # An exclusive lease could have started between the loop check and
+            # the acquire (it only waits on the tx lock, not on this check).
+            if self._exclusive:
+                raise self._busy(purpose, "an exclusive session")
+            conn.purpose = purpose
+            conn.begin_transaction()
+            yield conn
+        finally:
+            self._users -= 1
+            if have_tx:
+                conn.end_transaction()
+                self._tx_lock.release()
+            self._maybe_idle()
+
+    @asynccontextmanager
+    async def hold(
+        self, purpose: str, *, exclusive: bool, wait_s: float
+    ) -> AsyncIterator[_RingConnection]:
+        """Hold the shared link open for a long-lived session.
+
+        An exclusive lease sets the refusal flag *before* claiming the
+        transaction lock, so no new transaction can start behind it while it
+        waits for the one exchange already in flight to finish (bounded by the
+        command timeouts, comfortably inside :data:`STREAM_LOCK_WAIT_S`).
+
+        A shared lease never touches the transaction lock at all: the wave
+        listener coexists with polling, and its own writes go through
+        :meth:`gate`. ``wait_s`` is then nominally unused, but it names the
+        same promise as the exclusive case: this session does not fail just
+        because a poll was mid-exchange when the switch flipped.
+        """
+        self._cancel_idle()
+        try:
+            conn = await self._ensure_connected(purpose)
+        except BaseException:
+            self._maybe_idle()
+            raise
+        if exclusive:
+            self._exclusive = True
+            try:
+                deadline = time.monotonic() + wait_s
+                while True:
+                    if not self._tx_lock.locked():
+                        await self._tx_lock.acquire()
+                        break
+                    if time.monotonic() >= deadline:
+                        raise self._busy(purpose, "another transaction")
+                    await asyncio.sleep(self._LOCK_POLL_S)
+            except BaseException:
+                self._exclusive = False
+                self._maybe_idle()
+                raise
+        self._users += 1
+        conn.purpose = purpose
+        try:
+            yield conn
+        finally:
+            self._users -= 1
+            if exclusive:
+                self._tx_lock.release()
+                self._exclusive = False
+            self._maybe_idle()
+
+    @asynccontextmanager
+    async def gate(
+        self, purpose: str = "session io", wait_s: float = 30.0
+    ) -> AsyncIterator[_RingConnection]:
+        """One locked write from inside a shared lease (wave arm/disarm).
+
+        A lease cannot simply ``_send`` whenever it likes: that write would
+        interleave with a transaction's packets mid-exchange, and the ring
+        correlates replies by command byte alone. Taking the transaction lock
+        makes the lease's own traffic just another well-behaved exchange, and
+        the modest budget keeps a stuck transaction visible rather than
+        silently blocking the session's teardown.
+        """
+        deadline = time.monotonic() + wait_s
+        while True:
+            conn = self._conn
+            if conn is None or conn.dead.is_set():
+                raise ColmiRingApiClientCommunicationError(
+                    f"Link to Colmi ring {self._address} is gone"
+                    f" (this one is a {purpose})"
+                )
+            if not self._exclusive and not self._tx_lock.locked():
+                await self._tx_lock.acquire()
+                break
+            if time.monotonic() >= deadline:
+                holder = (
+                    "an exclusive session" if self._exclusive else "another transaction"
+                )
+                raise self._busy(purpose, holder)
+            await asyncio.sleep(self._LOCK_POLL_S)
+        if self._exclusive:
+            self._tx_lock.release()
+            raise self._busy(purpose, "an exclusive session")
+        conn.purpose = purpose
+        try:
+            yield conn
+        finally:
+            self._tx_lock.release()
+
+    def _cancel_idle(self) -> None:
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+
+    def _maybe_idle(self) -> None:
+        """Arm the idle disconnect if this was the last user of the link."""
+        if self._users or self._conn is None or self._idle_handle is not None:
+            return
+        self._idle_handle = self._hass.loop.call_later(
+            LINK_IDLE_DISCONNECT_S, self._async_idle_expired
+        )
+
+    def _async_idle_expired(self) -> None:
+        self._idle_handle = None
+        if self._users == 0:
+            # call_later cannot await; the disconnect itself double-checks the
+            # user count under the connect lock.
+            self._hass.async_create_task(self._idle_disconnect())
+
+    async def _idle_disconnect(self) -> None:
+        async with self._connect_lock:
+            if self._users or self._conn is None:
+                return
+            conn, self._conn = self._conn, None
+            await conn.close()
+
+    async def close(self) -> None:
+        """Tear the link down now (entry unload/reload)."""
+        self._cancel_idle()
+        async with self._connect_lock:
+            conn, self._conn = self._conn, None
+        if conn is not None:
+            await conn.close()
 
 
 class _StreamTally:
@@ -667,6 +922,12 @@ class _LinkSession:
 
     def __init__(self, conn: _RingConnection) -> None:
         self.conn = conn
+        # When *this session* began, not when the link came up: the shared link
+        # outlives individual sessions, and the retry loop's stability check is
+        # about the session. Measuring it against the link's age would let a
+        # lease onto an already-live link look trivially "stable" and reset the
+        # retry budget forever on a fault that dies in milliseconds.
+        self.started_at = time.monotonic()
         self._stopped = asyncio.Event()
         self.reason: str | None = None
 
@@ -733,20 +994,19 @@ class ColmiRingApiClient:
         self._hass = hass
         self._ring_address = ring_address
         # Every session to this ring goes through here. The firmware serves one
-        # central, so two overlapping connections do not queue - they drop each
-        # other's link, which is how a motion stream gets torn off the air
-        # seconds after opening.
-        self._lock = asyncio.Lock()
+        # central, so this client keeps one shared connection and serialises
+        # command exchanges on it (see :class:`SharedLink`); long-lived
+        # sessions hold it as a lease instead of owning it outright.
+        self._link = SharedLink(hass, ring_address)
 
-    def _connection(self, purpose: str, lock_wait_s: float) -> _RingConnection:
-        """A connection that holds the ring's single link for its whole life."""
-        return _RingConnection(
-            self._hass,
-            self._ring_address,
-            lock=self._lock,
-            lock_wait_s=lock_wait_s,
-            purpose=purpose,
-        )
+    async def async_close(self) -> None:
+        """Tear the shared link down now (entry unload/reload).
+
+        Left alone, the link would drop a few seconds after its last user
+        leaves via the idle timer; unloading should not leave a live GATT
+        connection owned by nobody in the meantime.
+        """
+        await self._link.close()
 
     async def async_get_data(
         self, include_previous_day: bool = False
@@ -773,7 +1033,7 @@ class ColmiRingApiClient:
         # direct evidence the optical sensor is not on skin right now, even
         # if the newest *non-zero* sample is still within the staleness grace.
         hr_zero_reading = False
-        async with self._connection("poll", POLL_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("poll", POLL_LOCK_WAIT_S) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
             except ColmiRingApiClientError:
@@ -978,7 +1238,7 @@ class ColmiRingApiClient:
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
         """Read the ring's heart-rate logging settings."""
-        async with self._connection("settings", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("settings", USER_LOCK_WAIT_S) as conn:
             return await conn.get_hr_log_settings()
 
     async def async_set_hr_log_settings(
@@ -988,14 +1248,14 @@ class ColmiRingApiClient:
 
         Returns the settings as the ring reports them after the write.
         """
-        async with self._connection("settings", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("settings", USER_LOCK_WAIT_S) as conn:
             await conn.set_hr_log_settings(settings)
             await asyncio.sleep(0.5)
             return await conn.get_hr_log_settings()
 
     async def async_get_battery(self) -> dict[str, Any]:
         """Return battery level + charging state."""
-        async with self._connection("battery", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("battery", USER_LOCK_WAIT_S) as conn:
             info = await conn.get_battery()
             return {
                 "battery_level": info.battery_level,
@@ -1004,17 +1264,17 @@ class ColmiRingApiClient:
 
     async def async_set_time(self, value: datetime) -> Any:
         """Sync the ring clock (required to interpret logged data)."""
-        async with self._connection("set-time", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("set-time", USER_LOCK_WAIT_S) as conn:
             return await conn.set_time(value)
 
     async def async_blink_twice(self) -> Any:
         """Trigger blink-twice on the ring."""
-        async with self._connection("blink", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("blink", USER_LOCK_WAIT_S) as conn:
             return await conn.blink_twice()
 
     async def async_reboot(self) -> Any:
         """Reboot the ring."""
-        async with self._connection("reboot", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("reboot", USER_LOCK_WAIT_S) as conn:
             return await conn.reboot()
 
     async def async_take_spo2(self) -> dict[str, Any]:
@@ -1023,7 +1283,7 @@ class ColmiRingApiClient:
         Returns a dict with ``spo2`` (int %) and ``spo2_timestamp`` (aware
         datetime), or ``spo2`` = None if the ring produced no valid reading.
         """
-        async with self._connection("spo2", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("spo2", USER_LOCK_WAIT_S) as conn:
             samples = await conn.poll_real_time_reading(
                 real_time.RealTimeReading.SPO2
             )
@@ -1043,7 +1303,7 @@ class ColmiRingApiClient:
         (aware datetime), or ``heart_rate`` = None if the ring produced no
         valid reading.
         """
-        async with self._connection("live-hr", USER_LOCK_WAIT_S) as conn:
+        async with self._link.acquire("live-hr", USER_LOCK_WAIT_S) as conn:
             samples = await conn.poll_real_time_reading(
                 real_time.RealTimeReading.HEART_RATE
             )
@@ -1071,13 +1331,15 @@ class ColmiRingApiClient:
     async def _motion_stream(
         self, on_packet: Callable[[bytearray], None]
     ) -> AsyncIterator[MotionSession]:
-        """Hold the connection open with RAW streaming on, until stopped.
+        """Hold the link with RAW streaming on, until stopped.
 
-        The ring serves a single central, so this connection *is* the link for
-        as long as it lives. The coordinator pauses its polls for the duration
-        (see ``MotionManager``), but a poll already in flight when the user
-        toggles the stream on can only be waited out, hence the generous
-        :data:`STREAM_LOCK_WAIT_S`.
+        The RAW stream takes the shared link as an *exclusive* lease: it owns
+        the ring's attention and its accelerometer outright, so transactions
+        refuse fast for the duration (see ``MotionManager.holds_link``) and
+        only the command exchange already in flight is waited out, hence the
+        generous :data:`STREAM_LOCK_WAIT_S`. The lease holds the transaction
+        lock for its whole life, which is also what lets the start/stop writes
+        below go out directly without interleaving with anyone's packets.
 
         The RAW stream deliberately does *not* also arm the ring's on-device
         wave detector. Measured on an R02 with the ATC RF03 Writer web tool,
@@ -1087,23 +1349,28 @@ class ColmiRingApiClient:
         one firmware appears to serve only at a time. So arming it here bought
         nothing; it has its own session now, see :meth:`_wave_session`.
         """
-        conn = self._connection("motion stream", STREAM_LOCK_WAIT_S)
-        session = MotionSession(conn)
-        tally = _StreamTally()
-        # Observe the whole link, not just the command bytes we listen for: if
-        # the firmware streams on a byte other than the guessed 0xA1, the tally
-        # still shows packets arriving, which is a different diagnosis and a
-        # different fix.
-        conn.observer = tally.add
-        listener = self._make_packet_listener(session, on_packet)
-        async with conn:
+        async with self._link.hold(
+            "motion stream", exclusive=True, wait_s=STREAM_LOCK_WAIT_S
+        ) as conn:
+            session = MotionSession(conn)
+            tally = _StreamTally()
+            # Observe the whole link, not just the command bytes we listen for:
+            # if the firmware streams on a byte other than the guessed 0xA1,
+            # the tally still shows packets arriving, which is a different
+            # diagnosis and a different fix. Cleared on the way out because the
+            # shared link outlives this session and must not keep counting for
+            # a tally that is already logged.
+            conn.observer = tally.add
+            listener = self._make_packet_listener(session, on_packet)
             conn.add_listener(motion.CMD_RAW_MODE, listener)
             conn.touch_motion()
             await conn.start_motion_stream()
             watchdog = asyncio.create_task(self._watch_stream(session))
             try:
-                # The context manager's ``__aexit__`` runs on every exit path,
-                # including an exception raised inside the ``async with`` body.
+                # Every exit path (including an exception raised inside the
+                # body) runs the teardown below while the lease still holds
+                # the transaction lock, so the stop write cannot race a
+                # transaction starting right behind our release.
                 yield session
             finally:
                 watchdog.cancel()
@@ -1112,6 +1379,7 @@ class ColmiRingApiClient:
                 except asyncio.CancelledError:
                     pass
                 conn.remove_listener(motion.CMD_RAW_MODE, listener)
+                conn.observer = None
                 self._log_stream_session(session, tally)
                 await conn.stop_motion_stream()
 
@@ -1119,13 +1387,17 @@ class ColmiRingApiClient:
     async def _wave_session(
         self, on_packet: Callable[[bytearray], None]
     ) -> AsyncIterator[WaveSession]:
-        """Hold the connection open with the ring's own wave detector armed.
+        """Hold the link with the ring's own wave detector armed.
 
         This is the session behind the Wave Detection switch, and it exists
         because a BLE notification only reaches a central that is connected at
         that moment: a wave reported while we are disconnected is simply lost.
-        So hearing the ring's wave reports means holding its single link, which
-        is also why the switch warns about pausing polling.
+        Under the shared link that no longer means *owning* the link, though:
+        the lease is shared, so heart-rate polling keeps interleaving with the
+        wave listening, and the wave reports themselves need no lock at all -
+        they are notifications the listener picks off the link whenever they
+        arrive. Only the ``02 04``/``02 06`` writes are locked exchanges (via
+        :meth:`SharedLink.gate`) so they cannot interleave with a poll.
 
         The listener goes in *before* the ``02 04`` write so that a ring which
         does answer the enable cannot have its reply fall on the floor, and the
@@ -1136,22 +1408,26 @@ class ColmiRingApiClient:
         No silence timeout, unlike the RAW stream: this session is *expected* to
         hear nothing between waves, which may be hours.
         """
-        conn = self._connection("wave detection", STREAM_LOCK_WAIT_S)
-        session = WaveSession(conn)
-        tally = _StreamTally()
-        # Same reasoning as the RAW stream: the tally answers "did the ring send
-        # nothing, or did it send on a byte we do not listen to?", and only an
-        # observer over the whole link can tell those apart.
-        conn.observer = tally.add
-        listener = self._make_packet_listener(session, on_packet)
-        async with conn:
+        async with self._link.hold(
+            "wave detection", exclusive=False, wait_s=STREAM_LOCK_WAIT_S
+        ) as conn:
+            session = WaveSession(conn)
+            tally = _StreamTally()
+            # Same reasoning as the RAW stream: the tally answers "did the ring
+            # send nothing, or did it send on a byte we do not listen to?", and
+            # only an observer over the whole link can tell those apart. It is
+            # cleared on the way out because the shared link outlives this
+            # session and must not tally packets for a logged-and-done tally.
+            conn.observer = tally.add
+            listener = self._make_packet_listener(session, on_packet)
             conn.add_listener(motion.CMD_CAMERA_GESTURE, listener)
             conn.touch_motion()
-            armed = await conn.set_camera_gesture(True)
+            async with self._link.gate("wave arm"):
+                armed = await conn.set_camera_gesture(True)
             if not armed:
-                # The write did not reach the ring. Listening anyway would hold
-                # the link, freeze polling and report nothing, so end the
-                # session and let the retry loop (then the switch) deal with it.
+                # The write did not reach the ring. Listening anyway would
+                # hold the link open and report nothing, so end the session
+                # and let the retry loop (then the switch) deal with it.
                 session.request_stop("unarmed")
             watchdog = asyncio.create_task(self._watch_link(session))
             try:
@@ -1163,18 +1439,24 @@ class ColmiRingApiClient:
                 except asyncio.CancelledError:
                     pass
                 conn.remove_listener(motion.CMD_CAMERA_GESTURE, listener)
+                conn.observer = None
                 self._log_wave_session(session, tally, armed)
-                await conn.set_camera_gesture(False)
+                try:
+                    async with self._link.gate("wave disarm"):
+                        await conn.set_camera_gesture(False)
+                except ColmiRingApiClientError:
+                    # Best-effort: the link may already be gone (which is why
+                    # this session ended), and then there is nothing to disarm.
+                    LOGGER.debug(
+                        "Could not send the wave-disarm write to ring %s",
+                        self._ring_address,
+                    )
 
     def _log_wave_session(
         self, session: WaveSession, tally: _StreamTally, armed: bool
     ) -> None:
         """Report what a finished wave session saw, and whether it could work."""
-        lived = (
-            "an unknown time"
-            if session.conn.linked_at is None
-            else f"{time.monotonic() - session.conn.linked_at:.1f}s"
-        )
+        lived = f"{time.monotonic() - session.started_at:.1f}s"
         reason = session.reason or "ABORTED (never stopped by anyone)"
         reports = tally.count_for(motion.CMD_CAMERA_GESTURE)
         if not armed:
@@ -1238,12 +1520,7 @@ class ColmiRingApiClient:
         streaming, or refused and dropped the link). The last two are logged at
         INFO because they are the ones worth reading without DEBUG enabled.
         """
-        conn = session.conn
-        lived = (
-            "an unknown time"
-            if conn.linked_at is None
-            else f"{time.monotonic() - conn.linked_at:.1f}s"
-        )
+        lived = f"{time.monotonic() - session.started_at:.1f}s"
         # No reason means nobody asked this session to stop, so it did not end on
         # its own: something unwound it (an exception, or a cancelled task). Saying
         # "stopped" there sends the reader looking at the ring for a teardown we
@@ -1403,7 +1680,7 @@ class ColmiRingApiClient:
         failing_since: float | None = None
         delay = self._STREAM_RETRY_MIN_S
         while should_run():
-            # Declared here so a failed ``__aenter__`` cannot leave the previous
+            # Declared here so a failed opener entry cannot leave the previous
             # attempt's session visible to the stability check below.
             session: _SessionT | None = None
             try:
@@ -1549,10 +1826,16 @@ class ColmiRingApiClient:
 
     @staticmethod
     def _session_lived(session: _LinkSession | None) -> float:
-        """Seconds a finished session held the link, or -1 if it never linked."""
-        if session is None or session.conn.linked_at is None:
+        """Seconds a finished session held its lease, or -1 if never opened.
+
+        Measured from the session's own start, not the link's: on a shared link
+        a session can fail instantly against an already-live connection, and
+        timing it from ``linked_at`` would read as a long, "stable" session and
+        silently reset the retry budget on every attempt.
+        """
+        if session is None:
             return -1.0
-        return time.monotonic() - session.conn.linked_at
+        return time.monotonic() - session.started_at
 
     async def _stream_pause(
         self,
