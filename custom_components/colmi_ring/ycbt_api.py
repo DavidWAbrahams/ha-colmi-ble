@@ -845,12 +845,13 @@ class YcbtRingApiClient:
             if type_name == "heart_rate" and conn.has_hrs:
                 conn.add_hrs_listener(on_hrs)
                 await conn.start_hrs()
+
             def on_complete(opcode: int, packet: yc_pkt.YcbtPacket) -> None:
                 if opcode in (yc.MEASUREMENT_COMPLETE, yc.MEASUREMENT_STATUS):
                     LOGGER.debug(
                         "Yucheng ring %s measurement %s event 0x%04X:"
                         " payload=%s",
-                        self._address,
+                        self._ring_address,
                         type_name,
                         opcode,
                         packet.payload.hex(),
@@ -861,7 +862,7 @@ class YcbtRingApiClient:
                 LOGGER.debug(
                     "Yucheng ring %s starting %s measurement"
                     " (prime 0x%04X, start 0x%04X type, watching push 0x%04X)",
-                    self._address,
+                    self._ring_address,
                     type_name,
                     yc.APP_PRIME_SENSORS,
                     yc.APP_START_MEASUREMENT,
@@ -894,7 +895,7 @@ class YcbtRingApiClient:
                 await conn.stop_hrs()
         LOGGER.debug(
             "Yucheng ring %s %s measurement collected %d sample(s): %s",
-            self._address,
+            self._ring_address,
             type_name,
             len(samples),
             samples[:20],
