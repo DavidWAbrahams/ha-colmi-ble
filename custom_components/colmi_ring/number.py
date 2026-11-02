@@ -51,9 +51,10 @@ ENTITY_DESCRIPTIONS = (
     ),
 )
 
-# The Yucheng set_monitor_interval payload is one minute byte with the OEM
-# SDK documenting 1..240 minutes; there is no Colmi-style log-grid reason to
-# floor it at 5.
+# The Yucheng monitor payload is {enable, intervalMinutes}. The OEM SDK
+# documents 1..240 minutes but its app clamps ring requests up to 30 - the
+# firmware ignores anything below that - so the entity range matches what
+# the hardware honours (see const.YCBT_MONITOR_INTERVAL_MIN).
 YCBT_ENTITY_DESCRIPTION = NumberEntityDescription(
     key="colmi_ring_hr_log_interval",
     name="Heart Rate Sample Interval",

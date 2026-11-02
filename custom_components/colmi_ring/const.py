@@ -32,10 +32,13 @@ DEFAULT_POLL_MAX_INTERVAL = 30
 # entity writes it, the init burst applies it, and the coordinator matches
 # its poll/staleness cadence to it.
 CONF_YCBT_MONITOR_INTERVAL = "ycbt_monitor_interval"
-DEFAULT_YCBT_MONITOR_INTERVAL = 5
-# The set_monitor_interval payload is one minute byte; the firmware's own
-# accepted range per the reverse-engineered SDK (1..240 minutes).
-YCBT_MONITOR_INTERVAL_MIN = 1
+DEFAULT_YCBT_MONITOR_INTERVAL = 30
+# The monitor payload is {enable, intervalMinutes}; the OEM SDK documents
+# 1..240 minutes but its app clamps ring requests up to 30 ("the ring's
+# all-day sampler refuses intervals under 30 minutes"), with a 60-minute
+# firmware default. Anything below 30 is silently ignored by the firmware,
+# so the effective floor here matches what the hardware actually honours.
+YCBT_MONITOR_INTERVAL_MIN = 30
 YCBT_MONITOR_INTERVAL_MAX = 240
 
 

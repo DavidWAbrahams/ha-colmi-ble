@@ -35,8 +35,8 @@ uint32 LE = seconds since **2000-01-01 UTC** (`+946684800`), but stored as *wall
 |---|---|---|
 | set time | `0x0100` | must precede history reads |
 | enable health sensors | `0x0104` | 1 byte; **required** or PPG never fires |
-| set monitor interval | `0x010C` | 1 byte minutes (1–240) |
-| enable bg SpO2 monitor | `0x0126` | 1 byte; drives autonomous sampling |
+| set monitor interval | `0x010C` | `[enable, minutes]`; HR monitor (firmware ignores <30 min) |
+| bg BP / temp / SpO2 monitors | `0x011C` / `0x0120` / `0x0126` | same `[enable, minutes]` payload; drive autonomous sampling |
 | get device info (fw) | `0x0200` | reply magic `'GC'`; fw = `byte3.byte2` |
 | get device name | `0x0203` | magic `'GP'` |
 | get now step | `0x020C` | empty payload; steps = u32 LE @5 |

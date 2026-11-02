@@ -113,10 +113,53 @@ def setting_time(now: datetime) -> YcbtPacket:
     return YcbtPacket(yc.SETTING_TIME, payload)
 
 
-def set_monitor_interval(minutes: int) -> YcbtPacket:
-    """Background health-monitoring interval, 1..240 minutes."""
+def _monitor(opcode: int, minutes: int, *, on: bool = True) -> YcbtPacket:
+    """One background-monitor command: payload ``[enable, interval]``.
+
+    The Setting-group monitors (heart rate ``0x010C``, blood pressure
+    ``0x011C``, temperature ``0x0120``, blood oxygen ``0x0126``) all take
+    the same two-byte ``{enable, intervalMinutes}`` payload - per the
+    vendor SDK's settings encoder. This firmware family refuses intervals
+    below 30 minutes (the OEM app clamps them up; its default is 60); the
+    policy clamp lives in ``const.clamp_ycbt_monitor_interval`` - this
+    clamp only keeps the byte on the wire.
+    """
     minutes = max(1, min(240, int(minutes)))
-    return YcbtPacket(yc.SET_MONITOR_INTERVAL, bytes([minutes]))
+    return YcbtPacket(opcode, bytes([1 if on else 0, minutes]))
+
+
+def set_monitor_interval(minutes: int, *, on: bool = True) -> YcbtPacket:
+    """Background heart-rate monitor toggle + sampling interval.
+
+    Older builds of this integration sent a lone minute byte here, which
+    the ring ACKed (every Setting command gets a generic 1-byte status)
+    but never applied - the record schedule stayed on the firmware
+    default.
+    """
+    return _monitor(yc.SET_MONITOR_INTERVAL, minutes, on=on)
+
+
+def set_blood_pressure_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
+    """Background blood-pressure monitor toggle + interval.
+
+    The OEM app drives this monitor alongside the heart-rate one; sending
+    it keeps BP records on the same schedule we control.
+    """
+    return _monitor(yc.SET_BLOOD_PRESSURE_MONITOR, minutes, on=on)
+
+
+def set_temperature_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
+    """Background skin-temperature monitor toggle + interval.
+
+    Without this write the ring never samples temperature between syncs,
+    which is why the skin-temperature history was sparse.
+    """
+    return _monitor(yc.SET_TEMPERATURE_MONITOR, minutes, on=on)
+
+
+def set_blood_oxygen_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
+    """Background blood-oxygen (SpO2) monitor toggle + interval."""
+    return _monitor(yc.ENABLE_BG_SPO2_MONITOR, minutes, on=on)
 
 
 def enable_health_sensors(on: bool = True) -> YcbtPacket:
@@ -126,11 +169,6 @@ def enable_health_sensors(on: bool = True) -> YcbtPacket:
     start commands but never fires the PPG LEDs.
     """
     return YcbtPacket(yc.ENABLE_HEALTH_SENSORS, bytes([1 if on else 0]))
-
-
-def enable_bg_spo2_monitor(on: bool = True) -> YcbtPacket:
-    """Toggle background SpO2 monitoring."""
-    return YcbtPacket(yc.ENABLE_BG_SPO2_MONITOR, bytes([1 if on else 0]))
 
 
 def get_device_info() -> YcbtPacket:

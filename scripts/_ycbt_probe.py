@@ -291,10 +291,14 @@ async def init_burst(
         rejections_before = capture.rejections
         await send(client, link.write_char, yc_pkt.setting_time(datetime.now()))
         await asyncio.sleep(0.2)
-        await send(client, link.write_char, yc_pkt.set_monitor_interval(5))
-        await asyncio.sleep(0.2)
-        await send(client, link.write_char, yc_pkt.enable_bg_spo2_monitor(True))
-        await asyncio.sleep(0.2)
+        for mon in (
+            yc_pkt.set_monitor_interval(30),
+            yc_pkt.set_blood_pressure_monitor(30),
+            yc_pkt.set_temperature_monitor(30),
+            yc_pkt.set_blood_oxygen_monitor(30),
+        ):
+            await send(client, link.write_char, mon)
+            await asyncio.sleep(0.2)
         await send(client, link.write_char, yc_pkt.enable_health_sensors(True))
         await asyncio.sleep(0.2)
         for cmd in (

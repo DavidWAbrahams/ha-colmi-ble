@@ -572,8 +572,15 @@ class _YcbtConnection:
             self.clear_replies()
             for packet in (
                 yc_pkt.setting_time(_now_local()),
+                # The four all-day monitors. Each takes {enable, interval};
+                # these are what make the ring record anything between
+                # syncs, so all four ride the one configured interval.
+                # (HRV, 0x0145, is skipped: its documented payload tail is
+                # unverified.)
                 yc_pkt.set_monitor_interval(self._monitor_interval),
-                yc_pkt.enable_bg_spo2_monitor(True),
+                yc_pkt.set_blood_pressure_monitor(self._monitor_interval),
+                yc_pkt.set_temperature_monitor(self._monitor_interval),
+                yc_pkt.set_blood_oxygen_monitor(self._monitor_interval),
                 yc_pkt.enable_health_sensors(True),
                 yc_pkt.get_device_name(),
                 yc_pkt.get_device_info(),
@@ -895,17 +902,27 @@ class YcbtRingApiClient:
     async def async_set_monitor_interval(self, minutes: int) -> int:
         """Set the ring's background monitoring interval.
 
-        Unlike the Colmi settings command there is no read opcode, so the
-        accepted value is confirmed only by the opcode echo (this family
-        answers every command with a frame echoing its opcode) and by the
-        absence of a 0xFC rejection. Returns the clamped value actually
-        written; raises when the ring refused or never answered.
+        Applies the interval to all four all-day monitors (heart rate,
+        blood pressure, temperature, blood oxygen) so they share one
+        schedule. Unlike the Colmi settings command there is no read
+        opcode, so the accepted value is confirmed only by the heart-rate
+        monitor's opcode echo (this family answers every Setting command
+        with a generic 1-byte status echoing its opcode) and by the absence
+        of a 0xFC rejection. Returns the clamped value actually written;
+        raises when the ring refused or never answered.
         """
         minutes = clamp_ycbt_monitor_interval(minutes)
         async with self._connection("interval", USER_LOCK_WAIT_S) as conn:
             rejections_before = conn.rejections
             conn.clear_replies()
-            await conn.send(yc_pkt.set_monitor_interval(minutes))
+            for packet in (
+                yc_pkt.set_monitor_interval(minutes),
+                yc_pkt.set_blood_pressure_monitor(minutes),
+                yc_pkt.set_temperature_monitor(minutes),
+                yc_pkt.set_blood_oxygen_monitor(minutes),
+            ):
+                await conn.send(packet)
+                await asyncio.sleep(0.15)
             reply = await conn.get_reply(yc.SET_MONITOR_INTERVAL)
             if reply is None or conn.rejections > rejections_before:
                 msg = (

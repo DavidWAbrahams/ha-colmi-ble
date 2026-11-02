@@ -36,7 +36,15 @@ SETTING_USER_BIND_ECHO = 0x0109
 SET_MONITOR_INTERVAL = 0x010C
 #: Yucheng "sedentary reminder" / activity-goal echo.
 SETTING_REMINDER_ECHO = 0x0112
+#: Background blood-pressure monitor (rides the heart-rate monitor toggle).
+SET_BLOOD_PRESSURE_MONITOR = 0x011C
+#: Background skin-temperature monitor.
+SET_TEMPERATURE_MONITOR = 0x0120
 ENABLE_BG_SPO2_MONITOR = 0x0126
+#: Background HRV monitor. Not sent: its payload is documented as
+#: ``{enable, interval, 0, 0, 0}`` with an unverified tail, so we leave the
+#: firmware default alone rather than risk a malformed write.
+SET_HRV_MONITOR = 0x0145
 
 GET_DEVICE_INFO = 0x0200
 GET_DEVICE_SUPPORT_FN = 0x0201

@@ -54,11 +54,28 @@ def check_wire_format() -> None:
         yc_pkt.get_power_statistics,
         yc_pkt.get_now_step,
         yc_pkt.enable_health_sensors,
-        lambda: yc_pkt.set_monitor_interval(10),
-        lambda: yc_pkt.enable_bg_spo2_monitor(True),
+        lambda: yc_pkt.set_monitor_interval(30),
+        lambda: yc_pkt.set_blood_pressure_monitor(30),
+        lambda: yc_pkt.set_temperature_monitor(30),
+        lambda: yc_pkt.set_blood_oxygen_monitor(30),
     ):
         enc = maker().encode()
         assert yc_pkt.crc_ok(enc), maker
+
+    # Monitor payload golden: {enable, intervalMinutes}, per the vendor SDK's
+    # settings encoder (a lone minute byte is ACKed but never applied).
+    for maker, opcode in (
+        (yc_pkt.set_monitor_interval, yc.SET_MONITOR_INTERVAL),
+        (yc_pkt.set_blood_pressure_monitor, yc.SET_BLOOD_PRESSURE_MONITOR),
+        (yc_pkt.set_temperature_monitor, yc.SET_TEMPERATURE_MONITOR),
+        (yc_pkt.set_blood_oxygen_monitor, yc.ENABLE_BG_SPO2_MONITOR),
+    ):
+        pkt = maker(45)
+        assert pkt.data_type == opcode, hex(pkt.data_type)
+        assert pkt.payload == bytes([0x01, 45]), pkt.payload.hex()
+        assert maker(45, on=False).payload == bytes([0x00, 45])
+        # wire clamp keeps the interval byte sane even past the policy floor
+        assert maker(999).payload == bytes([0x01, 240])
 
     # reject/accept framing
     assert yc_pkt.decode(bytes([0x01, 0x09, 0x05, 0x00, 0xFC, 0x00])) is None or True
