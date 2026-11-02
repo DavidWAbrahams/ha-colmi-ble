@@ -1,9 +1,11 @@
 # What?
 Integrate the Colmi line of smart rings with Home Assistant.
-Colmi rings (like the R02, R06, R10 etc) can be found for udner $20 on AliExpress.
+Colmi rings (like the R02, R06, R10 etc) can be found for under $20 on AliExpress.
 It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
+These can be distiguished because they use QRing as their phone app.
 
-There is also partial support for some clones that are sold interchangably on AliExpress, i.e. the YCBT R20 and R99. I've been burned by sellers mislabeling their
+There is also partial support for some clones that are sold interchangably on AliExpress, i.e. the YCBT R20 and R99 which use "Smarthealt" app. I've been
+burned by sellers mislabeling their
 product and wanted something to work for you in that case.
 
 # How?
@@ -109,10 +111,6 @@ the gesture event(s).
 
 - about **0** when the ring is held horizontally (the hole axis is flat, so there is little or no gravity along it),
 - about **90** when the ring is held vertically (the hole axis points at the sky or at the floor - both read 90, the sensor does not care which end is up).
-
-The reading is absolute: nothing is zeroed against a starting pose, nothing is integrated, so it cannot drift and needs no calibration. It is also insensitive to rotation in the horizontal plane - spinning the ring like a doorknob (or turning your hand) leaves the vertical angle alone; only the tilt of the hole axis up or down moves it.
-
-As with any worn sensor, the number describes the ring's axis, not your intent: what "horizontal" means on your finger depends on how you wear it.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
