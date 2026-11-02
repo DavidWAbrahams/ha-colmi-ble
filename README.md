@@ -12,6 +12,17 @@ product and wanted something to work for you in that case.
 Home Assistant will periodically pull data from your ring via Bluetooth Low Energy.
 This is built on top of tahnok's Python API (https://github.com/tahnok/colmi_r02_client) and ludeeus's Home Assistant Integration blueprint (https://github.com/ludeeus/integration_blueprint)
 
+# The shared Bluetooth link
+The ring's firmware serves exactly one Bluetooth central at a time, so this integration keeps a
+single shared connection per ring instead of one connection per feature. Everything goes through
+it: the periodic poll, the on-demand buttons, and the long-lived gesture sessions. Command
+exchanges are serialized on the link, so two features can never talk to the ring at the same
+moment, but they take turns quickly instead of blocking each other for minutes.
+
+The connection is opened lazily on first use and dropped about ten seconds after its last user
+leaves, so nothing holds a live link (and no extra battery) while the ring is just sitting idle.
+While it *is* idle, features like Wave Detection coexist with polling instead of freezing it.
+
 # Requirements
 Your home assistant device must have the ability to make active Bluetooth Low Energy (BLE) connections. The bluetooth adapter in a raspberry pi or some PC motherboards will satisfy this. It will also work with ESPHome bluetooth repeaters if they are configured something like this:
 
@@ -46,8 +57,8 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 
 | Switch | What it does | What it costs |
 | --- | --- | --- |
-| `Wave Detection` | Asks the ring to run its own on-device wave detector and report when it fires | Holds the ring's single Bluetooth link, so polling freezes while it is on; turns itself off after a configurable number of minutes (120 by default) |
-| `Motion Stream` | Makes the ring stream raw accelerometer data continuously, so you can build your own gestures in HA | Also freezes polling, and drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
+| `Wave Detection` | Asks the ring to run its own on-device wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable number of minutes (120 by default) |
+| `Motion Stream` | Makes the ring stream raw accelerometer data continuously, so you can build your own gestures in HA | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
 `Motion Stream` is opt-in from the integration's options ("Enable gesture detection"). Enabling it adds
 that switch plus:
@@ -56,9 +67,12 @@ that switch plus:
   `Acceleration` (the magnitude) - see below, and
 - a `Vertical Angle` sensor - see below.
 
-The two switches are mutually exclusive. Both want the same accelerometer over the same one link, so
-turning one on while the other is running is *refused*, with an error naming the switch to turn off,
-rather than silently ending a session you were relying on.
+The two switches are mutually exclusive with *each other*. The RAW stream puts the firmware into a
+mode that takes over the accelerometer and stops the wave detector's reports, so turning one on
+while the other is running is *refused*, with an error naming the switch to turn off, rather than
+silently ending a session you were relying on. (This is a firmware limitation, not a connection
+limit: unlike before, wave detection no longer blocks polling or the buttons, which share the link
+alongside it.)
 
 There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
 we may implement:
