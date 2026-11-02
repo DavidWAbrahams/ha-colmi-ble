@@ -15,10 +15,18 @@ from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
 from .backfill import BackfillManager
-from .const import CONF_WAVE_TIMEOUT, DOMAIN, LOGGER
+from .const import (
+    CONF_DEVICE_FAMILY,
+    CONF_WAVE_TIMEOUT,
+    DOMAIN,
+    FAMILY_COLMI,
+    FAMILY_YCBT,
+    LOGGER,
+)
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
 from .motion_manager import MotionManager
+from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -49,24 +57,38 @@ async def async_migrate_entry(
     survives the rename. (The gesture/switch entity unique ids also
     changed, which orphans the old entities; HA recreates the new ones,
     and the old leftovers can be removed from the UI.)
+
+    Version 3 introduces the device family (``colmi`` vs ``ycbt``). Every
+    entry that predates it was set up against a Colmi ring, so the family
+    is simply stamped ``colmi``.
     """
-    if entry.version > 1:
+    if entry.version > 3:
         # Downgrade or already current: nothing to do.
         return True
 
-    old_options = dict(entry.options)
-    new_options = dict(old_options)
-    if "clap_timeout" in new_options:
-        new_options[CONF_WAVE_TIMEOUT] = new_options.pop("clap_timeout")
+    new_options = dict(entry.options)
+    new_data = dict(entry.data)
+    migrated: list[str] = []
+
+    if entry.version <= 1:
+        if "clap_timeout" in new_options:
+            new_options[CONF_WAVE_TIMEOUT] = new_options.pop("clap_timeout")
+        migrated.append("clap gesture renamed to wave")
+
+    if entry.version <= 2:
+        new_data.setdefault(CONF_DEVICE_FAMILY, FAMILY_COLMI)
+        migrated.append("device family stamped colmi")
 
     hass.config_entries.async_update_entry(
         entry,
+        data=new_data,
         options=new_options,
-        version=2,
+        version=3,
     )
     LOGGER.info(
-        "Config entry %s migrated to version 2 (clap gesture renamed to wave)",
+        "Config entry %s migrated to version 3 (%s)",
         entry.entry_id,
+        "; ".join(migrated),
     )
     return True
 
@@ -87,12 +109,24 @@ async def async_setup_entry(
         update_interval=timedelta(minutes=5),
         backfill=BackfillManager(hass, entry.entry_id),
     )
-    client = ColmiRingApiClient(hass=hass, ring_address=entry.data[CONF_ADDRESS])
-    # Always constructed (it does no I/O until asked) because the coordinator
-    # needs to be able to ask whether the stream is holding the connection even
-    # in setups where the option is off. The switch and event entities, in
-    # contrast, only appear when CONF_MOTION_ENABLED is on.
-    motion = MotionManager(hass, entry, client, coordinator)
+    family = entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI)
+    ring_address = entry.data[CONF_ADDRESS]
+    if family == FAMILY_YCBT:
+        client = YcbtRingApiClient(hass=hass, ring_address=ring_address)
+    else:
+        client = ColmiRingApiClient(hass=hass, ring_address=ring_address)
+    # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
+    # is a Colmi command): YCBT rings have no equivalent, so the family gate
+    # leaves it None and every "is the stream busy" check no-ops. For Colmi
+    # it is always constructed (it does no I/O until asked) because the
+    # coordinator needs to be able to ask whether the stream is holding the
+    # connection even in setups where the option is off. The switch and event
+    # entities, in contrast, only appear when CONF_MOTION_ENABLED is on.
+    motion = (
+        MotionManager(hass, entry, client, coordinator)
+        if family == FAMILY_COLMI
+        else None
+    )
     coordinator.motion = motion
     entry.runtime_data = ColmiRingData(
         client=client,

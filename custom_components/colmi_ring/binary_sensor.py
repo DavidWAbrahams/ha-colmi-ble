@@ -10,6 +10,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 
+from .const import CONF_DEVICE_FAMILY, FAMILY_COLMI, FAMILY_YCBT
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -49,18 +50,22 @@ async def async_setup_entry(
 ) -> None:
     """Set up the binary sensor platform."""
     coordinator = entry.runtime_data.coordinator
-    async_add_entities(
-        [
-            ColmiRingOnFingerBinarySensor(
-                coordinator=coordinator,
-                entity_description=ENTITY_DESCRIPTIONS["on_finger"],
-            ),
+    entities: list[ColmiRingEntity] = [
+        ColmiRingOnFingerBinarySensor(
+            coordinator=coordinator,
+            entity_description=ENTITY_DESCRIPTIONS["on_finger"],
+        ),
+    ]
+    # Yucheng rings report only a battery percentage, never a charging state,
+    # so the charging binary sensor would sit unknown forever.
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) != FAMILY_YCBT:
+        entities.append(
             ColmiRingBatteryChargingBinarySensor(
                 coordinator=coordinator,
                 entity_description=ENTITY_DESCRIPTIONS["battery_charging"],
-            ),
-        ]
-    )
+            )
+        )
+    async_add_entities(entities)
 
 
 class ColmiRingOnFingerBinarySensor(ColmiRingEntity, BinarySensorEntity):

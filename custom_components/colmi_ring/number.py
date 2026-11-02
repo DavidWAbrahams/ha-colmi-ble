@@ -13,7 +13,7 @@ from homeassistant.const import UnitOfTime
 
 from .api import ColmiRingApiClientError
 from .colmi_codec.hr_settings import HeartRateLogSettings
-from .const import LOGGER
+from .const import CONF_DEVICE_FAMILY, FAMILY_COLMI, FAMILY_YCBT, LOGGER
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -48,6 +48,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the number platform."""
+    # The interval is a Colmi vendor command; the Yucheng ring's sampling rate
+    # is fixed by the integration instead, so expose no control for it.
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) == FAMILY_YCBT:
+        LOGGER.debug(
+            "Colmi ring %s is a Yucheng ring: skipping the HR interval number",
+            entry.entry_id,
+        )
+        return
     async_add_entities(
         ColmiRingHrIntervalNumber(
             coordinator=entry.runtime_data.coordinator,

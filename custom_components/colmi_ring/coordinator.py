@@ -16,11 +16,13 @@ from .api import (
 from .colmi_codec import date_utils
 from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import (
+    CONF_DEVICE_FAMILY,
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
     DEFAULT_POLL_MAX_INTERVAL,
+    FAMILY_YCBT,
     LOGGER,
 )
 
@@ -54,6 +56,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # A live real-time reading, kept only while it is fresher than the
         # ring's logged HR sample (see _async_update_data precedence).
         self.hr_live: dict[str, Any] | None = None
+
+    @property
+    def _is_ycbt(self) -> bool:
+        """True when this entry's ring speaks the Yucheng YCBT protocol."""
+        return self.config_entry.data.get(CONF_DEVICE_FAMILY) == FAMILY_YCBT
 
     @staticmethod
     def _prefer_newer_hr(data: dict[str, Any], live: dict[str, Any]) -> bool:
@@ -185,6 +192,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     # slot grid, so polling faster than that can never reveal a new sample.
     _MIN_POLL_MINUTES = 5
 
+    # Yucheng rings expose no readable sampling setting; the client commands
+    # a 5-minute monitor interval at connect time, so we treat that as the
+    # sampling interval for polling and staleness math.
+    _YCBT_SAMPLE_INTERVAL_MINUTES = 5
+
     def _apply_poll_interval(self, data: dict[str, Any]) -> None:
         """Match the poll cadence to the ring's sampling interval, capped.
 
@@ -192,14 +204,20 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         sampling interval, so polling faster just re-reads an unchanged log
         and wastes battery. We therefore poll at ``min(ring interval,
         configured max)``, floored at the 5-minute log grid. When the ring
-        did not answer the settings query we keep the current interval
-        rather than snapping to a default. ``DataUpdateCoordinator`` reads
+        did not answer the settings query (Yucheng rings never do; a Colmi
+        ring that dropped the query keeps its current interval rather than
+        snapping to a default). ``DataUpdateCoordinator`` reads
         ``update_interval`` when scheduling the next refresh, so assigning
         it here retunes subsequent polls.
         """
         settings = data.get("hr_settings")
-        if not isinstance(settings, HeartRateLogSettings):
+        if self._is_ycbt:
+            # Yucheng family: no settings entity, fixed monitor interval.
+            sample_minutes = self._YCBT_SAMPLE_INTERVAL_MINUTES
+        elif not isinstance(settings, HeartRateLogSettings):
             return
+        else:
+            sample_minutes = settings.interval
         try:
             max_minutes = int(
                 self.config_entry.options.get(
@@ -210,14 +228,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             max_minutes = DEFAULT_POLL_MAX_INTERVAL
         minutes = max(
             self._MIN_POLL_MINUTES,
-            min(settings.interval, max_minutes),
+            min(sample_minutes, max_minutes),
         )
         new_interval = timedelta(minutes=minutes)
         if self.update_interval != new_interval:
             LOGGER.debug(
                 "Colmi ring poll interval set to %s (sampling %s min, max %s min)",
                 new_interval,
-                settings.interval,
+                sample_minutes,
                 max_minutes,
             )
             self.update_interval = new_interval
@@ -250,7 +268,13 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         interval_minutes = (
             settings.interval
             if isinstance(settings, HeartRateLogSettings)
-            else 15
+            # Yucheng rings have no settings reply; Colmi rings that failed the
+            # settings query fall back to a conservative typical interval.
+            else (
+                self._YCBT_SAMPLE_INTERVAL_MINUTES
+                if self._is_ycbt
+                else 15
+            )
         )
         threshold = timedelta(
             minutes=stale_polls * poll_minutes + interval_minutes + 5

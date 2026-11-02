@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .api import ColmiRingApiClient
     from .coordinator import ColmiRingDataUpdateCoordinator
     from .motion_manager import MotionManager
+    from .ycbt_api import YcbtRingApiClient
 
 
 type ColmiRingConfigEntry = ConfigEntry[ColmiRingData]
@@ -21,7 +22,9 @@ type ColmiRingConfigEntry = ConfigEntry[ColmiRingData]
 class ColmiRingData:
     """Data for the Blueprint integration."""
 
-    client: ColmiRingApiClient
+    # Two protocol families share one integration; the client factory in
+    # __init__ picks one from the entry's device family.
+    client: ColmiRingApiClient | YcbtRingApiClient
     coordinator: ColmiRingDataUpdateCoordinator
     integration: Integration
     # Owns the RAW motion stream; None when the motion options are off, which is

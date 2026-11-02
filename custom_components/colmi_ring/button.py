@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 
 from .api import ColmiRingApiClientError
-from .const import LOGGER
+from .const import CONF_DEVICE_FAMILY, FAMILY_COLMI, FAMILY_YCBT, LOGGER
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -25,40 +25,50 @@ async def async_setup_entry(
 ) -> None:
     """Set up the button platform."""
     coordinator: ColmiRingDataUpdateCoordinator = entry.runtime_data.coordinator
-    buttons: list[ColmiRingEntity] = [
-        ColmiRingBlinkButton(
-            coordinator=coordinator,
-            entity_description=ButtonEntityDescription(
-                key="colmi_ring_blink_button",
-                name="Blink LED",
-                icon="mdi:eye-outline",
+    buttons: list[ColmiRingEntity] = []
+    # Blink and Reboot are Colmi-only commands: the Yucheng client has no
+    # equivalent, so those buttons would just fail when pressed.
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) != FAMILY_YCBT:
+        buttons.extend(
+            [
+                ColmiRingBlinkButton(
+                    coordinator=coordinator,
+                    entity_description=ButtonEntityDescription(
+                        key="colmi_ring_blink_button",
+                        name="Blink LED",
+                        icon="mdi:eye-outline",
+                    ),
+                ),
+                ColmiRingRebootButton(
+                    coordinator=coordinator,
+                    entity_description=ButtonEntityDescription(
+                        key="colmi_ring_reboot_button",
+                        name="Reboot",
+                        icon="mdi:restart",
+                    ),
+                ),
+            ]
+        )
+    buttons.extend(
+        [
+            ColmiRingSpo2Button(
+                coordinator=coordinator,
+                entity_description=ButtonEntityDescription(
+                    key="colmi_ring_spo2_button",
+                    name="Read SpO2",
+                    icon="mdi:lungs",
+                ),
             ),
-        ),
-        ColmiRingRebootButton(
-            coordinator=coordinator,
-            entity_description=ButtonEntityDescription(
-                key="colmi_ring_reboot_button",
-                name="Reboot",
-                icon="mdi:restart",
+            ColmiRingHeartRateButton(
+                coordinator=coordinator,
+                entity_description=ButtonEntityDescription(
+                    key="colmi_ring_heart_rate_button",
+                    name="Read Heart Rate",
+                    icon="mdi:heart-pulse",
+                ),
             ),
-        ),
-        ColmiRingSpo2Button(
-            coordinator=coordinator,
-            entity_description=ButtonEntityDescription(
-                key="colmi_ring_spo2_button",
-                name="Read SpO2",
-                icon="mdi:lungs",
-            ),
-        ),
-        ColmiRingHeartRateButton(
-            coordinator=coordinator,
-            entity_description=ButtonEntityDescription(
-                key="colmi_ring_heart_rate_button",
-                name="Read Heart Rate",
-                icon="mdi:heart-pulse",
-            ),
-        ),
-    ]
+        ]
+    )
     async_add_entities(buttons)
 
 
@@ -185,5 +195,3 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
                 "(is the ring worn snugly on a finger?)"
             )
         self.coordinator.apply_heart_rate(reading)
-
-

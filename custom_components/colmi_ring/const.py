@@ -8,6 +8,16 @@ DOMAIN = "colmi_ring"
 
 RING_ADDRESS_CONFIG_NAME = "ring_address"
 
+# --- Device family ----------------------------------------------------------
+#
+# Two ring protocol families share this integration. The family is decided
+# once, at config time (the config flow probes the device), stored in the
+# entry data, and read everywhere a platform or the client factory needs to
+# know which protocol speaks to the ring. Old entries migrate to "colmi".
+CONF_DEVICE_FAMILY = "device_family"
+FAMILY_COLMI = "colmi"
+FAMILY_YCBT = "ycbt"
+
 CONF_HR_STALE_POLLS = "hr_stale_after_polls"
 
 # Upper bound (minutes) for the adaptive BLE poll interval: the coordinator

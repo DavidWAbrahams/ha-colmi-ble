@@ -169,8 +169,11 @@ async def async_setup_entry(
         for entity_description in ENTITY_DESCRIPTIONS
     )
     # The accelerometer sensors only have data while the RAW stream is on, which
-    # only happens with gestures enabled, so that option gates them too.
-    if not entry.options.get(CONF_MOTION_ENABLED, False):
+    # only happens with gestures enabled, so that option gates them too. Yucheng
+    # rings have no motion manager at all, so they are gated out as well.
+    if not entry.options.get(CONF_MOTION_ENABLED, False) or (
+        entry.runtime_data.motion is None
+    ):
         return
     async_add_entities(
         ColmiRingAccelerometerSensor(coordinator=coordinator, sensor=sensor)
