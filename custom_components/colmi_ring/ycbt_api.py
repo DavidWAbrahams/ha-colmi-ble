@@ -341,6 +341,9 @@ class _YcbtConnection:
     def _handle_hrs(
         self, _char: BleakGATTCharacteristic, data: bytearray
     ) -> None:
+        LOGGER.debug(
+            "Yucheng ring %s HRS raw: %s", self._address, bytes(data).hex()
+        )
         bpm = hrs_bpm(bytes(data))
         if bpm:
             for listener in list(self._hrs_listeners):
@@ -352,14 +355,30 @@ class _YcbtConnection:
     def _handle_notify(
         self, _char: BleakGATTCharacteristic, data: bytearray
     ) -> None:
-        packet = yc_pkt.decode(bytes(data))
+        raw = bytes(data)
+        packet = yc_pkt.decode(raw)
         if packet is None:
+            # Pad so the length-field bytes exist even on a runt frame.
+            head = raw.ljust(4, b"\x00")
             LOGGER.debug(
-                "Ignoring undecodable notification from %s: %s",
+                "Ignoring undecodable notification from %s on char %s:"
+                " %s (len_field=0x%02X%02X crc_ok=%s)",
                 self._address,
-                bytes(data).hex(),
+                _char.uuid,
+                raw.hex(),
+                head[2],
+                head[3],
+                yc_pkt.crc_ok(raw),
             )
             return
+        LOGGER.debug(
+            "Yucheng ring %s frame 0x%04X on char %s: payload=%s crc_ok=%s",
+            self._address,
+            packet.data_type,
+            _char.uuid,
+            packet.payload.hex(),
+            yc_pkt.crc_ok(raw),
+        )
         if yc_pkt.is_rejection(packet):
             self.rejections += 1
             LOGGER.debug(
@@ -826,7 +845,28 @@ class YcbtRingApiClient:
             if type_name == "heart_rate" and conn.has_hrs:
                 conn.add_hrs_listener(on_hrs)
                 await conn.start_hrs()
+            def on_complete(opcode: int, packet: yc_pkt.YcbtPacket) -> None:
+                if opcode in (yc.MEASUREMENT_COMPLETE, yc.MEASUREMENT_STATUS):
+                    LOGGER.debug(
+                        "Yucheng ring %s measurement %s event 0x%04X:"
+                        " payload=%s",
+                        self._address,
+                        type_name,
+                        opcode,
+                        packet.payload.hex(),
+                    )
+
+            conn.add_live_listener(on_complete)
             try:
+                LOGGER.debug(
+                    "Yucheng ring %s starting %s measurement"
+                    " (prime 0x%04X, start 0x%04X type, watching push 0x%04X)",
+                    self._address,
+                    type_name,
+                    yc.APP_PRIME_SENSORS,
+                    yc.APP_START_MEASUREMENT,
+                    push_opcode,
+                )
                 await conn.send(yc_pkt.prime_sensors())
                 await asyncio.sleep(0.3)
                 await conn.send(yc_pkt.start_measurement(type_name, start=True))
@@ -849,8 +889,16 @@ class YcbtRingApiClient:
                         self._ring_address,
                     )
                 conn.remove_live_listener(on_frame)
+                conn.remove_live_listener(on_complete)
                 conn.remove_hrs_listener(on_hrs)
                 await conn.stop_hrs()
+        LOGGER.debug(
+            "Yucheng ring %s %s measurement collected %d sample(s): %s",
+            self._address,
+            type_name,
+            len(samples),
+            samples[:20],
+        )
         return samples
 
     async def async_probe_family(self) -> None:

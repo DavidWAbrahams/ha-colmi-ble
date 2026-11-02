@@ -289,6 +289,11 @@ class SportRecord:
     calorie_kcal: int
 
     @property
+    def timestamp_ms(self) -> int:
+        """Alias so the generic history drain can watermark any record type."""
+        return self.start_time_ms
+
+    @property
     def duration_sec(self) -> int:
         return max(0, (self.end_time_ms - self.start_time_ms) // 1000)
 
@@ -323,6 +328,11 @@ class SportModeRecord:
     active_duration_sec: int
     min_hr: int
     max_hr: int
+
+    @property
+    def timestamp_ms(self) -> int:
+        """Alias so the generic history drain can watermark any record type."""
+        return self.start_time_ms
 
 
 def parse_sport_mode_records(
