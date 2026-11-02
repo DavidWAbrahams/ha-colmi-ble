@@ -67,10 +67,22 @@ if TYPE_CHECKING:
 # How long an on-demand measurement runs before we stop the ring and give up.
 # The PPG needs a ~10-20 s warm-up before pushes become plausible.
 MEASURE_SECONDS = 30.0
+# The R99 SpO2 session computes its result later: a field capture showed
+# its 0x060D progress counter still climbing when a 30 s window closed.
+SPO2_MEASURE_SECONDS = 60.0
 # Once a live value has appeared, keep collecting this long (the median needs
 # a handful of samples, and pushing longer only delays the button press
 # landing).
 MEASURE_SETTLE_S = 12.0
+# How often to poll 0x0211 ("IS") mid-session: the SDK's real-time
+# getRealBloodOxygen equivalent, answered on the command characteristic.
+SPO2_POLL_S = 3.0
+# In the R99 0x060D progress payload, byte 21 is an elapsed-seconds
+# counter (verified in a field capture); skip it when scanning for values.
+PROGRESS_SECONDS_INDEX = 21
+# Physiologically plausible SpO2 percent range, used when scanning the
+# undocumented 0x060D / 0x0211 / 0x040E payloads for a value byte.
+SPO2_PLAUSIBLE = range(50, 101)
 # Silence that ends a history drain: the firmware only sends the next block
 # in reply to an ACK, so a missing block within this window means the stream
 # has no more data for us.
@@ -102,6 +114,86 @@ def _ms_to_dt(ms: int) -> datetime:
 def _median(samples: list[int]) -> int:
     ordered = sorted(samples)
     return ordered[len(ordered) // 2]
+
+
+async def _async_measure_window(
+    samples: list[int],
+    window_s: float,
+    completed: Callable[[], bool],
+    poll: Callable[[], Any] | None = None,
+) -> None:
+    """Watch a started measurement until its value settles or time is up.
+
+    Stops early once ``completed()`` reports the ring finished AND a sample
+    arrived, or once ``MEASURE_SETTLE_S`` has passed since the first sample
+    (the median needs a handful of values). ``poll`` runs every
+    ``SPO2_POLL_S`` while waiting - the R99 ``0x0211`` real-time query.
+    """
+    deadline = time.monotonic() + window_s
+    next_poll = time.monotonic() + SPO2_POLL_S
+    first_at: float | None = None
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1.0)
+        if samples and first_at is None:
+            first_at = time.monotonic()
+        if completed() and samples:
+            break
+        if first_at is not None and time.monotonic() - first_at >= MEASURE_SETTLE_S:
+            break
+        if poll is not None and time.monotonic() >= next_poll:
+            next_poll = time.monotonic() + SPO2_POLL_S
+            await poll()
+
+
+def _spo2_extra_samples(
+    opcode: int, packet: yc_pkt.YcbtPacket, address: str
+) -> list[int]:
+    """SpO2 values carried by the R99 frames other than the 0x0602 push.
+
+    The R99 answers a manual SpO2 session with per-second ``0x060D``
+    progress frames (byte 21 is an elapsed-seconds counter; its value
+    fields stay zero until the ring computes a reading), answers the
+    ``0x0211`` ("IS") real-time query on the command characteristic, and
+    may carry the final value in its ``0x040E``/``0x0413`` completion
+    payload. None of these layouts is documented, so only bytes in the
+    plausible SpO2 range are accepted, and the undocumented nonzero
+    progress bytes are logged for later diagnosis. Returns ``[]`` for
+    any other opcode.
+    """
+    if not packet.payload:
+        return []
+    if opcode == yc.REAL_UPLOAD_MEASURE_PROGRESS:
+        nonzero = [
+            (idx, byte)
+            for idx, byte in enumerate(packet.payload)
+            if byte and idx != PROGRESS_SECONDS_INDEX
+        ]
+        if nonzero:
+            LOGGER.debug(
+                "Yucheng ring %s SpO2 progress nonzero bytes: %s",
+                address,
+                [(idx, f"0x{byte:02X}") for idx, byte in nonzero],
+            )
+        return [byte for _, byte in nonzero if byte in SPO2_PLAUSIBLE]
+    if opcode == yc.GET_REAL_BLOOD_OXYGEN:
+        values = [
+            byte
+            for byte in packet.payload.removeprefix(
+                yc.MAGIC_GET_REAL_BLOOD_OXYGEN
+            )
+            if byte in SPO2_PLAUSIBLE
+        ]
+        if values:
+            LOGGER.debug(
+                "Yucheng ring %s SpO2 poll reply payload=%s values=%s",
+                address,
+                packet.payload.hex(),
+                values,
+            )
+        return values
+    if opcode in (yc.MEASUREMENT_COMPLETE, yc.MEASUREMENT_STATUS):
+        return [byte for byte in packet.payload if byte in SPO2_PLAUSIBLE]
+    return []
 
 
 def hrs_bpm(data: bytes) -> int | None:
@@ -821,21 +913,60 @@ class YcbtRingApiClient:
         Runs the same flow as the Phase-0 probe: enable sensors (init
         burst), ``0x030C`` prime, ``0x032F`` start, watch ``0x0601``/
         ``0x0602`` (and HRS when present), then always ``0x032F`` stop.
+
+        SpO2 on the R99 needs extra collection paths: instead of
+        ``0x0602`` the ring streams per-second ``0x060D`` progress frames
+        whose value bytes stay zero until it computes a reading, can run
+        past the ordinary window, answers the ``0x0211`` ("IS") real-time
+        query, and may carry the final value in the ``0x040E`` completion
+        payload. For ``blood_oxygen`` all of these are collected, each
+        accepting only bytes in the plausible SpO2 range.
+
         Returns the raw samples; empty means the ring never produced a
         plausible value.
         """
         samples: list[int] = []
+        spo2 = type_name == "blood_oxygen"
+        completed = False
         async with self._connection(purpose, USER_LOCK_WAIT_S) as conn:
             await conn.async_init()
 
             def on_frame(opcode: int, packet: yc_pkt.YcbtPacket) -> None:
-                if opcode != push_opcode or not packet.payload:
+                nonlocal completed
+                if opcode == push_opcode:
+                    if packet.payload:
+                        value = packet.payload[0] & 0xFF
+                        # 0 is "no reading yet"; 255 is the SDK's sentinel
+                        # for sensor-off/garbage on both HR and SpO2 pushes.
+                        if 0 < value < 255:
+                            samples.append(value)
                     return
-                value = packet.payload[0] & 0xFF
-                # 0 is "no reading yet"; 255 is the SDK's sentinel for
-                # sensor-off/garbage on both HR and SpO2 pushes.
-                if 0 < value < 255:
-                    samples.append(value)
+                if opcode in (
+                    yc.MEASUREMENT_COMPLETE,
+                    yc.MEASUREMENT_STATUS,
+                ):
+                    LOGGER.debug(
+                        "Yucheng ring %s measurement %s event 0x%04X:"
+                        " payload=%s",
+                        self._ring_address,
+                        type_name,
+                        opcode,
+                        packet.payload.hex(),
+                    )
+                    completed = True
+                    # The completion layout is undocumented and may carry
+                    # timestamp bytes that look plausible, so trust it only
+                    # when nothing else produced a sample.
+                    if spo2 and not samples:
+                        samples.extend(
+                            _spo2_extra_samples(
+                                opcode, packet, self._ring_address
+                            ),
+                        )
+                elif spo2:
+                    samples.extend(
+                        _spo2_extra_samples(opcode, packet, self._ring_address),
+                    )
 
             def on_hrs(bpm: int) -> None:
                 if 0 < bpm < 255:
@@ -846,41 +977,32 @@ class YcbtRingApiClient:
                 conn.add_hrs_listener(on_hrs)
                 await conn.start_hrs()
 
-            def on_complete(opcode: int, packet: yc_pkt.YcbtPacket) -> None:
-                if opcode in (yc.MEASUREMENT_COMPLETE, yc.MEASUREMENT_STATUS):
-                    LOGGER.debug(
-                        "Yucheng ring %s measurement %s event 0x%04X:"
-                        " payload=%s",
-                        self._ring_address,
-                        type_name,
-                        opcode,
-                        packet.payload.hex(),
-                    )
-
-            conn.add_live_listener(on_complete)
+            window = SPO2_MEASURE_SECONDS if spo2 else MEASURE_SECONDS
             try:
                 LOGGER.debug(
                     "Yucheng ring %s starting %s measurement"
-                    " (prime 0x%04X, start 0x%04X type, watching push 0x%04X)",
+                    " (prime 0x%04X, start 0x%04X type, watching push"
+                    " 0x%04X, window %.0fs)",
                     self._ring_address,
                     type_name,
                     yc.APP_PRIME_SENSORS,
                     yc.APP_START_MEASUREMENT,
                     push_opcode,
+                    window,
                 )
                 await conn.send(yc_pkt.prime_sensors())
                 await asyncio.sleep(0.3)
                 await conn.send(yc_pkt.start_measurement(type_name, start=True))
-                deadline = time.monotonic() + MEASURE_SECONDS
-                first_at: float | None = None
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(1.0)
-                    if samples and first_at is None:
-                        first_at = time.monotonic()
-                    if first_at is not None and (
-                        time.monotonic() - first_at >= MEASURE_SETTLE_S
-                    ):
-                        break
+
+                async def poll_realtime() -> None:
+                    await conn.send(yc_pkt.get_real_blood_oxygen())
+
+                await _async_measure_window(
+                    samples,
+                    window,
+                    lambda: completed,
+                    poll=poll_realtime if spo2 else None,
+                )
             finally:
                 try:
                     await conn.send(yc_pkt.start_measurement(type_name, start=False))
@@ -890,7 +1012,6 @@ class YcbtRingApiClient:
                         self._ring_address,
                     )
                 conn.remove_live_listener(on_frame)
-                conn.remove_live_listener(on_complete)
                 conn.remove_hrs_listener(on_hrs)
                 await conn.stop_hrs()
         LOGGER.debug(
