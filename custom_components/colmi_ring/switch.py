@@ -28,7 +28,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import CONF_MOTION_ENABLED, LOGGER
+from .const import CONF_MOTION_ENABLED, LOGGER, measurement_busy_message
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -100,6 +100,9 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
             return
         self._unsubscribe = motion.add_state_listener(self._on_stream_state)
         self.async_on_remove(self._unsubscribe)
+        # Availability also flips when a Read measurement starts/finishes
+        # (the stream needs the ring's full attention, LEDs included).
+        self.async_on_remove(self.coordinator.add_busy_listener(self._repaint))
 
     @callback
     def _on_stream_state(self, streaming: bool) -> None:
@@ -114,8 +117,17 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Available whenever the manager exists and HA is connected to it."""
-        return super().available and self._motion_manager() is not None
+        """Unavailable while a Read measurement owns the ring's sensor.
+
+        Starting the RAW stream mid-measurement would hijack the very sensor
+        the measurement is reading, corrupting both; the greyed-out switch is
+        the honest signal, and the refusal below covers the racing call.
+        """
+        return (
+            super().available
+            and self._motion_manager() is not None
+            and self.coordinator.ring_busy is None
+        )
 
     async def async_turn_on(self, **kwargs: object) -> None:
         """Start streaming.
@@ -128,6 +140,11 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
         if motion is None:  # pragma: no cover - guarded by available
             raise HomeAssistantError(
                 "Motion streaming is not enabled for this ring"
+            )
+        if self.coordinator.ring_busy is not None:
+            raise HomeAssistantError(
+                "Cannot start the motion stream: "
+                f"{measurement_busy_message(self.coordinator.ring_busy)}"
             )
         await motion.async_start()
         self.async_write_ha_state()

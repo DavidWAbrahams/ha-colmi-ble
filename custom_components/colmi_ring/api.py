@@ -47,7 +47,10 @@ from .colmi_codec.steps import SportDetailParser
 
 from .const import (
     LOGGER,
+    MEASURE_HEART_RATE,
+    MEASURE_SPO2,
     MOTION_STREAM_SILENCE_TIMEOUT_S,
+    measurement_busy_message,
 )
 
 if TYPE_CHECKING:
@@ -998,6 +1001,11 @@ class ColmiRingApiClient:
         # command exchanges on it (see :class:`SharedLink`); long-lived
         # sessions hold it as a lease instead of owning it outright.
         self._link = SharedLink(hass, ring_address)
+        # Name of the on-demand measurement in progress, or None. The
+        # optical sensor lights different LEDs per reading type, so the ring
+        # cannot take two at once; refuse the second press immediately rather
+        # than queueing it for fifteen seconds behind the first.
+        self._measuring: str | None = None
 
     async def async_close(self) -> None:
         """Tear the shared link down now (entry unload/reload).
@@ -1007,6 +1015,18 @@ class ColmiRingApiClient:
         connection owned by nobody in the meantime.
         """
         await self._link.close()
+
+    def _claim_measurement(self, name: str) -> None:
+        """Take the ring's one-at-a-time measurement slot or refuse loudly.
+
+        The transaction lock would serialize two measurements anyway, but
+        waiting on it means the second press hangs for the first one's whole
+        (~30 s) duration and then reports a vague busy timeout. Claiming the
+        slot up front fails it instantly with a message that says why.
+        """
+        if self._measuring is not None:
+            raise ColmiRingApiClientBusyError(measurement_busy_message(self._measuring))
+        self._measuring = name
 
     async def async_get_data(
         self, include_previous_day: bool = False
@@ -1283,10 +1303,14 @@ class ColmiRingApiClient:
         Returns a dict with ``spo2`` (int %) and ``spo2_timestamp`` (aware
         datetime), or ``spo2`` = None if the ring produced no valid reading.
         """
-        async with self._link.acquire("spo2", USER_LOCK_WAIT_S) as conn:
-            samples = await conn.poll_real_time_reading(
-                real_time.RealTimeReading.SPO2
-            )
+        self._claim_measurement(MEASURE_SPO2)
+        try:
+            async with self._link.acquire("spo2", USER_LOCK_WAIT_S) as conn:
+                samples = await conn.poll_real_time_reading(
+                    real_time.RealTimeReading.SPO2
+                )
+        finally:
+            self._measuring = None
         if not samples:
             return {"spo2": None, "spo2_timestamp": None}
         samples.sort()
@@ -1303,10 +1327,14 @@ class ColmiRingApiClient:
         (aware datetime), or ``heart_rate`` = None if the ring produced no
         valid reading.
         """
-        async with self._link.acquire("live-hr", USER_LOCK_WAIT_S) as conn:
-            samples = await conn.poll_real_time_reading(
-                real_time.RealTimeReading.HEART_RATE
-            )
+        self._claim_measurement(MEASURE_HEART_RATE)
+        try:
+            async with self._link.acquire("live-hr", USER_LOCK_WAIT_S) as conn:
+                samples = await conn.poll_real_time_reading(
+                    real_time.RealTimeReading.HEART_RATE
+                )
+        finally:
+            self._measuring = None
         if not samples:
             return {"heart_rate": None, "heart_rate_timestamp": None}
         samples.sort()

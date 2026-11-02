@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -30,6 +31,8 @@ from .const import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .backfill import BackfillManager
     from .data import ColmiRingConfigEntry
     from .motion_manager import MotionManager
@@ -59,6 +62,38 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # A live real-time reading, kept only while it is fresher than the
         # ring's logged HR sample (see _async_update_data precedence).
         self.hr_live: dict[str, Any] | None = None
+        # Name of the on-demand measurement in progress ("heart rate", "SpO2",
+        # ...), or None. The optical sensor takes one measurement at a time,
+        # so the Read buttons and the Motion Stream switch grey out while this
+        # is set (see ColmiRingEntity._watch_ring_busy).
+        self.ring_busy: str | None = None
+        self._busy_listeners: list[Callable[[str | None], None]] = []
+
+    def add_busy_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> Callable[[], None]:
+        """Learn when a measurement starts or stops; returns an unsubscribe."""
+        self._busy_listeners.append(listener)
+        return lambda: self._remove_busy_listener(listener)
+
+    def _remove_busy_listener(
+        self, listener: Callable[[str | None], None]
+    ) -> None:
+        if listener in self._busy_listeners:
+            self._busy_listeners.remove(listener)
+
+    @callback
+    def async_set_ring_busy(self, running: str | None) -> None:
+        """Announce a measurement starting (its name) or finishing (None)."""
+        if self.ring_busy == running:
+            return
+        self.ring_busy = running
+        for listener in list(self._busy_listeners):
+            try:
+                listener(running)
+            except Exception:  # noqa: BLE001
+                # One bad listener must not strand the rest.
+                LOGGER.exception("Colmi ring busy-state listener failed")
 
     @property
     def _is_ycbt(self) -> bool:
