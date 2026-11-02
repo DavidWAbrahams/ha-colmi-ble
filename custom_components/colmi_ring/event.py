@@ -29,6 +29,9 @@ from homeassistant.components.event import EventEntity, EventEntityDescription
 from homeassistant.core import callback
 
 from .const import (
+    CONF_DEVICE_FAMILY,
+    FAMILY_COLMI,
+    FAMILY_YCBT,
     LOGGER,
 )
 from .entity import ColmiRingEntity
@@ -62,9 +65,14 @@ async def async_setup_entry(
     """Set up the gesture event entities.
 
     Not gated on ``CONF_MOTION_ENABLED`` the way the stream switch is: the wave
-    has a second, independent source, so the entities exist for any setup. The
-    listeners they register are harmless while nothing publishes to them.
+    has a second, independent source, so the entities exist for any Colmi
+    setup. The listeners they register are harmless while nothing publishes to
+    them. The Yucheng family is gated out entirely: its firmware has neither
+    the RAW stream nor the on-device wave detector, so a gesture entity could
+    never fire (and the Wave Detection switch behind it is never created).
     """
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) == FAMILY_YCBT:
+        return
     coordinator: ColmiRingDataUpdateCoordinator = entry.runtime_data.coordinator
     async_add_entities(
         ColmiRingGestureEvent(
