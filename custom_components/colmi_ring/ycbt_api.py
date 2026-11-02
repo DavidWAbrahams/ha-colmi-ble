@@ -67,9 +67,10 @@ if TYPE_CHECKING:
 # How long an on-demand measurement runs before we stop the ring and give up.
 # The PPG needs a ~10-20 s warm-up before pushes become plausible.
 MEASURE_SECONDS = 30.0
-# The R99 SpO2 session computes its result later: a field capture showed
-# its 0x060D progress counter still climbing when a 30 s window closed.
-SPO2_MEASURE_SECONDS = 60.0
+# SpO2 and temperature sessions on the R99 compute their result late: a
+# field capture showed the 0x060D progress counter still climbing when a
+# 30 s window closed. Both long-measurement types use this window.
+LONG_MEASURE_SECONDS = 60.0
 # Once a live value has appeared, keep collecting this long (the median needs
 # a handful of samples, and pushing longer only delays the button press
 # landing).
@@ -83,6 +84,10 @@ PROGRESS_SECONDS_INDEX = 21
 # Physiologically plausible SpO2 percent range, used when scanning the
 # undocumented 0x060D / 0x0211 / 0x040E payloads for a value byte.
 SPO2_PLAUSIBLE = range(50, 101)
+# Plausible whole-degC skin-temperature range, the equivalent guard when
+# scanning live/progress/completion payloads for a temperature byte. The
+# int-part byte of an ``int, frac`` encoding (as in AllRecord) lands here.
+TEMP_PLAUSIBLE = range(25, 43)
 # Silence that ends a history drain: the firmware only sends the next block
 # in reply to an ACK, so a missing block within this window means the stream
 # has no more data for us.
@@ -145,20 +150,25 @@ async def _async_measure_window(
             await poll()
 
 
-def _spo2_extra_samples(
-    opcode: int, packet: yc_pkt.YcbtPacket, address: str
+def _measure_extra_samples(
+    opcode: int,
+    packet: yc_pkt.YcbtPacket,
+    context: str,
+    plausible: range,
+    *,
+    fallback: bool = False,
 ) -> list[int]:
-    """SpO2 values carried by the R99 frames other than the 0x0602 push.
+    """Measurement values carried by R99 frames other than the live push.
 
-    The R99 answers a manual SpO2 session with per-second ``0x060D``
-    progress frames (byte 21 is an elapsed-seconds counter; its value
-    fields stay zero until the ring computes a reading), answers the
-    ``0x0211`` ("IS") real-time query on the command characteristic, and
-    may carry the final value in its ``0x040E``/``0x0413`` completion
-    payload. None of these layouts is documented, so only bytes in the
-    plausible SpO2 range are accepted, and the undocumented nonzero
-    progress bytes are logged for later diagnosis. Returns ``[]`` for
-    any other opcode.
+    The R99 answers a manual session with per-second ``0x060D`` progress
+    frames (byte 21 is an elapsed-seconds counter; its value fields stay
+    zero until the ring computes a reading), answers the ``0x0211`` ("IS")
+    real-time query on the command characteristic, and may carry the final
+    value in its ``0x040E``/``0x0413`` completion payload. None of these
+    layouts is documented, so only bytes in ``plausible`` (SpO2 or skin
+    temperature) are accepted, and undocumented nonzero progress bytes are
+    logged for later diagnosis. ``context`` identifies the ring and
+    measurement type in the logs. Returns ``[]`` for any other opcode.
     """
     if not packet.payload:
         return []
@@ -170,29 +180,42 @@ def _spo2_extra_samples(
         ]
         if nonzero:
             LOGGER.debug(
-                "Yucheng ring %s SpO2 progress nonzero bytes: %s",
-                address,
+                "Yucheng ring %s progress nonzero bytes: %s",
+                context,
                 [(idx, f"0x{byte:02X}") for idx, byte in nonzero],
             )
-        return [byte for _, byte in nonzero if byte in SPO2_PLAUSIBLE]
+        return [byte for _, byte in nonzero if byte in plausible]
     if opcode == yc.GET_REAL_BLOOD_OXYGEN:
         values = [
             byte
             for byte in packet.payload.removeprefix(
                 yc.MAGIC_GET_REAL_BLOOD_OXYGEN
             )
-            if byte in SPO2_PLAUSIBLE
+            if byte in plausible
         ]
         if values:
             LOGGER.debug(
-                "Yucheng ring %s SpO2 poll reply payload=%s values=%s",
-                address,
+                "Yucheng ring %s poll reply payload=%s values=%s",
+                context,
                 packet.payload.hex(),
                 values,
             )
         return values
     if opcode in (yc.MEASUREMENT_COMPLETE, yc.MEASUREMENT_STATUS):
-        return [byte for byte in packet.payload if byte in SPO2_PLAUSIBLE]
+        return [byte for byte in packet.payload if byte in plausible]
+    if fallback:
+        # Temperature's live push opcode is undocumented, so when asked we
+        # treat any other frame as a candidate and scan it too.
+        values = [byte for byte in packet.payload if byte in plausible]
+        if values:
+            LOGGER.debug(
+                "Yucheng ring %s frame 0x%04X payload=%s values=%s",
+                context,
+                opcode,
+                packet.payload.hex(),
+                values,
+            )
+        return values
     return []
 
 
@@ -593,6 +616,12 @@ class YcbtRingApiClient:
         # restart does not re-download (and re-ACK-forward) old backlog.
         self._hwm: dict[str, int] = {}
         self._hwm_loaded = False
+        # Last known skin temperature: {"skin_temperature": float,
+        # "skin_temperature_timestamp": datetime} or None. Persisted across
+        # polls because the history stream delivers each record exactly once
+        # (watermark-deduped), so without this the sensor would flap to
+        # unknown on every poll that drains no new records.
+        self._skin_reading: dict[str, Any] | None = None
         self._store = Store(
             hass,
             _HWM_STORE_VERSION,
@@ -752,6 +781,19 @@ class YcbtRingApiClient:
             )
             await self._async_save_hwm()
 
+            # Skin temperature rides in the all-metrics records (layout
+            # pinned in records.AllRecord); keep the newest reading so the
+            # sensor survives polls whose drains hold none.
+            temp_rows = [record for record in all_fresh if record.temperature]
+            if temp_rows:
+                latest_temp = max(temp_rows, key=lambda record: record.timestamp_ms)
+                self._skin_reading = {
+                    "skin_temperature": latest_temp.temperature,
+                    "skin_temperature_timestamp": _ms_to_dt(
+                        latest_temp.timestamp_ms
+                    ),
+                }
+
             by_ts: dict[datetime, int] = {}
             for record in all_fresh:
                 if record.hr:
@@ -813,6 +855,10 @@ class YcbtRingApiClient:
             "hr_settings": None,
             "battery_level": battery_level,
             "battery_charging": battery_charging,
+            "skin_temperature": (self._skin_reading or {}).get("skin_temperature"),
+            "skin_temperature_timestamp": (self._skin_reading or {}).get(
+                "skin_temperature_timestamp"
+            ),
             "steps": steps_total,
             "distance": distance_total,
             "calories": calories_total,
@@ -902,6 +948,31 @@ class YcbtRingApiClient:
             "heart_rate_timestamp": date_utils.now(),
         }
 
+    async def async_take_temperature(self) -> dict[str, Any]:
+        """Take an on-demand skin-temperature measurement.
+
+        The R99's live temperature push opcode is undocumented, so the
+        session collects any frame byte in the plausible whole-degC range
+        (see :meth:`_async_measure`); the median resists the occasional
+        unrelated byte that happens to fall in range. Returns a dict with
+        ``skin_temperature`` (degC) and ``skin_temperature_timestamp``,
+        or ``skin_temperature`` = None if nothing plausible appeared.
+        """
+        samples = await self._async_measure(
+            "temperature", "temperature", yc.REAL_UPLOAD_BODY_DATA
+        )
+        if not samples:
+            return {"skin_temperature": None, "skin_temperature_timestamp": None}
+        reading = {
+            "skin_temperature": float(_median(samples)),
+            "skin_temperature_timestamp": date_utils.now(),
+        }
+        # Persist so the next poll's (possibly empty) history drain does
+        # not drop the reading the user just asked for. A failed session
+        # leaves any earlier reading standing instead of clearing it.
+        self._skin_reading = reading
+        return reading
+
     async def _async_measure(
         self,
         purpose: str,
@@ -911,29 +982,36 @@ class YcbtRingApiClient:
         """Prime + start a manual measurement and collect its live pushes.
 
         Runs the same flow as the Phase-0 probe: enable sensors (init
-        burst), ``0x030C`` prime, ``0x032F`` start, watch ``0x0601``/
-        ``0x0602`` (and HRS when present), then always ``0x032F`` stop.
+        burst), ``0x030C`` prime, ``0x032F`` start, watch the metric's
+        push opcode (and HRS when present), then always ``0x032F`` stop.
 
-        SpO2 on the R99 needs extra collection paths: instead of
-        ``0x0602`` the ring streams per-second ``0x060D`` progress frames
-        whose value bytes stay zero until it computes a reading, can run
-        past the ordinary window, answers the ``0x0211`` ("IS") real-time
-        query, and may carry the final value in the ``0x040E`` completion
-        payload. For ``blood_oxygen`` all of these are collected, each
-        accepting only bytes in the plausible SpO2 range.
+        SpO2 and temperature on the R99 need extra collection paths: the
+        ring streams per-second ``0x060D`` progress frames whose value
+        bytes stay zero until it computes a reading, can run past the
+        ordinary window, answers the ``0x0211`` ("IS") real-time query
+        (SpO2 only), and may carry the final value in the ``0x040E``
+        completion payload. SpO2 keeps its verified ``0x0602`` push plus
+        these extras; temperature has no verified push opcode, so every
+        frame is scanned for bytes in the plausible range instead. Each
+        path accepts only in-range bytes, and the median resists the
+        occasional coincidental one.
 
         Returns the raw samples; empty means the ring never produced a
         plausible value.
         """
         samples: list[int] = []
         spo2 = type_name == "blood_oxygen"
+        temp = type_name == "temperature"
+        scan = spo2 or temp
+        plausible = TEMP_PLAUSIBLE if temp else SPO2_PLAUSIBLE
         completed = False
+        log_context = f"{self._ring_address} {type_name}"
         async with self._connection(purpose, USER_LOCK_WAIT_S) as conn:
             await conn.async_init()
 
             def on_frame(opcode: int, packet: yc_pkt.YcbtPacket) -> None:
                 nonlocal completed
-                if opcode == push_opcode:
+                if opcode == push_opcode and not temp:
                     if packet.payload:
                         value = packet.payload[0] & 0xFF
                         # 0 is "no reading yet"; 255 is the SDK's sentinel
@@ -957,15 +1035,24 @@ class YcbtRingApiClient:
                     # The completion layout is undocumented and may carry
                     # timestamp bytes that look plausible, so trust it only
                     # when nothing else produced a sample.
-                    if spo2 and not samples:
+                    if scan and not samples:
                         samples.extend(
-                            _spo2_extra_samples(
-                                opcode, packet, self._ring_address
+                            _measure_extra_samples(
+                                opcode,
+                                packet,
+                                log_context,
+                                plausible,
                             ),
                         )
-                elif spo2:
+                elif scan:
                     samples.extend(
-                        _spo2_extra_samples(opcode, packet, self._ring_address),
+                        _measure_extra_samples(
+                            opcode,
+                            packet,
+                            log_context,
+                            plausible,
+                            fallback=temp,
+                        ),
                     )
 
             def on_hrs(bpm: int) -> None:
@@ -977,7 +1064,7 @@ class YcbtRingApiClient:
                 conn.add_hrs_listener(on_hrs)
                 await conn.start_hrs()
 
-            window = SPO2_MEASURE_SECONDS if spo2 else MEASURE_SECONDS
+            window = LONG_MEASURE_SECONDS if scan else MEASURE_SECONDS
             try:
                 LOGGER.debug(
                     "Yucheng ring %s starting %s measurement"

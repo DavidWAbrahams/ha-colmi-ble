@@ -69,6 +69,19 @@ async def async_setup_entry(
             ),
         ]
     )
+    # On-demand skin temperature exists only on the Yucheng protocol family;
+    # the Colmi client has no temperature command path at all.
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) == FAMILY_YCBT:
+        buttons.append(
+            ColmiRingTemperatureButton(
+                coordinator=coordinator,
+                entity_description=ButtonEntityDescription(
+                    key="colmi_ring_temperature_button",
+                    name="Read Temperature",
+                    icon="mdi:thermometer",
+                ),
+            )
+        )
     async_add_entities(buttons)
 
 
@@ -195,3 +208,39 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
                 "(is the ring worn snugly on a finger?)"
             )
         self.coordinator.apply_heart_rate(reading)
+
+
+class ColmiRingTemperatureButton(ColmiRingEntity, ButtonEntity):
+    """Trigger an on-demand skin-temperature measurement on the ring."""
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        entity_description: ButtonEntityDescription,
+    ) -> None:
+        """Initialize the button class."""
+        super().__init__(coordinator)
+        self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{entity_description.key}"
+        )
+
+    def press(self) -> None:
+        """Press the button (measurement takes up to a minute; background it)."""
+        self._assert_ring_free()
+        self.hass.async_create_task(self.async_press())
+
+    async def async_press(self) -> None:
+        """Take an on-demand skin-temperature reading and publish it."""
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            reading = await client.async_take_temperature()
+        except ColmiRingApiClientError as err:
+            LOGGER.warning("Colmi ring temperature measurement failed: %s", err)
+            raise
+        if reading.get("skin_temperature") is None:
+            LOGGER.warning(
+                "Colmi ring temperature measurement produced no valid reading "
+                "(is the ring worn snugly on a finger?)"
+            )
+        self.coordinator.apply_skin_temperature(reading)

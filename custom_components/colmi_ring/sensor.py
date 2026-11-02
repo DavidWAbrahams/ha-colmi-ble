@@ -11,10 +11,20 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfLength
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfEnergy,
+    UnitOfLength,
+    UnitOfTemperature,
+)
 from homeassistant.core import callback
 
-from .const import CONF_MOTION_ENABLED, LOGGER
+from .const import (
+    CONF_DEVICE_FAMILY,
+    CONF_MOTION_ENABLED,
+    FAMILY_YCBT,
+    LOGGER,
+)
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -68,6 +78,20 @@ ENTITY_DESCRIPTIONS = (
         icon="mdi:lungs",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
+    ),
+)
+
+# Skin temperature comes from the Yucheng all-metrics history stream (and
+# the on-demand temperature session), neither of which the Colmi protocol
+# client implements, so the sensor is created for YCBT entries only.
+YCBT_ENTITY_DESCRIPTIONS = (
+    SensorEntityDescription(
+        key="skin_temperature",
+        name="Skin Temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
     ),
 )
 
@@ -161,12 +185,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up the sensor platform."""
     coordinator: ColmiRingDataUpdateCoordinator = entry.runtime_data.coordinator
+    descriptions = list(ENTITY_DESCRIPTIONS)
+    if entry.data.get(CONF_DEVICE_FAMILY) == FAMILY_YCBT:
+        descriptions.extend(YCBT_ENTITY_DESCRIPTIONS)
     async_add_entities(
         ColmiRingSensor(
             coordinator=coordinator,
             entity_description=entity_description,
         )
-        for entity_description in ENTITY_DESCRIPTIONS
+        for entity_description in descriptions
     )
     # The accelerometer sensors only have data while the RAW stream is on, which
     # only happens with gestures enabled, so that option gates them too. Yucheng
@@ -212,7 +239,7 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
             )
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> int | float | None:
         """Return the native value of the sensor."""
         data = self.coordinator.data
         if not data:
@@ -231,6 +258,11 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
                     }
             elif self.entity_description.key == "spo2":
                 timestamp = self.coordinator.data.get("spo2_timestamp")
+                self._attr_extra_state_attributes = {"timestamp": timestamp}
+            elif self.entity_description.key == "skin_temperature":
+                timestamp = self.coordinator.data.get(
+                    "skin_temperature_timestamp"
+                )
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
         super()._handle_coordinator_update()
 

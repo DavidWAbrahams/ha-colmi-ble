@@ -302,6 +302,20 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         data["spo2_timestamp"] = reading.get("spo2_timestamp")
         self.async_set_updated_data(data)
 
+    def apply_skin_temperature(self, reading: dict[str, Any]) -> None:
+        """Push a fresh skin-temperature reading to entities immediately.
+
+        Unlike SpO2 the Yucheng client persists the reading itself (it is
+        what every later poll re-publishes), so the coordinator only has
+        to make this press land now instead of at the next poll.
+        """
+        data = dict(self.data) if self.data else {}
+        data["skin_temperature"] = reading.get("skin_temperature")
+        data["skin_temperature_timestamp"] = reading.get(
+            "skin_temperature_timestamp"
+        )
+        self.async_set_updated_data(data)
+
     def apply_heart_rate(self, reading: dict[str, Any]) -> None:
         """Store a fresh live HR reading and push it to entities immediately."""
         self.hr_live = reading
