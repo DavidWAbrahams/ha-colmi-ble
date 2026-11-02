@@ -5,8 +5,9 @@ __pycache__
 */build/*
 */dist/*
 
-# third-party reference sources (foreign licenses; must not be committed)
+# local development AI cruft
 research/
+plans/
 
 
 # misc
