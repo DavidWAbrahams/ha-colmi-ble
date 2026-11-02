@@ -13,7 +13,17 @@ from homeassistant.const import UnitOfTime
 
 from .api import ColmiRingApiClientError
 from .colmi_codec.hr_settings import HeartRateLogSettings
-from .const import CONF_DEVICE_FAMILY, FAMILY_COLMI, FAMILY_YCBT, LOGGER
+from .const import (
+    CONF_DEVICE_FAMILY,
+    CONF_YCBT_MONITOR_INTERVAL,
+    DEFAULT_YCBT_MONITOR_INTERVAL,
+    FAMILY_COLMI,
+    FAMILY_YCBT,
+    LOGGER,
+    YCBT_MONITOR_INTERVAL_MAX,
+    YCBT_MONITOR_INTERVAL_MIN,
+    clamp_ycbt_monitor_interval,
+)
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -41,6 +51,20 @@ ENTITY_DESCRIPTIONS = (
     ),
 )
 
+# The Yucheng set_monitor_interval payload is one minute byte with the OEM
+# SDK documenting 1..240 minutes; there is no Colmi-style log-grid reason to
+# floor it at 5.
+YCBT_ENTITY_DESCRIPTION = NumberEntityDescription(
+    key="colmi_ring_hr_log_interval",
+    name="Heart Rate Sample Interval",
+    icon="mdi:heart-pulse",
+    native_unit_of_measurement=UnitOfTime.MINUTES,
+    native_min_value=YCBT_MONITOR_INTERVAL_MIN,
+    native_max_value=YCBT_MONITOR_INTERVAL_MAX,
+    native_step=1,
+    mode=NumberMode.BOX,
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,  # noqa: ARG001 Unused function argument: `hass`
@@ -48,12 +72,18 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the number platform."""
-    # The interval is a Colmi vendor command; the Yucheng ring's sampling rate
-    # is fixed by the integration instead, so expose no control for it.
     if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) == FAMILY_YCBT:
-        LOGGER.debug(
-            "Colmi ring %s is a Yucheng ring: skipping the HR interval number",
-            entry.entry_id,
+        # Same user-facing control, different backing: the family has no
+        # interval *read* opcode, so the entity shows the value the
+        # integration last had the ring apply (the entry options), not one
+        # read back from the ring.
+        async_add_entities(
+            [
+                YcbtRingMonitorIntervalNumber(
+                    coordinator=entry.runtime_data.coordinator,
+                    entity_description=YCBT_ENTITY_DESCRIPTION,
+                )
+            ]
         )
         return
     async_add_entities(
@@ -63,6 +93,68 @@ async def async_setup_entry(
         )
         for entity_description in ENTITY_DESCRIPTIONS
     )
+
+
+class YcbtRingMonitorIntervalNumber(ColmiRingEntity, NumberEntity):
+    """Yucheng background-monitoring interval, backed by the entry options.
+
+    The ring never reports its interval, so this entity is write-through:
+    the value comes from the options the integration applies on every
+    connect, and setting it writes the ring immediately *and* persists the
+    new value (which reloads the entry, so future connects agree).
+    """
+
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        entity_description: NumberEntityDescription,
+    ) -> None:
+        """Initialize the number entity."""
+        super().__init__(coordinator)
+        self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{entity_description.key}"
+        )
+
+    @property
+    def native_value(self) -> float:
+        """The interval the integration keeps the ring set to (minutes)."""
+        return float(
+            clamp_ycbt_monitor_interval(
+                self.coordinator.config_entry.options.get(
+                    CONF_YCBT_MONITOR_INTERVAL,
+                    DEFAULT_YCBT_MONITOR_INTERVAL,
+                )
+            )
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Write the interval to the ring, then persist it in the options."""
+        self._assert_ring_free()
+        entry = self.coordinator.config_entry
+        client = entry.runtime_data.client
+        try:
+            accepted = await client.async_set_monitor_interval(int(value))
+        except ColmiRingApiClientError as err:
+            LOGGER.warning(
+                "Failed to set Yucheng ring monitor interval to %s: %s",
+                value,
+                err,
+            )
+            raise
+        LOGGER.debug(
+            "Yucheng ring monitor interval set to %s min; persisting option",
+            accepted,
+        )
+        # Persisting the option fires our update listener, which reloads the
+        # entry so the client factory and coordinator pick up the new value;
+        # no explicit coordinator refresh is needed.
+        self.hass.config_entries.async_update_entry(
+            entry,
+            options={**entry.options, CONF_YCBT_MONITOR_INTERVAL: accepted},
+        )
 
 
 class ColmiRingHrIntervalNumber(ColmiRingEntity, NumberEntity):

@@ -26,6 +26,32 @@ CONF_HR_STALE_POLLS = "hr_stale_after_polls"
 CONF_POLL_MAX_INTERVAL = "poll_max_interval"
 DEFAULT_POLL_MAX_INTERVAL = 30
 
+# Yucheng rings have no readable HR-sampling setting (no read opcode exists),
+# so the integration's chosen background monitoring interval lives here in
+# the entry options and is re-sent to the ring on every connect. The number
+# entity writes it, the init burst applies it, and the coordinator matches
+# its poll/staleness cadence to it.
+CONF_YCBT_MONITOR_INTERVAL = "ycbt_monitor_interval"
+DEFAULT_YCBT_MONITOR_INTERVAL = 5
+# The set_monitor_interval payload is one minute byte; the firmware's own
+# accepted range per the reverse-engineered SDK (1..240 minutes).
+YCBT_MONITOR_INTERVAL_MIN = 1
+YCBT_MONITOR_INTERVAL_MAX = 240
+
+
+def clamp_ycbt_monitor_interval(value: object) -> int:
+    """Coerce an option value to a valid Yucheng monitor interval (minutes).
+
+    Missing/garbage option values fall back to the default so a hand-edited
+    or half-migrated entry never yields an out-of-range wire value.
+    """
+    try:
+        minutes = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        minutes = DEFAULT_YCBT_MONITOR_INTERVAL
+    return max(YCBT_MONITOR_INTERVAL_MIN, min(YCBT_MONITOR_INTERVAL_MAX, minutes))
+
+
 # Import heart-rate samples recorded while out of BLE range into HA history
 # (direct recorder states insert). Safe for the MEASUREMENT state class.
 CONF_HR_BACKFILL = "hr_backfill"

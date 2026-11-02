@@ -21,9 +21,12 @@ from .const import (
     CONF_HR_STALE_POLLS,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
+    CONF_YCBT_MONITOR_INTERVAL,
     DEFAULT_POLL_MAX_INTERVAL,
+    DEFAULT_YCBT_MONITOR_INTERVAL,
     FAMILY_YCBT,
     LOGGER,
+    clamp_ycbt_monitor_interval,
 )
 
 if TYPE_CHECKING:
@@ -61,6 +64,20 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     def _is_ycbt(self) -> bool:
         """True when this entry's ring speaks the Yucheng YCBT protocol."""
         return self.config_entry.data.get(CONF_DEVICE_FAMILY) == FAMILY_YCBT
+
+    @property
+    def _ycbt_monitor_interval(self) -> int:
+        """The Yucheng sampling cadence this entry's options ask for.
+
+        The family has no interval read opcode, so the option value is the
+        source of truth: the number entity writes it, and the client's init
+        burst re-applies it to the ring on every connect.
+        """
+        return clamp_ycbt_monitor_interval(
+            self.config_entry.options.get(
+                CONF_YCBT_MONITOR_INTERVAL, DEFAULT_YCBT_MONITOR_INTERVAL
+            )
+        )
 
     @staticmethod
     def _prefer_newer_hr(data: dict[str, Any], live: dict[str, Any]) -> bool:
@@ -188,14 +205,12 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             self.hr_live = None
 
-    # Floor for the adaptive poll interval. The ring's HR log is a 5-min
-    # slot grid, so polling faster than that can never reveal a new sample.
+    # Floor for the adaptive poll interval (Colmi family). The ring's HR log
+    # is a 5-min slot grid, so polling faster than that can never reveal a
+    # new sample. Yucheng records carry minute-granular timestamps and their
+    # sampling rate is ours to choose, so that family may poll faster.
     _MIN_POLL_MINUTES = 5
-
-    # Yucheng rings expose no readable sampling setting; the client commands
-    # a 5-minute monitor interval at connect time, so we treat that as the
-    # sampling interval for polling and staleness math.
-    _YCBT_SAMPLE_INTERVAL_MINUTES = 5
+    _YCBT_MIN_POLL_MINUTES = 1
 
     def _apply_poll_interval(self, data: dict[str, Any]) -> None:
         """Match the poll cadence to the ring's sampling interval, capped.
@@ -212,12 +227,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         """
         settings = data.get("hr_settings")
         if self._is_ycbt:
-            # Yucheng family: no settings entity, fixed monitor interval.
-            sample_minutes = self._YCBT_SAMPLE_INTERVAL_MINUTES
+            # Yucheng family: no settings reply; the option the integration
+            # pushes to the ring is the sampling interval.
+            sample_minutes = self._ycbt_monitor_interval
         elif not isinstance(settings, HeartRateLogSettings):
             return
         else:
             sample_minutes = settings.interval
+        floor = self._YCBT_MIN_POLL_MINUTES if self._is_ycbt else self._MIN_POLL_MINUTES
         try:
             max_minutes = int(
                 self.config_entry.options.get(
@@ -227,7 +244,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         except (TypeError, ValueError):
             max_minutes = DEFAULT_POLL_MAX_INTERVAL
         minutes = max(
-            self._MIN_POLL_MINUTES,
+            floor,
             min(sample_minutes, max_minutes),
         )
         new_interval = timedelta(minutes=minutes)
@@ -270,11 +287,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             if isinstance(settings, HeartRateLogSettings)
             # Yucheng rings have no settings reply; Colmi rings that failed the
             # settings query fall back to a conservative typical interval.
-            else (
-                self._YCBT_SAMPLE_INTERVAL_MINUTES
-                if self._is_ycbt
-                else 15
-            )
+            else (self._ycbt_monitor_interval if self._is_ycbt else 15)
         )
         threshold = timedelta(
             minutes=stale_polls * poll_minutes + interval_minutes + 5

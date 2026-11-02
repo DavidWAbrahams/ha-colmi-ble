@@ -55,7 +55,11 @@ from .colmi_codec import date_utils
 from .colmi_codec.ycbt import constants as yc
 from .colmi_codec.ycbt import packet as yc_pkt
 from .colmi_codec.ycbt import records as yc_rec
-from .const import LOGGER
+from .const import (
+    DEFAULT_YCBT_MONITOR_INTERVAL,
+    LOGGER,
+    clamp_ycbt_monitor_interval,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -136,12 +140,16 @@ class _YcbtConnection:
         lock: asyncio.Lock | None = None,
         lock_wait_s: float = POLL_LOCK_WAIT_S,
         purpose: str = "poll",
+        monitor_interval_minutes: int = DEFAULT_YCBT_MONITOR_INTERVAL,
     ) -> None:
         self._hass = hass
         self._address = address
         self._lock = lock
         self._lock_wait_s = lock_wait_s
         self._purpose = purpose
+        # Background monitoring interval the init burst (re-)applies, chosen
+        # by the owner from the entry options; see async_set_monitor_interval.
+        self._monitor_interval = clamp_ycbt_monitor_interval(monitor_interval_minutes)
         self._locked = False
         self._client: BleakClient | None = None
         self._write_char: BleakGATTCharacteristic | None = None
@@ -430,7 +438,7 @@ class _YcbtConnection:
             self.clear_replies()
             for packet in (
                 yc_pkt.setting_time(_now_local()),
-                yc_pkt.set_monitor_interval(5),
+                yc_pkt.set_monitor_interval(self._monitor_interval),
                 yc_pkt.enable_bg_spo2_monitor(True),
                 yc_pkt.enable_health_sensors(True),
                 yc_pkt.get_device_name(),
@@ -457,10 +465,17 @@ class _YcbtConnection:
 class YcbtRingApiClient:
     """High level client for a Yucheng YCBT ring (R20/R99 family)."""
 
-    def __init__(self, hass: HomeAssistant, ring_address: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        ring_address: str,
+        monitor_interval_minutes: int = DEFAULT_YCBT_MONITOR_INTERVAL,
+    ) -> None:
         """Store the HA instance and ring address (no connection yet)."""
         self._hass = hass
         self._ring_address = ring_address
+        # The number entity's current value, re-applied on every connect.
+        self._monitor_interval = clamp_ycbt_monitor_interval(monitor_interval_minutes)
         # Every session to this ring goes through here (one central).
         self._lock = asyncio.Lock()
         # Per-history-stream high-water marks (unix ms), persisted so a
@@ -481,6 +496,7 @@ class YcbtRingApiClient:
             lock=self._lock,
             lock_wait_s=lock_wait_s,
             purpose=purpose,
+            monitor_interval_minutes=self._monitor_interval,
         )
 
     # ------------------------------------------------------- watermarks
@@ -718,6 +734,32 @@ class YcbtRingApiClient:
         local = value.astimezone() if value.tzinfo else value
         async with self._connection("set-time", USER_LOCK_WAIT_S) as conn:
             await conn.send(yc_pkt.setting_time(local))
+
+    async def async_set_monitor_interval(self, minutes: int) -> int:
+        """Set the ring's background monitoring interval.
+
+        Unlike the Colmi settings command there is no read opcode, so the
+        accepted value is confirmed only by the opcode echo (this family
+        answers every command with a frame echoing its opcode) and by the
+        absence of a 0xFC rejection. Returns the clamped value actually
+        written; raises when the ring refused or never answered.
+        """
+        minutes = clamp_ycbt_monitor_interval(minutes)
+        async with self._connection("interval", USER_LOCK_WAIT_S) as conn:
+            rejections_before = conn.rejections
+            conn.clear_replies()
+            await conn.send(yc_pkt.set_monitor_interval(minutes))
+            reply = await conn.get_reply(yc.SET_MONITOR_INTERVAL)
+            if reply is None or conn.rejections > rejections_before:
+                msg = (
+                    f"Yucheng ring {self._ring_address} did not accept "
+                    f"monitoring interval {minutes} min"
+                )
+                raise ColmiRingApiClientCommunicationError(msg)
+        # Keep our copy so later connects re-apply it even before the entry
+        # reload triggered by the options write lands.
+        self._monitor_interval = minutes
+        return minutes
 
     async def async_take_spo2(self) -> dict[str, Any]:
         """Take an on-demand SpO2 measurement and return the median sample.

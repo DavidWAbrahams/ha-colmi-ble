@@ -18,10 +18,12 @@ from .backfill import BackfillManager
 from .const import (
     CONF_DEVICE_FAMILY,
     CONF_WAVE_TIMEOUT,
+    CONF_YCBT_MONITOR_INTERVAL,
     DOMAIN,
     FAMILY_COLMI,
     FAMILY_YCBT,
     LOGGER,
+    clamp_ycbt_monitor_interval,
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
@@ -112,7 +114,16 @@ async def async_setup_entry(
     family = entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI)
     ring_address = entry.data[CONF_ADDRESS]
     if family == FAMILY_YCBT:
-        client = YcbtRingApiClient(hass=hass, ring_address=ring_address)
+        client = YcbtRingApiClient(
+            hass=hass,
+            ring_address=ring_address,
+            # The ring's monitoring interval is not readable back, so the
+            # options value is the source of truth the init burst re-applies
+            # on every connect (see the number platform's ycbt entity).
+            monitor_interval_minutes=clamp_ycbt_monitor_interval(
+                entry.options.get(CONF_YCBT_MONITOR_INTERVAL)
+            ),
+        )
     else:
         client = ColmiRingApiClient(hass=hass, ring_address=ring_address)
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
