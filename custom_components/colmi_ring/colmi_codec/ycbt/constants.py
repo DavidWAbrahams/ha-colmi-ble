@@ -83,9 +83,10 @@ REAL_UPLOAD_HEART = 0x0601
 REAL_UPLOAD_BLOOD_OXY = 0x0602
 REAL_UPLOAD_BLOOD_PRESS = 0x0603
 #: Per-second measurement-progress push observed on R99 during a manual
-#: SpO2 session (31-byte payload; byte 21 is an elapsed-seconds counter and
-#: the value fields stay zero until the ring computes a reading). The R99
-#: never pushes 0x0602, so this is its only live measurement frame.
+#: SpO2 session (31-byte payload; byte 21 is an elapsed-seconds counter;
+#: the value fields stayed zero for the whole session in our logs). The
+#: R99 does deliver its SpO2 reading on 0x0602, but only ~40 s into the
+#: session -- late for a 30 s window, which is why we wait up to 60 s.
 REAL_UPLOAD_MEASURE_PROGRESS = 0x060D
 REAL_UPLOAD_BODY_DATA = 0x0610
 REAL_UPLOAD_BATTERY = 0x0615
