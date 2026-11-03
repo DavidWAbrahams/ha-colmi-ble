@@ -48,10 +48,9 @@ The ring only reports data while it is within Bluetooth range of Home Assistant.
 
 The ring doesn't stop measuring, though. It keeps logging heart rate and activity to internal memory. When you come home and the ring reconnects, this integration reads that stored log and tries to backfill the missing time.
 
-- **Heart rate** is backfilled automatically (on by default). Because it is a plain measurement, it shows up correctly in both the raw history graph and long-term statistics.
-- **Steps, distance, and calories** backfill is optional and experimental (off by default). These are total-increasing sensors, so I don't know if backfilled data points will play nicely with statistics (min/max/avg). Enable it from the integration's options ("Experimental: also backfill steps/distance/calories history") if are ok with that and want their history graphs filled in anyway.
+Backfill is enabled by default and can be toggled from the integration's options ("Recover samples recorded on the ring while out of Bluetooth range") under Settings -> Devices and Services -> Colmi Ring -> Configure.
 
-You can toggle these behaviors under Settings -> Devices and Services -> Colmi Ring -> Configure.
+Heart rate is a plain measurement, so it shows up correctly in both the raw history graph and long-term statistics. Steps, distance, and calories are total-increasing sensors, so backfilled values are imported into raw history only (long-term statistics are not rebuilt for old ranges), and I don't know if backfilled data points will play nicely with statistics (min/max/avg) near the junctions.
 
 # Gestures
 
@@ -78,8 +77,9 @@ alongside it.)
 The stream-derived gestures are built for what the firmware actually reports: the stock R02
 firmware sends one raw sample per second, so these gestures are about *poses held for seconds*,
 not quick flicks (a flick is invisible at 1 Hz). They work at 1 Hz and get a little crisper if
-you flash the 4 Hz firmware mentioned below. How long a pose must be held is configurable in the
-integration's options (*Gesture hold seconds*, 2 s by default).
+you flash the 4 Hz firmware mentioned below. How long each gesture must be held is configurable
+separately in the integration's options (*Hand still hold seconds*, 10 s by default; *Hand flip
+hold seconds*, 2 s by default).
 
 | Gesture | Fires when |
 | --- | --- |

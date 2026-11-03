@@ -6,7 +6,7 @@ Run: python scripts/_flip_check.py
 Simulates the two stream gestures the way the real stream behaves -- 1 Hz
 (stock R02 firmware) and 4 Hz (fast firmware) -- and asserts:
 
-* stillness fires once per calm episode, exactly ``hold_s`` in, and re-arms
+* stillness fires once per calm episode, exactly the still hold in, and re-arms
   only after the hand actually moves;
 * a flip (two confirmed poses >= 120 degrees apart with a fast transition)
   fires once, at the end of the second hold, at both sample rates;
@@ -119,7 +119,7 @@ def events_of(
 
 
 # 1. Stillness: one event per calm episode, ``HOLD_S`` in, re-armed by motion.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 6.0, 1.0) + waving(3.0, 1.0) + held(UP, 4.0, 1.0),
@@ -132,7 +132,7 @@ check(
     f"times={stills}",
 )
 check(
-    "still fires at hold_s, not earlier",
+    "still fires at the hold, not earlier",
     bool(stills) and abs(stills[0] - HOLD_S) < 1e-9,
     f"first={stills[:1]}",
 )
@@ -147,7 +147,7 @@ check(
 )
 
 # 2. Flip at 1 Hz: palm up 3 s, one shaking sample, palm down 3 s.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 3.0, 1.0) + waving(1.0, 1.0) + held(DOWN, 3.0, 1.0),
@@ -178,7 +178,7 @@ else:
     check("flip arrives at the end of the second hold", False, "no flip fired")
 
 # 3. Negative: the same two poses reached slowly must not read as a flip.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 3.0, 1.0) + waving(8.0, 1.0) + held(DOWN, 3.0, 1.0),
@@ -190,7 +190,7 @@ check(
 )
 
 # 4. Negative: a stream gap (reconnect) makes the transition unknowable.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(detector, held(UP, 3.0, 1.0), rate=1.0)
 fired += stream(detector, held(DOWN, 3.0, 1.0), rate=1.0, t0=23.0)
 check(
@@ -199,7 +199,7 @@ check(
 )
 
 # 5. Back-to-back flips each fire: every confirmed pose anchors the next one.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 3.0, 1.0)
@@ -217,7 +217,7 @@ check(
 )
 
 # 6. Flip at 4 Hz: the fixed 1 s transition floor binds instead of the dt term.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 2.5, 4.0) + waving(0.5, 4.0) + held(DOWN, 2.5, 4.0),
@@ -227,7 +227,7 @@ flips = times_of(fired, GESTURE_FLIP)
 check("flip fires at 4 Hz", len(flips) == 1, f"times={flips}")
 
 # 7. Negative: a chain of orthogonal poses (90 deg each) is not a flip.
-detector = StreamGestureDetector(hold_s=HOLD_S)
+detector = StreamGestureDetector(still_hold_s=HOLD_S, flip_hold_s=HOLD_S)
 fired = stream(
     detector,
     held(UP, 3.0, 1.0)

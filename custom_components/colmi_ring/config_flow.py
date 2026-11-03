@@ -17,19 +17,20 @@ from .api import (
     ColmiRingApiClientError,
 )
 from .const import (
+    CONF_BACKFILL_ON_RECONNECT,
     CONF_DEVICE_FAMILY,
-    CONF_GESTURE_HOLD_S,
-    CONF_HR_BACKFILL,
+    CONF_GESTURE_HOLD_FLIP_S,
+    CONF_GESTURE_HOLD_STILL_S,
     CONF_HR_STALE_POLLS,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
-    CONF_STEPS_BACKFILL,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
-    DEFAULT_GESTURE_HOLD_S,
+    DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_STILL_S,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
@@ -82,8 +83,10 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for Blueprint."""
 
     # Version 3 added the device family; see async_migrate_entry in
-    # __init__.py, which stamps pre-v3 entries as ``colmi``.
-    VERSION = 3
+    # __init__.py, which stamps pre-v3 entries as ``colmi``. Version 4 merged
+    # the hr/steps backfill options into one flag; version 5 split the gesture
+    # hold option into a per-gesture pair (see async_migrate_entry).
+    VERSION = 5
 
     # Ring we were started from (Bluetooth discovery), if any: used to
     # pre-populate the address field and default the family picker.
@@ -239,21 +242,28 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         )
                     ),
                     vol.Optional(
-                        CONF_HR_BACKFILL,
+                        CONF_BACKFILL_ON_RECONNECT,
                         default=self.config_entry.options.get(
-                            CONF_HR_BACKFILL, True
+                            CONF_BACKFILL_ON_RECONNECT, True
                         ),
                     ): selector.BooleanSelector(),
                     vol.Optional(
-                        CONF_STEPS_BACKFILL,
+                        CONF_GESTURE_HOLD_STILL_S,
                         default=self.config_entry.options.get(
-                            CONF_STEPS_BACKFILL, False
+                            CONF_GESTURE_HOLD_STILL_S, DEFAULT_GESTURE_HOLD_STILL_S
                         ),
-                    ): selector.BooleanSelector(),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=60,
+                            step=0.5,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
                     vol.Optional(
-                        CONF_GESTURE_HOLD_S,
+                        CONF_GESTURE_HOLD_FLIP_S,
                         default=self.config_entry.options.get(
-                            CONF_GESTURE_HOLD_S, DEFAULT_GESTURE_HOLD_S
+                            CONF_GESTURE_HOLD_FLIP_S, DEFAULT_GESTURE_HOLD_FLIP_S
                         ),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(

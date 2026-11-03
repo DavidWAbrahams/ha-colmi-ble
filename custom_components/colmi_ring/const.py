@@ -55,14 +55,12 @@ def clamp_ycbt_monitor_interval(value: object) -> int:
     return max(YCBT_MONITOR_INTERVAL_MIN, min(YCBT_MONITOR_INTERVAL_MAX, minutes))
 
 
-# Import heart-rate samples recorded while out of BLE range into HA history
-# (direct recorder states insert). Safe for the MEASUREMENT state class.
-CONF_HR_BACKFILL = "hr_backfill"
-
-# Experimental: same treatment for the steps/distance/calories sensors, whose
-# TOTAL_INCREASING day totals are imported as cumulative bins. Raw history
-# only (no long-term statistics for old ranges); see plans/hr-backfill-plan.md.
-CONF_STEPS_BACKFILL = "steps_backfill"
+# Import samples recorded on the ring while out of BLE range into HA history
+# (direct recorder states insert). Heart rate is a plain MEASUREMENT and
+# imports cleanly; the steps/distance/calories sensors are TOTAL_INCREASING
+# day totals imported as cumulative bins (raw history only, no long-term
+# statistics for old ranges); see plans/hr-backfill-plan.md.
+CONF_BACKFILL_ON_RECONNECT = "backfill_on_reconnect"
 
 # --- Motion / gesture detection -------------------------------------------
 #
@@ -93,11 +91,17 @@ def measurement_busy_message(running: str) -> str:
         f" {running} measurement in progress"
     )
 
-# Seconds a pose must be held to count as a hold: how long the hand must stay
-# still for the stillness gesture, and how long each palm pose must be held for
-# the flip gesture (palm up for X s, flipped, palm down for X s).
-CONF_GESTURE_HOLD_S = "gesture_hold_s"
-DEFAULT_GESTURE_HOLD_S = 2.0
+# Seconds the hand must stay still for the stillness gesture. Longer than the
+# flip hold on purpose: a resting hand should take its time announcing itself,
+# so casual pauses do not fire the event.
+CONF_GESTURE_HOLD_STILL_S = "gesture_hold_still_s"
+DEFAULT_GESTURE_HOLD_STILL_S = 10.0
+
+# Seconds each palm pose must be held for the flip gesture (palm up for X s,
+# flipped, palm down for X s). Short because the flip is an intentional two-
+# part gesture, not a resting state.
+CONF_GESTURE_HOLD_FLIP_S = "gesture_hold_flip_s"
+DEFAULT_GESTURE_HOLD_FLIP_S = 2.0
 
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
