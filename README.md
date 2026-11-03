@@ -1,30 +1,19 @@
 # What?
 Integrate the Colmi line of smart rings with Home Assistant.
 Colmi rings (like the R02, R06, R10 etc) can be found for under $20 on AliExpress.
-It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
 These can be distiguished because they use QRing as their phone app.
+It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
+It also supports gestures!
 
-There is also partial support for some clones that are sold interchangably on AliExpress, i.e. the YCBT R20 and R99 which use "Smarthealt" app. I've been
-burned by sellers mislabeling their
-product and wanted something to work for you in that case.
+There is also partial support for some clones that are sold interchangeably on AliExpress, i.e. the YCBT R20 and R99 which use "Smarthealth" app. I've been burned by sellers mislabeling their product and wanted something to work for you in that case.
+This does not include gesture support.
 
 # How?
 Home Assistant will periodically pull data from your ring via Bluetooth Low Energy.
 This is built on top of tahnok's Python API (https://github.com/tahnok/colmi_r02_client) and ludeeus's Home Assistant Integration blueprint (https://github.com/ludeeus/integration_blueprint)
 
-# The shared Bluetooth link
-The ring's firmware serves exactly one Bluetooth central at a time, so this integration keeps a
-single shared connection per ring instead of one connection per feature. Everything goes through
-it: the periodic poll, the on-demand buttons, and the long-lived gesture sessions. Command
-exchanges are serialized on the link, so two features can never talk to the ring at the same
-moment, but they take turns quickly instead of blocking each other for minutes.
-
-The connection is opened lazily on first use and dropped about ten seconds after its last user
-leaves, so nothing holds a live link (and no extra battery) while the ring is just sitting idle.
-While it *is* idle, features like Wave Detection coexist with polling instead of freezing it.
-
 # Requirements
-Your home assistant device must have the ability to make active Bluetooth Low Energy (BLE) connections. The bluetooth adapter in a raspberry pi or some PC motherboards will satisfy this. It will also work with ESPHome bluetooth repeaters if they are configured something like this:
+Your home assistant device must have the ability to make active Bluetooth Low Energy (BLE) connections. The bluetooth adapter in a raspberry pi or some PC motherboards will satisfy this. It will also work with ESPHome bluetooth proxies if they are configured something like this:
 
 ```
 esp32_ble_tracker:
@@ -41,15 +30,12 @@ Install HACS. Add this repo to your Custom Repositories. Install "Colmi Ring" fr
 If for some reason autodiscovery doesn't work, try going to Settings -> Devices and Services -> Add Integration -> Colmi Ring
 
 # A note on SpO2
-The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware doesn't sample it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant at your own risk (expect reduced battery life if you do it frequently).
+The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware doesn't sample it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant as you wish, understanding that battery life will be reduced.
 
 # Filling in the gaps (backfill)
-The ring only reports data while it is within Bluetooth range of Home Assistant. The moment you leave the house and walk out of range, the BLE connection drops and Home Assistant stops receiving anything new.
+The ring only reports data while it is within Bluetooth range of Home Assistant. When you leave the house, the BLE connection drops and Home Assistant stops receiving data.
 
 The ring doesn't stop measuring, though. It keeps logging heart rate and activity to internal memory. When you come home and the ring reconnects, this integration reads that stored log and tries to backfill the missing time.
-
-- **Heart rate** is backfilled automatically (on by default). Because it is a plain measurement, it shows up correctly in both the raw history graph and long-term statistics.
-- **Steps, distance, and calories** backfill is optional and experimental (off by default). These are total-increasing sensors, so I don't know if backfilled data points will play nicely with statistics (min/max/avg). Enable it from the integration's options ("Experimental: also backfill steps/distance/calories history") if are ok with that and want their history graphs filled in anyway.
 
 You can toggle these behaviors under Settings -> Devices and Services -> Colmi Ring -> Configure.
 
@@ -69,22 +55,18 @@ provides:
 - a `Vertical Angle` sensor - see below.
 
 The two switches are mutually exclusive with *each other*. The RAW stream puts the firmware into a
-mode that takes over the accelerometer and stops the wave detector's reports, so turning one on
-while the other is running is *refused*, with an error naming the switch to turn off, rather than
-silently ending a session you were relying on. (This is a firmware limitation, not a connection
-limit: unlike before, wave detection no longer blocks polling or the buttons, which share the link
-alongside it.)
+mode that takes over the accelerometer and stops the wave detector's reports.
 
-The stream-derived gestures are built for what the firmware actually reports: the stock R02
-firmware sends one raw sample per second, so these gestures are about *poses held for seconds*,
-not quick flicks (a flick is invisible at 1 Hz). They work at 1 Hz and get a little crisper if
+The stream-derived gestures are designed within the limits of the hardware: the stock R02
+firmware sends one sample per second, so these gestures are about *poses held for seconds*,
+not quick motions. They work at 1 Hz and get a little crisper if
 you flash the 4 Hz firmware mentioned below. How long a pose must be held is configurable in the
-integration's options (*Gesture hold seconds*, 2 s by default).
+integration's options.
 
 | Gesture | Fires when |
 | --- | --- |
-| `hand_still` | your hand stays roughly motionless (little acceleration beyond gravity) for the hold time - once per still period, re-armed by the next movement |
-| `hand_flip` | you hold one palm pose (e.g. palm up) for the hold time, turn your hand over quickly, and hold the opposite pose (palm down) for the hold time. The turn must be quick: at 1 Hz that means about two samples, at 4 Hz under a second |
+| `hand_still` | your hand stays roughly motionless for the hold time |
+| `hand_flip` | you hold one pose (e.g. palm up), quickly turn your hand 180°, and hold the opposite pose (palm down) |
 
 Each gesture also has a matching *event entity* (`event.<ring>_wave`, `event.<ring>_hand_still`,
 `event.<ring>_hand_flip`), so automations can trigger on either the entity or the event below.
@@ -103,10 +85,6 @@ action:
       angle_deg: "{{ trigger.event.data.angle_deg }}"
 ```
 
-The event data includes `gesture`, `source` (`ring` for the wave, `stream` for the two
-stream-derived gestures), `hold_s` (how long the completing pose was held) and `angle_deg`
-(how far the new pose is from the previous one - near 180 for a flip; 0 for the other gestures).
-
 ## Watching the raw accelerometer data
 
 While the `Motion Stream` switch is on, the ring's raw accelerometer readings are also published as
@@ -124,33 +102,24 @@ z: the axis through the finger hole
 Y: in the plane of the ring, roughly through the charging port
 x: in the plane of the ring, roughly through the red LED
 
-These are deliberately *unprocessed*: no low-pass filter, no gravity removal, no tilt or orientation
-solving.
-
 In the stock firmware, these messages are sent once per second. You can easily flash a modified firmware
-from your browser that increases this to 4 per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using [ATC RF03 Ring OTA Flasher](https://atc1441.github.io/ATC_RF03_Writer.html). If you do this, you will likely want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25s.
+from your browser that increases an R02 to 4 messages per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using [ATC RF03 Ring OTA Flasher](https://atc1441.github.io/ATC_RF03_Writer.html). If you do this, you may want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25s.
 
-The motion sensors read `unknown` whenever the motion stream is off. Updates are published about once a second
+Even with a flashed firmware, Home Assistant updates are published about once a second
 rather than at the full stream rate - every state change is a recorder row, and a higher rate could
-swamp your database. Automations that need the sharp signal could use
-the gesture event(s).
+swamp your database. Automations that need a sharp signal could use the gesture event(s).
 
 ## Vertical angle
 
-`sensor.<ring>_vertical_angle` is the one derived motion sensor: how far the axis through the ring hole is deflected from the horizontal plane, measured absolutely against gravity. It reads between 0 and 90 degrees:
+`sensor.<ring>_vertical_angle` is a derived motion sensor: how far the finger is deflected from the horizontal plane. It reads between 0 and 90 degrees:
 
-- about **0** when the ring is held horizontally (the hole axis is flat, so there is little or no gravity along it),
-- about **90** when the ring is held vertically (the hole axis points at the sky or at the floor - both read 90, the sensor does not care which end is up).
+- about **0** when the ring is held horizontally (the finger is parallel to the floor),
+- about **90** when the ring is held vertically (the finger is perpendicular to the floor - up or down both read 90, the sensor does know which end is up).
 
 In practice a real ring never quite reaches either end: sensor bias and tiny
 residual motion keep a "flat" reading a degree or two above 0 and an upright one
-a degree or two below 90. The integration's options expose two calibration
-anchors for this - *Angle calibration: raw angle that means flat* and *Angle
-calibration: raw angle that means upright*. Set the first to the angle your ring
-still reads when perfectly flat (e.g. `1.5`) and the second to the angle it maxes
-out at when perfectly upright (e.g. `88`), and the reading is rescaled linearly
-between them, clamped to 0 and 90. Both default to `0`, which means no correction
-(the upright anchor being `0` selects the default of 90).
+a degree or two below 90. If you want the sensors to actually use the full 0-90 scale,
+there are two configuration options to manually adjust the endpoints.
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
