@@ -18,41 +18,31 @@ from .api import (
 )
 from .const import (
     CONF_DEVICE_FAMILY,
-    CONF_GESTURE_SENSITIVITY,
+    CONF_GESTURE_HOLD_S,
     CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
-    CONF_MOTION_ENABLED,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
     CONF_STEPS_BACKFILL,
+    CONF_VERTICAL_FLAT_DEG,
+    CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
-    DEFAULT_GESTURE_SENSITIVITY,
+    DEFAULT_GESTURE_HOLD_S,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
+    DEFAULT_VERTICAL_FLAT_DEG,
+    DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
     DOMAIN,
     FAMILY_COLMI,
     FAMILY_YCBT,
-    GESTURE_SENSITIVITY_SCALE,
     LOGGER,
+    VERTICAL_FLAT_ANCHOR_MAX_DEG,
 )
 from .ycbt_api import YcbtRingApiClient
-
-# Options flow labels for the sensitivity selector, in GESTURE_SENSITIVITY_SCALE's
-# declaration order so the dropdown reads low -> high.
-_GESTURE_SENSITIVITY_LABELS = {
-    "low": "Low (only clear movements)",
-    "medium": "Medium",
-    "high": "High (also slight movements)",
-}
-_GESTURE_SENSITIVITY_OPTIONS = [
-    {"value": key, "label": _GESTURE_SENSITIVITY_LABELS.get(key, key)}
-    for key in GESTURE_SENSITIVITY_SCALE
-]
-
 
 # Advertisement-level hints for the two protocol families. These only pick
 # the default of the family picker; the authoritative decision is the
@@ -261,20 +251,16 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         ),
                     ): selector.BooleanSelector(),
                     vol.Optional(
-                        CONF_MOTION_ENABLED,
+                        CONF_GESTURE_HOLD_S,
                         default=self.config_entry.options.get(
-                            CONF_MOTION_ENABLED, False
+                            CONF_GESTURE_HOLD_S, DEFAULT_GESTURE_HOLD_S
                         ),
-                    ): selector.BooleanSelector(),
-                    vol.Optional(
-                        CONF_GESTURE_SENSITIVITY,
-                        default=self.config_entry.options.get(
-                            CONF_GESTURE_SENSITIVITY, DEFAULT_GESTURE_SENSITIVITY
-                        ),
-                    ): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=_GESTURE_SENSITIVITY_OPTIONS,
-                            mode=selector.SelectSelectorMode.DROPDOWN,
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=15,
+                            step=0.5,
+                            mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
                     vol.Optional(
@@ -293,8 +279,6 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         )
                     ),
                     vol.Optional(
-                        # Not behind CONF_MOTION_ENABLED: the wave switch exists
-                        # whether or not gesture streaming is enabled.
                         CONF_WAVE_TIMEOUT,
                         default=self.config_entry.options.get(
                             CONF_WAVE_TIMEOUT, DEFAULT_WAVE_TIMEOUT
@@ -320,6 +304,34 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             min=0,
                             max=5,
                             step=0.05,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_VERTICAL_FLAT_DEG,
+                        default=self.config_entry.options.get(
+                            CONF_VERTICAL_FLAT_DEG, DEFAULT_VERTICAL_FLAT_DEG
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=VERTICAL_FLAT_ANCHOR_MAX_DEG,
+                            step=0.1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_VERTICAL_UPRIGHT_DEG,
+                        default=self.config_entry.options.get(
+                            CONF_VERTICAL_UPRIGHT_DEG, DEFAULT_VERTICAL_UPRIGHT_DEG
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            # 0 means "no correction" (raw reading already
+                            # tops out at 90).
+                            min=0,
+                            max=90,
+                            step=0.1,
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),

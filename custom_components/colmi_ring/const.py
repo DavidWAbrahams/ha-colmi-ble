@@ -93,24 +93,11 @@ def measurement_busy_message(running: str) -> str:
         f" {running} measurement in progress"
     )
 
-# Opt-in: creates the motion switch and the gesture event entities. Off by
-# default because streaming holds the single GATT link open (which pauses
-# normal polling) and measurably costs battery.
-CONF_MOTION_ENABLED = "motion_enabled"
-
-# Multiplier on the detector thresholds: "low" sensitivity means a *bigger*
-# movement is required. See GESTURE_SENSITIVITY_SCALE.
-CONF_GESTURE_SENSITIVITY = "gesture_sensitivity"
-DEFAULT_GESTURE_SENSITIVITY = "medium"
-
-# Options value -> divisor applied to the base thresholds, so a larger number
-# means a *smaller* threshold, i.e. more sensitive. "low" is therefore the
-# fraction and "high" the multiple.
-GESTURE_SENSITIVITY_SCALE: dict[str, float] = {
-    "low": 0.6,
-    "medium": 1.0,
-    "high": 1.6,
-}
+# Seconds a pose must be held to count as a hold: how long the hand must stay
+# still for the stillness gesture, and how long each palm pose must be held for
+# the flip gesture (palm up for X s, flipped, palm down for X s).
+CONF_GESTURE_HOLD_S = "gesture_hold_s"
+DEFAULT_GESTURE_HOLD_S = 2.0
 
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
@@ -162,37 +149,35 @@ MOTION_GRAVITY_TRUST_G = 0.2
 # spends near 1 g (its very first samples) is not eaten.
 MOTION_GRAVITY_FAST_TAU_S = 0.08
 
-# Time constant of the leaky vertical-velocity integrator. The leak is what
-# makes a slow, deliberate arm lift invisible while a snap raise is obvious.
-MOTION_VELOCITY_LEAK_TAU_S = 0.45
+# A sample counts as *still* when the gravity-removed acceleration stays under
+# this much. A walking or gesturing hand shakes by far more than this; a held
+# pose, even a slightly unsteady one, sits well inside it.
+MOTION_STILL_ACCEL_G = 0.25
 
-# Peak |vertical velocity| (g*s, ~1 g*s = 9.8 m/s) that counts as a rapid
-# vertical movement. 0.11 g*s is about 1.1 m/s.
-MOTION_RAISE_VELOCITY_G_S = 0.11
+# A held pose tolerates this much wander from the direction it was anchored to
+# before the hold is considered broken. Comfortably above sensor and hand
+# jitter, comfortably below the tens of degrees of a deliberate pose change.
+MOTION_HOLD_TOLERANCE_DEG = 30.0
 
-# A *rapid* movement must also reach its peak velocity promptly. Without this,
-# holding a steady push for two seconds eventually accumulates enough leaked
-# velocity to count as a raise on a sensitive setting, even though the gesture
-# is defined by its snap rather than its total impulse.
-MOTION_RAISE_MAX_PEAK_S = 0.6
+# The two poses of a flip must be at least this far apart. A palm-up to
+# palm-down rotation is 180 degrees; the margin below it absorbs a flip that is
+# not quite complete and the heading error of a single unsmoothed sample.
+# Deliberately far from the hold tolerance: an angle between the two belongs to
+# neither, and ends the old hold without ever completing a new one.
+MOTION_FLIP_MIN_ANGLE_DEG = 120.0
 
-# The gravity direction must also have swung by this much between the start and
-# the end of a vertical movement, so a straight up-and-down bounce (or a
-# vibration) cannot pass for a raise. Deliberately well below the tens of
-# degrees a wrist actually rotates: the ending heading is an average over a
-# short window, which flattens the measured swing somewhat.
-#
-# Unlike the magnitude thresholds, this is NOT divided by the gesture
-# sensitivity: a swing either happened or it did not, and relaxing it on a
-# sensitive setting would remove the discrimination the setting depends on.
-MOTION_RAISE_PITCH_DEG = 15.0
-MOTION_PITCH_RECENT_WINDOW_S = 0.25
+# The turn between the two holds of a flip must not take longer than this.
+# It is a floor: the detector uses max(this, MOTION_FLIP_TRANSITION_DT_FACTOR
+# times the measured sample interval), because a stream that reports once per
+# second cannot observe a transition of under a second at all - one second is
+# the shortest measurable transition, not a license to accept slow ones.
+MOTION_FLIP_TRANSITION_BASE_S = 1.0
+MOTION_FLIP_TRANSITION_DT_FACTOR = 2.0
 
-# Minimum interval between reports of the *same* gesture, and the shorter
-# window in which one gesture suppresses the others (a hard raise ends with a
-# lower, and either can bleed into the other's window).
-MOTION_GESTURE_COOLDOWN_S = 1.2
-MOTION_GESTURE_SUPPRESS_S = 0.5
+# A longer silence than this between samples is a gap (reconnect, dropped
+# burst), not a measurement: it ends the current hold, re-arms the stillness
+# gesture, and must not move the gravity estimate or the rate estimate.
+MOTION_SAMPLE_GAP_MAX_S = 5.0
 
 # --- Vertical angle tuning --------------------------------------------------
 #
@@ -235,10 +220,67 @@ MOTION_VERTICAL_SNAP_TAU_S = 0.1
 # simply holds its value while they last.
 MOTION_VERTICAL_TRUST_G = 0.3
 
-# Report zero below this angle. A resting hand produces a little residual noise
-# however well filtered, and the recorder does not need a row per wiggle; a ring
-# resting horizontal reads exactly zero rather than a wander around it.
-MOTION_VERTICAL_DEADBAND_DEG = 1.5
+# --- Vertical angle calibration --------------------------------------------
+#
+# The reported elevation is a straight rescale of the filtered one, anchored at
+# both ends: the raw elevation that means "flat" maps to 0, and the raw elevation
+# that means "vertical" maps to 90, linearly in between. A monotonic map loses
+# nothing - distinct poses still read distinctly, and nothing saturates except
+# the two endpoints - while a snap band would have to assert a precision the
+# hardware does not have.
+#
+# The high end matters because ``asin`` amplifies horizontal error without limit:
+# at 1 g, 0.05 g of horizontal reading - sensor bias, cross-axis error, or a hand
+# that is not perfectly still - pins the raw elevation near 87 degrees no matter
+# how well the signal is filtered, because the offset is a nonzero mean rather
+# than noise. Averaging cannot remove it; only an anchor can.
+#
+# Both are options rather than constants because the offset is a property of the
+# unit and the wear, not of the code. Each defaults to no correction.
+
+# Raw elevation (degrees) that reads as flat, i.e. is reported as 0.
+CONF_VERTICAL_FLAT_DEG = "vertical_flat_deg"
+DEFAULT_VERTICAL_FLAT_DEG = 0.0
+
+# Raw elevation (degrees) that reads as vertical, i.e. is reported as 90. Zero
+# means "the raw reading already tops out at 90", so no correction.
+CONF_VERTICAL_UPRIGHT_DEG = "vertical_upright_deg"
+DEFAULT_VERTICAL_UPRIGHT_DEG = 0.0
+
+# How far either anchor may move from its uncorrected value. Beyond these the
+# map would gain so much that ordinary readings stop being meaningful; the
+# useful range for a real ring is a couple of degrees at each end.
+VERTICAL_FLAT_ANCHOR_MAX_DEG = 10.0
+VERTICAL_UPRIGHT_ANCHOR_MIN_DEG = 80.0
+
+
+def resolve_vertical_anchors(flat: object, upright: object) -> tuple[float, float]:
+    """Coerce the two anchor options into a valid ``(flat, vertical)`` pair.
+
+    Garbage or half-migrated values fall back to no correction rather than to a
+    plausible-looking map, because a silently wrong calibration is worse than an
+    obviously uncorrected one. A pair that cannot define an increasing map - the
+    flat anchor at or above the vertical one - is rejected outright.
+    """
+    try:
+        flat_deg = float(flat)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        flat_deg = DEFAULT_VERTICAL_FLAT_DEG
+    try:
+        upright_deg = float(upright)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        upright_deg = DEFAULT_VERTICAL_UPRIGHT_DEG
+
+    flat_deg = min(max(flat_deg, 0.0), VERTICAL_FLAT_ANCHOR_MAX_DEG)
+    if upright_deg <= 0:
+        # The default: no correction at the high end.
+        upright_deg = 90.0
+    else:
+        upright_deg = min(max(upright_deg, VERTICAL_UPRIGHT_ANCHOR_MIN_DEG), 90.0)
+
+    if upright_deg <= flat_deg:
+        return 0.0, 90.0
+    return flat_deg, upright_deg
 
 # How long the RAW stream may stay silent before the session is considered
 # dead and closed. Generous because the stock firmware is known to report

@@ -28,7 +28,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import CONF_MOTION_ENABLED, LOGGER, measurement_busy_message
+from .const import LOGGER, measurement_busy_message
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -54,22 +54,18 @@ async def async_setup_entry(
 ) -> None:
     """Set up the link-holding switches.
 
-    The wave switch is offered unconditionally: it needs no motion option, and
-    a user who only wants waves should still be able to arm the detector. The
-    stream switch stays behind ``CONF_MOTION_ENABLED``, which also gates the
-    gesture event entities.
+    Both switches are offered to every Colmi setup: neither needs an opt-in
+    option, and each only costs battery while it is actually on. Yucheng rings
+    have no motion manager, so they get neither switch.
     """
     motion = entry.runtime_data.motion
     if motion is None:  # pragma: no cover - setup order guard
         LOGGER.debug("Colmi ring switches have no motion manager")
         return
     entities: list[ColmiRingEntity] = [
-        ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator)
+        ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
+        ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
     ]
-    if entry.options.get(CONF_MOTION_ENABLED, False):
-        entities.append(
-            ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator)
-        )
     async_add_entities(entities)
 
 

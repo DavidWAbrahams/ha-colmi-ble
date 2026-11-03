@@ -5,24 +5,36 @@ offline against a captured sample log.
 
 Design notes
 ------------
-The ring's axis mapping and sign convention on our firmware are not confirmed,
-and the ring is worn on a finger whose orientation changes constantly, so the
-detector never reasons about "the vertical axis". Instead it keeps a slow
-exponential average of the raw vector, which *is* the gravity direction as seen
-by the sensor (an accelerometer at rest reads +1 g along its own up axis).
-Projecting the gravity-removed acceleration onto that direction yields a
-signed *vertical* acceleration whose sign is meaningful in any wrist
-orientation: positive means "accelerating the way gravity says up is", i.e.
-upward. A rapid hand raise therefore produces a positive velocity bump and a
-lower a negative one, regardless of which of X/Y/Z the ring happens to use.
+Stock R02 firmware reports one accelerometer sample per second, and that
+sample rate rules out every gesture built on sub-second transients: a leaky
+velocity integrator loses most of its accumulated velocity between samples,
+and a movement that takes half a second to complete is over before the ring
+looks. What survives that rate are *poses* - directions the hand holds for
+seconds, which a single sample per second is plenty to confirm.
 
-Two guards keep ordinary life from producing gestures:
+:class:`StreamGestureDetector` therefore detects two pose gestures, both read
+from the raw vector as gravity direction plus movement:
 
-* the vertical velocity is a *leaky* integral, so a slow, deliberate arm lift
-  never accumulates enough to trip it, and
-* a raise/lower must also be corroborated by a real swing of the gravity
-  direction between the start and the peak of the movement, so vibration or a
-  jiggling walk cannot pass.
+* ``hand_still``: the gravity-removed acceleration stays small for
+  ``gesture_hold_s`` seconds. Fires once per quiet episode, so holding a
+  resting hand produces one event rather than one per second.
+* ``hand_flip``: a held pose, a quick turn, and a second held pose far from
+  the first - in practice palm up, flip, palm down. The two poses are compared
+  as the *angle between their gravity directions*, close to 180 degrees for a
+  palm flip, so the check never assumes which sensor axis points where. The
+  comparison deliberately keeps the sign of the dot product: folding it (as
+  :func:`_separation_deg` is careful *not* to do, unlike an axis-elevation
+  measure) would read a 180-degree flip as no movement at all. The turn must
+  also be quick, judged against a window that scales with the measured sample
+  interval: a stream that reports once per second cannot observe a sub-second
+  transition at all, so a few sample intervals is the most faithful reading
+  of "less than a second" the firmware allows, while a faster firmware keeps
+  a tight window.
+
+The old flick detector that this replaced integrated vertical velocity to
+separate a snap raise from a slow lift; at 1 Hz it could not resolve either,
+and what it fired on was a tilt, so it and its sensitivity option were removed
+rather than left to misfire.
 
 The file also holds :class:`VerticalAngleTracker`, which reports how far the
 ring's hole axis is deflected from the horizontal plane, measured absolutely
@@ -38,47 +50,38 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from .colmi_codec.motion import AccelSample
 from .const import (
-    MOTION_GESTURE_COOLDOWN_S,
-    MOTION_GESTURE_SUPPRESS_S,
+    DEFAULT_GESTURE_HOLD_S,
+    MOTION_FLIP_MIN_ANGLE_DEG,
+    MOTION_FLIP_TRANSITION_BASE_S,
+    MOTION_FLIP_TRANSITION_DT_FACTOR,
     MOTION_GRAVITY_FAST_TAU_S,
     MOTION_GRAVITY_TAU_S,
     MOTION_GRAVITY_TRUST_G,
-    MOTION_PITCH_RECENT_WINDOW_S,
-    MOTION_RAISE_MAX_PEAK_S,
-    MOTION_RAISE_PITCH_DEG,
-    MOTION_RAISE_VELOCITY_G_S,
-    MOTION_VELOCITY_LEAK_TAU_S,
+    MOTION_HOLD_TOLERANCE_DEG,
+    MOTION_SAMPLE_GAP_MAX_S,
+    MOTION_STILL_ACCEL_G,
     MOTION_VERTICAL_AXIS,
-    MOTION_VERTICAL_DEADBAND_DEG,
     MOTION_VERTICAL_SNAP_DEG,
     MOTION_VERTICAL_SNAP_TAU_S,
     MOTION_VERTICAL_TAU_S,
     MOTION_VERTICAL_TRUST_G,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Iterable
-
 # Gesture identifiers, used as the event entity key and in event data.
 GESTURE_WAVE = "wave"
-GESTURE_RAISE = "hand_raise"
-GESTURE_LOWER = "hand_lower"
+GESTURE_STILL = "hand_still"
+GESTURE_FLIP = "hand_flip"
 
 # Where a gesture came from, reported in event data.
 SOURCE_RING = "ring"  # detected by the ring itself (camera-button gesture)
 SOURCE_STREAM = "stream"  # derived here from the RAW accelerometer stream
 
-# Samples older than this are dropped from the sliding windows.
-_BUFFER_S = 2.5
-
-# The detector must see the velocity decay to this fraction of the threshold
-# before it will arm again. Without it, the braking at the top of a raise reads
-# as a lower.
-_REARM_FRACTION = 0.3
+# Samples older than this are dropped from the magnitude buffer kept for the
+# decode sanity check.
+_BUFFER_S = 5.0
 
 # Below this gravity magnitude the vector is too noisy to define "up".
 _MIN_GRAVITY_G = 0.35
@@ -90,28 +93,38 @@ class GestureEvent:
 
     gesture: str
     source: str
-    peak_g: float
-    velocity_g_s: float
+    # Seconds the relevant pose (or calm) was held when the gesture fired.
+    # 0 for the ring's own wave report, which is a statement, not a
+    # measurement, and 0 for gestures with no hold behind them.
+    hold_s: float = 0.0
+    # Angle between the two poses of a flip, in degrees. 0 otherwise.
+    angle_deg: float = 0.0
 
     def as_event_data(self) -> dict[str, float | str]:
         """The payload both the bus event and the entity event carry."""
         return {
             "gesture": self.gesture,
             "source": self.source,
-            "peak_g": self.peak_g,
-            "velocity_g_s": self.velocity_g_s,
+            "hold_s": self.hold_s,
+            "angle_deg": self.angle_deg,
         }
 
 
 @dataclass(slots=True)
-class _Movement:
-    """A vertical movement in progress, plus the heading it started from."""
+class _PoseHold:
+    """A wrist pose, and how long the ring has been holding it.
 
-    sign: int
-    peak: float
-    start_direction: AccelSample | None
+    ``direction`` is the unit gravity vector of the sample that opened the
+    hold; the hold lives while calm samples keep arriving within the tolerance
+    of it. ``confirmed`` marks that it has lasted long enough to be a hold
+    rather than a moment of stillness - only confirmed poses can anchor the
+    flip check.
+    """
+
+    direction: AccelSample
     start_time: float
-    peak_time: float
+    last_calm_time: float
+    confirmed: bool = False
 
 
 def _unit(vector: AccelSample) -> AccelSample | None:
@@ -121,54 +134,56 @@ def _unit(vector: AccelSample) -> AccelSample | None:
     return AccelSample(vector.x / magnitude, vector.y / magnitude, vector.z / magnitude)
 
 
-def _angle_deg(a: AccelSample, b: AccelSample) -> float:
-    """Angle in degrees between two directions (order-insensitive)."""
-    cosine = max(-1.0, min(1.0, abs(a.dot(b))))
+def _separation_deg(a: AccelSample, b: AccelSample) -> float:
+    """Angle in degrees between two directions, 0..180.
+
+    No absolute value on the dot product: 180 degrees must read as 180, since
+    that is exactly the number a palm flip produces. (The vertical angle
+    tracker wants the folded, sign-free version; that one lives there.)
+    """
+    cosine = max(-1.0, min(1.0, a.dot(b)))
     return math.degrees(math.acos(cosine))
 
 
-class GestureDetector:
-    """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`."""
+class StreamGestureDetector:
+    """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`.
 
-    def __init__(self, sensitivity: float = 1.0) -> None:
-        """Create a detector.
+    Feed it every sample of a session and it returns the ``hand_still`` and
+    ``hand_flip`` gestures the stream completes. It also reports the stream's
+    sample rate and median magnitude, which is everything
+    ``MotionManager._async_check_rate`` needs to log what the stream actually
+    looks like once per session.
+    """
 
-        ``sensitivity`` divides the thresholds (higher = more sensitive).
-        """
-        self._sensitivity = sensitivity if sensitivity > 0 else 1.0
+    def __init__(self, hold_s: float = DEFAULT_GESTURE_HOLD_S) -> None:
+        """Create a detector holding poses for ``hold_s`` seconds."""
+        try:
+            hold = float(hold_s)
+        except (TypeError, ValueError):
+            hold = float(DEFAULT_GESTURE_HOLD_S)
+        self._hold_s = min(max(hold, 1.0), 60.0)
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
-        self._velocity = 0.0
         self._dt_ema: float | None = None
         self._last_sample: float | None = None
 
-        # When the vertical velocity was last negligible, so the next movement
-        # can be timed from the start of its acceleration.
-        self._last_slow_time: float | None = None
+        # The pose being held right now, and the last pose that was confirmed
+        # long enough to anchor a flip. The anchor keeps its last calm stamp
+        # live while the same pose keeps holding, and freezes when the hand
+        # moves on, which is exactly what times the flip's transition.
+        self._hold: _PoseHold | None = None
+        self._anchor: _PoseHold | None = None
 
-        self._last_fire: dict[str, float] = {}
-        self._last_any_fire: float | None = None
-        self._move: _Movement | None = None
+        # Calm episode for the stillness gesture: when it started, and whether
+        # it has already fired (one event per episode, not per second).
+        self._still_since: float | None = None
+        self._still_fired = False
 
-        self.last_peak_g = 0.0
-        self.last_velocity_g_s = 0.0
         self.events_seen = 0
         self.samples_seen = 0
 
-    # -- thresholds -------------------------------------------------------
-
-    @property
-    def _velocity_threshold(self) -> float:
-        return MOTION_RAISE_VELOCITY_G_S / self._sensitivity
-
-    @property
-    def _pitch_threshold_deg(self) -> float:
-        # Deliberately *not* scaled by the sensitivity. The swing is not a
-        # magnitude to be out-run but a qualification of the movement: easing
-        # it on a sensitive setting would let a walking bounce or a vibration
-        # pass as a raise, which is exactly the confusion it is here to prevent.
-        return MOTION_RAISE_PITCH_DEG
+    # -- stream diagnostics (for MotionManager's once-per-session log) ----
 
     @property
     def sample_rate_hz(self) -> float | None:
@@ -205,48 +220,36 @@ class GestureDetector:
         if now is None:
             now = time.monotonic()
 
-        events: list[GestureEvent] = []
-        dt = 0.0
-        if self._last_sample is not None:
-            dt = now - self._last_sample
-            # A gap (reconnect, or a ring that reports in bursts) is not a
-            # measurement of the sample rate, and must not drive the
-            # integrator.
-            if dt <= 0 or dt > 1.0:
-                dt = 0.0
-            else:
-                self._dt_ema = dt if self._dt_ema is None else (
-                    0.2 * dt + 0.8 * self._dt_ema
-                )
-        self._last_sample = now
-
+        dt, gap = self._elapsed(now)
         self._samples.append((now, sample))
         self._trim(now)
-        self._update_gravity(sample, dt)
 
-        gravity = self._gravity
-        if gravity is None:
-            return events
+        if gap:
+            # A silence longer than any plausible sample interval means the
+            # stream went away and came back (reconnect, dropped burst). What
+            # the hand did in the silence is unknowable, so every episode open
+            # across it is dropped rather than judged.
+            self._hold = None
+            self._anchor = None
+            self._still_since = None
+            self._still_fired = False
 
-        linear = sample.minus(gravity)
-        peak = linear.magnitude_g
-        # A decaying maximum, so the peak reported with an event and exposed for
-        # tuning means "how hard was the recent movement", not "how hard has it
-        # ever been since the switch was turned on".
-        if dt > 0:
-            self.last_peak_g = max(peak, self.last_peak_g * math.exp(-dt / _BUFFER_S))
-        else:
-            self.last_peak_g = max(peak, self.last_peak_g)
+        if self._gravity is None:
+            self._gravity = sample
+        elif dt > 0:
+            # A same-tick duplicate (dt <= 0) must not move the reference or
+            # count as time passing for the fast filter below.
+            self._update_gravity(sample, dt)
 
-        up = _unit(gravity)
-        if up is None:
-            return events
+        unit = _unit(sample)
+        calm = (
+            unit is not None
+            and sample.minus(self._gravity).magnitude_g <= MOTION_STILL_ACCEL_G
+        )
 
-        vertical = linear.dot(up)
-        self._velocity = self._integrate(vertical, dt)
-        self.last_velocity_g_s = self._velocity
-
-        events.extend(self._check_vertical(now))
+        events: list[GestureEvent] = []
+        events.extend(self._track_stillness(calm=calm, now=now))
+        events.extend(self._track_pose(calm=calm, unit=unit, now=now))
 
         self.events_seen += len(events)
         self.samples_seen += 1
@@ -256,16 +259,37 @@ class GestureDetector:
         """Forget everything (call when a stream session restarts)."""
         self._gravity = None
         self._samples.clear()
-        self._velocity = 0.0
         self._dt_ema = None
         self._last_sample = None
-        self._last_slow_time = None
-        self._last_fire.clear()
-        self._last_any_fire = None
-        self._move = None
+        self._hold = None
+        self._anchor = None
+        self._still_since = None
+        self._still_fired = False
+        self.events_seen = 0
         self.samples_seen = 0
 
     # -- internals --------------------------------------------------------
+
+    def _elapsed(self, now: float) -> tuple[float, bool]:
+        """Seconds since the previous sample, and whether the stream gapped.
+
+        The dt EMA (and with it the sample rate and the flip's transition
+        window) only ever sees plausible sample intervals: a gap is not a
+        measurement of either.
+        """
+        if self._last_sample is None:
+            self._last_sample = now
+            return 0.0, False
+        dt = now - self._last_sample
+        self._last_sample = now
+        if dt <= 0:
+            return 0.0, False
+        if dt > MOTION_SAMPLE_GAP_MAX_S:
+            return 0.0, True
+        self._dt_ema = dt if self._dt_ema is None else (
+            0.2 * dt + 0.8 * self._dt_ema
+        )
+        return dt, False
 
     def _trim(self, now: float) -> None:
         cutoff = now - _BUFFER_S
@@ -275,15 +299,14 @@ class GestureDetector:
     def _update_gravity(self, sample: AccelSample, dt: float) -> None:
         """Complementary filter of the *raw* vector = gravity direction.
 
-        Normally a slow average, so a gesture cannot tilt the reference frame.
-        But a sample whose magnitude is about 1 g is by definition *not*
-        accelerating, which makes the raw vector a trustworthy gravity reading;
-        following it quickly is what stops a changed wrist pose from being
-        misread as a long, slow acceleration.
+        Normally a slow average, so a movement cannot tilt the reference frame
+        and every still sample would then be measured against a frame moving
+        the way the hand just moved. But a sample whose magnitude is about 1 g
+        is by definition *not* accelerating, which makes the raw vector a
+        trustworthy gravity reading; following it quickly is what lets a new
+        palm pose become the reference within one or two samples, which in turn
+        is what makes the *next* pose's stillness measurable.
         """
-        if self._gravity is None or dt <= 0:
-            self._gravity = sample
-            return
         tau = (
             MOTION_GRAVITY_FAST_TAU_S
             if abs(sample.magnitude_g - 1.0) <= MOTION_GRAVITY_TRUST_G
@@ -291,147 +314,121 @@ class GestureDetector:
         )
         alpha = 1.0 - math.exp(-dt / tau)
         gravity = self._gravity
+        if gravity is None:  # pragma: no cover - caller guarantees the first
+            self._gravity = sample
+            return
         self._gravity = AccelSample(
             gravity.x + alpha * (sample.x - gravity.x),
             gravity.y + alpha * (sample.y - gravity.y),
             gravity.z + alpha * (sample.z - gravity.z),
         )
 
-    def _integrate(self, vertical: float, dt: float) -> float:
-        """Leaky integral of vertical acceleration: a velocity proxy.
+    def _track_stillness(
+        self, *, calm: bool, now: float
+    ) -> list[GestureEvent]:
+        """One ``hand_still`` per calm episode, once it has lasted ``hold_s``.
 
-        The leak (``MOTION_VELOCITY_LEAK_TAU_S``) is what makes the detector
-        respond to *snap* rather than displacement: a movement that takes a
-        second to complete leaks away as fast as it accumulates.
+        Calm means the gravity-removed acceleration stays small: a held pose,
+        however slightly unsteady, sits inside the threshold, while a walking
+        or gesturing hand does not. Slowly *drifting* the hand is a separate
+        question - it barely accelerates, so it reads as calm - and that is
+        accepted: the gesture says "this hand is not moving about", which is
+        what the acceleration actually measures.
         """
-        if dt <= 0:
-            return self._velocity
-        decayed = self._velocity * math.exp(-dt / MOTION_VELOCITY_LEAK_TAU_S)
-        return decayed + vertical * dt
-
-    def _check_vertical(self, now: float) -> list[GestureEvent]:
-        """Raise/lower from the vertical velocity, corroborated by the swing.
-
-        A movement opens when the vertical velocity crosses the threshold and
-        is judged when it closes, i.e. once the velocity has decayed back
-        through the re-arm mark and the hand has visibly stopped. Judging on
-        the close is what makes the corroboration meaningful: it compares the
-        heading the movement *started* from with the heading it ended at, which
-        a vibration, a vertical bounce, or a brisk walk all fail while a real
-        arm lift passes easily.
-        """
-        threshold = self._velocity_threshold
-        if abs(self._velocity) <= threshold * _REARM_FRACTION:
-            # Not moving vertically: remember when, so the next movement can be
-            # timed from the start of its acceleration rather than from the
-            # moment it happened to cross the firing threshold.
-            self._last_slow_time = now
-
-        move = self._move
-
-        if move is None:
-            if abs(self._velocity) < threshold:
-                return []
-            self._move = _Movement(
-                sign=1 if self._velocity > 0 else -1,
-                peak=abs(self._velocity),
-                start_direction=self._current_direction(),
-                start_time=self._last_slow_time if self._last_slow_time else now,
-                peak_time=now,
-            )
+        if not calm:
+            self._still_since = None
+            self._still_fired = False
             return []
-
-        if self._velocity * move.sign > move.peak:
-            move.peak = self._velocity * move.sign
-            move.peak_time = now
-        if abs(self._velocity) > threshold * _REARM_FRACTION:
-            return []  # still moving
-
-        self._move = None
-        gesture = GESTURE_RAISE if move.sign > 0 else GESTURE_LOWER
-        if not self._movement_qualified(move, gesture, now):
+        if self._still_since is None:
+            self._still_since = now
             return []
-
-        self._record_fire(gesture, now)
+        held = now - self._still_since
+        if self._still_fired or held < self._hold_s:
+            return []
+        self._still_fired = True
         return [
             GestureEvent(
-                gesture=gesture,
+                gesture=GESTURE_STILL,
                 source=SOURCE_STREAM,
-                peak_g=round(self.last_peak_g, 3),
-                velocity_g_s=round(move.peak * move.sign, 4),
+                hold_s=round(held, 2),
             )
         ]
 
-    def _movement_qualified(self, move: _Movement, gesture: str, now: float) -> bool:
-        """Whether a closed movement was really the rapid gesture it resembles."""
-        if move.peak_time - move.start_time > MOTION_RAISE_MAX_PEAK_S:
-            # The velocity built up gradually rather than snapping, so this was
-            # a shove or a slow lift. On a sensitive setting a steady push
-            # eventually accumulates enough leaked velocity to cross the
-            # threshold, which is why magnitude alone is not enough.
-            return False
-        if not self._can_fire(gesture, now, MOTION_GESTURE_COOLDOWN_S):
-            return False
-        return self._swung_during(move)
+    def _track_pose(
+        self, *, calm: bool, unit: AccelSample | None, now: float
+    ) -> list[GestureEvent]:
+        """Advance the current pose hold; confirm and maybe fire a flip.
 
-    def _current_direction(self) -> AccelSample | None:
-        """Heading over the most recent short window, from the raw samples.
-
-        Both sides of the swing comparison use this same measure. That matters:
-        the gravity estimate is deliberately slow, so comparing it against a
-        fresh reading would report a swing whenever the wrist has *already*
-        settled into a new heading, with no movement involved.
+        A non-calm sample does not end a hold, it just stops it progressing:
+        what ends it is the hand settling somewhere else, because the hold and
+        the flip are both about where the pose *ended up*. If the hand moves
+        for long enough the transition window closes on its own, so a slow
+        change of pose confirms a new hold without ever being called a flip.
         """
-        if len(self._samples) < 2:
-            return None
-        return self._mean_direction(
-            self._samples[-1][0] - MOTION_PITCH_RECENT_WINDOW_S,
-            self._samples[-1][0],
-        )
+        if not calm or unit is None:
+            return []
 
-    def _swung_during(self, move: _Movement) -> bool:
-        """True if the ring ended ``move`` pointing somewhere it did not start."""
-        ended_at = self._current_direction()
-        if move.start_direction is None or ended_at is None:
-            # Too few samples to compare headings. Requiring the corroborating
-            # swing is the safer default: without it we would fire on anything
-            # that moved.
-            return False
-        return _angle_deg(ended_at, move.start_direction) >= self._pitch_threshold_deg
-
-    def _mean_direction(
-        self, start: float, end: float
-    ) -> AccelSample | None:
-        """Unit vector of the average raw sample within ``[start, end]``."""
-        total = [0.0, 0.0, 0.0]
-        count = 0
-        window: Iterable[tuple[float, AccelSample]] = self._samples
-        for stamp, sample in window:
-            if start <= stamp <= end:
-                total[0] += sample.x
-                total[1] += sample.y
-                total[2] += sample.z
-                count += 1
-        if count < 2:
-            return None
-        return _unit(AccelSample(total[0], total[1], total[2]))
-
-    def _can_fire(self, gesture: str, now: float, cooldown: float) -> bool:
-        """Per-gesture cooldown plus a short window of mutual suppression."""
-        previous = self._last_fire.get(gesture)
-        if previous is not None and now - previous < cooldown:
-            return False
+        hold = self._hold
         if (
-            self._last_any_fire is not None
-            and now - self._last_any_fire < MOTION_GESTURE_SUPPRESS_S
+            hold is not None
+            and _separation_deg(hold.direction, unit) <= MOTION_HOLD_TOLERANCE_DEG
         ):
-            return False
-        return True
+            hold.last_calm_time = now
+            if hold.confirmed or now - hold.start_time < self._hold_s:
+                return []
+            return self._confirm_hold(hold, now)
 
-    def _record_fire(self, gesture: str, now: float) -> None:
-        """Note that ``gesture`` fired, for cooldown and mutual suppression."""
-        self._last_fire[gesture] = now
-        self._last_any_fire = now
+        # Settled into a pose far enough from the current hold that it is a
+        # different pose: this sample opens a new hold.
+        self._hold = _PoseHold(direction=unit, start_time=now, last_calm_time=now)
+        return []
+
+    def _confirm_hold(
+        self, hold: _PoseHold, now: float
+    ) -> list[GestureEvent]:
+        """A pose has been held long enough; compare it with the last one.
+
+        The flip is the whole gesture the user described: hold one palm pose,
+        turn, hold the opposite one. Both halves are required before anything
+        fires, so the event arrives at the end of the second hold and each
+        flip of a back-and-forth sequence fires in turn - the confirmed pose
+        just became the anchor for the next one.
+        """
+        hold.confirmed = True
+        anchor = self._anchor
+        events: list[GestureEvent] = []
+        if anchor is not None and anchor is not hold:
+            separation = _separation_deg(anchor.direction, hold.direction)
+            transition = hold.start_time - anchor.last_calm_time
+            if (
+                separation >= MOTION_FLIP_MIN_ANGLE_DEG
+                and transition <= self._transition_window_s()
+            ):
+                events.append(
+                    GestureEvent(
+                        gesture=GESTURE_FLIP,
+                        source=SOURCE_STREAM,
+                        hold_s=round(now - hold.start_time, 2),
+                        angle_deg=round(separation, 1),
+                    )
+                )
+        self._anchor = hold
+        return events
+
+    def _transition_window_s(self) -> float:
+        """Longest transition a flip may take, given the measured sample rate.
+
+        The floor (``MOTION_FLIP_TRANSITION_BASE_S``) is the user's "less than
+        a second" and binds on fast streams. The dt term exists because a 1 Hz
+        stream cannot see a transition at all: one second between holds is one
+        sample, and accepting "a few samples" is the only reading that does
+        not silently disable the gesture on stock firmware.
+        """
+        dt = self._dt_ema if self._dt_ema is not None else 0.0
+        return max(
+            MOTION_FLIP_TRANSITION_BASE_S,
+            MOTION_FLIP_TRANSITION_DT_FACTOR * dt,
+        )
 
 
 class VerticalAngleTracker:
@@ -469,12 +466,24 @@ class VerticalAngleTracker:
     settles in well under a second instead of visibly sliding.
     """
 
-    def __init__(self) -> None:
-        """Start with no estimate."""
-        # Low-passed elevation of the hole axis, in degrees (0..90).
+    def __init__(self, flat_deg: float = 0.0, vertical_deg: float = 90.0) -> None:
+        """Start with no estimate, calibrated to the given anchors.
+
+        ``flat_deg`` and ``vertical_deg`` are the *raw* elevations that mean flat
+        and vertical; the reported angle rescales raw elevations linearly so
+        those map to 0 and 90. The defaults are the uncorrected identity: with
+        real sensor bias the raw reading tops out below 90 (see
+        ``const.CONF_VERTICAL_UPRIGHT_DEG``), and that offset is a property of
+        the unit and the wear, so the anchors come from the entry options.
+        """
+        # Low-passed elevation of the hole axis, in degrees (0..90), raw scale.
         self._elevation: float | None = None
         self._prev_time: float | None = None
         self.angle_deg: float | None = None
+        # Output calibration anchors; guaranteed flat < vertical by the caller
+        # (const.resolve_vertical_anchors).
+        self._flat_deg = flat_deg
+        self._vertical_deg = vertical_deg
 
     def feed(self, sample: AccelSample, now: float | None = None) -> float | None:
         """Feed one sample; return the current angle, or None until trusted.
@@ -518,8 +527,7 @@ class VerticalAngleTracker:
             self._elevation += alpha * (target - self._elevation)
         # dt <= 0 (a gap, or two stamps in one tick): hold the estimate.
 
-        angle = self._elevation
-        self.angle_deg = 0.0 if angle < MOTION_VERTICAL_DEADBAND_DEG else angle
+        self.angle_deg = self._calibrate(self._elevation)
         return self.angle_deg
 
     def reset(self) -> None:
@@ -550,3 +558,20 @@ class VerticalAngleTracker:
         """True if a magnitude near 1 g means gravity is what we are reading."""
         return abs(magnitude_g - 1.0) <= MOTION_VERTICAL_TRUST_G
 
+    def _calibrate(self, raw_deg: float) -> float:
+        """Map a raw elevation onto the calibrated 0..90 scale.
+
+        A strictly monotonic affine map anchored at ``flat_deg`` -> 0 and
+        ``vertical_deg`` -> 90, clamped at both ends. Monotonicity is what makes
+        this honest rather than falsifying: distinct poses still read distinctly
+        and no threshold information is lost, unlike a snap band that reports
+        one value for a range of tilts. The smoothing above stays in raw units
+        so its gap-based snap logic keeps its physical meaning, and at the
+        default anchors this is the identity.
+        """
+        if raw_deg <= self._flat_deg:
+            return 0.0
+        if raw_deg >= self._vertical_deg:
+            return 90.0
+        span = self._vertical_deg - self._flat_deg
+        return (raw_deg - self._flat_deg) * 90.0 / span

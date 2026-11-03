@@ -53,15 +53,16 @@ The ring doesn't stop measuring, though. It keeps logging heart rate and activit
 
 You can toggle these behaviors under Settings -> Devices and Services -> Colmi Ring -> Configure.
 
-# Gestures (experimental, off by default)
+# Gestures
 
 | Switch | What it does | What it costs |
 | --- | --- | --- |
 | `Wave Detection` | Asks the ring to run its own on-device wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable number of minutes (120 by default) |
-| `Motion Stream` | Makes the ring stream raw accelerometer data continuously, so you can build your own gestures in HA | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
+| `Motion Stream` | Makes the ring stream raw accelerometer data continuously. The integration derives two gestures from that stream (`Hand still`, `Hand flip` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
-`Motion Stream` is opt-in from the integration's options ("Enable gesture detection"). Enabling it adds
-that switch plus:
+Both switches are available on any Colmi ring; nothing runs (and nothing costs
+battery) until you turn one on. While the `Motion Stream` switch is on, it also
+provides:
 
 - four accelerometer sensors - `Acceleration X`, `Acceleration Y`, `Acceleration Z` and
   `Acceleration` (the magnitude) - see below, and
@@ -74,6 +75,20 @@ silently ending a session you were relying on. (This is a firmware limitation, n
 limit: unlike before, wave detection no longer blocks polling or the buttons, which share the link
 alongside it.)
 
+The stream-derived gestures are built for what the firmware actually reports: the stock R02
+firmware sends one raw sample per second, so these gestures are about *poses held for seconds*,
+not quick flicks (a flick is invisible at 1 Hz). They work at 1 Hz and get a little crisper if
+you flash the 4 Hz firmware mentioned below. How long a pose must be held is configurable in the
+integration's options (*Gesture hold seconds*, 2 s by default).
+
+| Gesture | Fires when |
+| --- | --- |
+| `hand_still` | your hand stays roughly motionless (little acceleration beyond gravity) for the hold time - once per still period, re-armed by the next movement |
+| `hand_flip` | you hold one palm pose (e.g. palm up) for the hold time, turn your hand over quickly, and hold the opposite pose (palm down) for the hold time. The turn must be quick: at 1 Hz that means about two samples, at 4 Hz under a second |
+
+Each gesture also has a matching *event entity* (`event.<ring>_wave`, `event.<ring>_hand_still`,
+`event.<ring>_hand_flip`), so automations can trigger on either the entity or the event below.
+
 There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
 we may implement:
 
@@ -82,14 +97,15 @@ trigger:
   - platform: event
     event_type: colmi_ring_gesture
     event_data:
-      gesture: wave
+      gesture: hand_flip
 action:
   - variables:
-      peak_g: "{{ trigger.event.data.peak_g }}"
+      angle_deg: "{{ trigger.event.data.angle_deg }}"
 ```
 
-The event data includes `gesture`, `source` (`ring`, since the wave is detected by the ring's own
-detector), `peak_g` and `velocity_g_s`.
+The event data includes `gesture`, `source` (`ring` for the wave, `stream` for the two
+stream-derived gestures), `hold_s` (how long the completing pose was held) and `angle_deg`
+(how far the new pose is from the previous one - near 180 for a flip; 0 for the other gestures).
 
 ## Watching the raw accelerometer data
 
@@ -125,6 +141,16 @@ the gesture event(s).
 
 - about **0** when the ring is held horizontally (the hole axis is flat, so there is little or no gravity along it),
 - about **90** when the ring is held vertically (the hole axis points at the sky or at the floor - both read 90, the sensor does not care which end is up).
+
+In practice a real ring never quite reaches either end: sensor bias and tiny
+residual motion keep a "flat" reading a degree or two above 0 and an upright one
+a degree or two below 90. The integration's options expose two calibration
+anchors for this - *Angle calibration: raw angle that means flat* and *Angle
+calibration: raw angle that means upright*. Set the first to the angle your ring
+still reads when perfectly flat (e.g. `1.5`) and the second to the angle it maxes
+out at when perfectly upright (e.g. `88`), and the reading is rescaled linearly
+between them, clamped to 0 and 90. Both default to `0`, which means no correction
+(the upright anchor being `0` selects the default of 90).
 
 # TODO
 1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

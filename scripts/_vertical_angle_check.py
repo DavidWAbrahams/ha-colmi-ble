@@ -94,10 +94,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-# 1. a ring held flat (Z axis horizontal) reads zero.
+# 1. a ring held flat (Z axis horizontal) reads ~zero (the default anchors are
+# the identity, so a little quantization-sized wander around 0 is expected).
 tracker = VerticalAngleTracker()
 run(tracker, jitter(0.0, 2.0), t0=0.0)
-check("flat reads 0", tracker.angle_deg == 0.0, f"angle={tracker.angle_deg}")
+check(
+    "flat reads ~0",
+    tracker.angle_deg is not None and tracker.angle_deg < 0.5,
+    f"angle={tracker.angle_deg}",
+)
 
 # 2. elevations read themselves.
 tracker = VerticalAngleTracker()
@@ -222,6 +227,53 @@ check(
     "step 90->0 at rest after 2 s",
     settled is not None and settled < 1.5,
     f"angle={settled}",
+)
+
+# 12. the calibration anchors: a real capture whose horizontal bias caps the raw
+# elevation near 87 degrees reads a full 90 once the high anchor is set there.
+tracker = VerticalAngleTracker(flat_deg=0.0, vertical_deg=87.0)
+run(tracker, [AccelSample(-0.053, -0.006, -1.002)] * int(2.0 * RATE), t0=1100.0)
+check(
+    "anchored upright reads 90",
+    tracker.angle_deg is not None and abs(tracker.angle_deg - 90.0) < 0.5,
+    f"angle={tracker.angle_deg}",
+)
+
+# 13. between the anchors the map is linear: raw 43.5 with anchors (0, 87) is
+# exactly half the span, so it reports 45.
+tracker = VerticalAngleTracker(flat_deg=0.0, vertical_deg=87.0)
+run(tracker, hold(43.5, 2.0), t0=1200.0)
+check(
+    "midpoint scales linearly",
+    tracker.angle_deg is not None and abs(tracker.angle_deg - 45.0) < 0.5,
+    f"angle={tracker.angle_deg}",
+)
+
+# 14. the flat anchor clamps below itself: raw 1.0 with a 1.5 flat anchor is 0.
+tracker = VerticalAngleTracker(flat_deg=1.5, vertical_deg=90.0)
+run(tracker, hold(1.0, 2.0), t0=1300.0)
+check(
+    "below the flat anchor reads 0",
+    tracker.angle_deg == 0.0,
+    f"angle={tracker.angle_deg}",
+)
+
+# 15. above the vertical anchor it saturates at 90, never past it.
+tracker = VerticalAngleTracker(flat_deg=0.0, vertical_deg=85.0)
+run(tracker, hold(90.0, 2.0), t0=1400.0)
+check(
+    "above the vertical anchor reads exactly 90",
+    tracker.angle_deg == 90.0,
+    f"angle={tracker.angle_deg}",
+)
+
+# 16. the default anchors are the identity: mid-range reads what it is.
+tracker = VerticalAngleTracker()
+run(tracker, hold(45.0, 2.0), t0=1500.0)
+check(
+    "default anchors are the identity",
+    tracker.angle_deg is not None and abs(tracker.angle_deg - 45.0) < 0.5,
+    f"angle={tracker.angle_deg}",
 )
 
 if failures:
