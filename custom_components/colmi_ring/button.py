@@ -7,7 +7,15 @@ from typing import TYPE_CHECKING
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 
 from .api import ColmiRingApiClientError
-from .const import CONF_DEVICE_FAMILY, FAMILY_COLMI, FAMILY_YCBT, LOGGER
+from .const import (
+    CONF_DEVICE_FAMILY,
+    FAMILY_COLMI,
+    FAMILY_YCBT,
+    LOGGER,
+    MEASURE_HEART_RATE,
+    MEASURE_SPO2,
+    MEASURE_TEMPERATURE,
+)
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -141,6 +149,8 @@ class ColmiRingRebootButton(ColmiRingEntity, ButtonEntity):
 class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
     """Trigger an on-demand SpO2 measurement on the ring."""
 
+    _measure_name = MEASURE_SPO2
+
     def __init__(
         self,
         coordinator: ColmiRingDataUpdateCoordinator,
@@ -152,10 +162,27 @@ class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{entity_description.key}"
         )
+        self._watch_ring_busy()
+
+    @property
+    def available(self) -> bool:
+        """Greyed out while the stream owns the ring or a measurement runs.
+
+        The optical sensor lights different LEDs per reading type, so only one
+        on-demand measurement can run at a time; a second press while one is
+        running could corrupt both readings.
+        """
+        motion = self._motion_manager()
+        return (
+            super().available
+            and self.coordinator.ring_busy is None
+            and (motion is None or not motion.holds_link)
+        )
 
     def press(self) -> None:
         """Press the button (measurement takes ~30s; run it in the background)."""
         self._assert_ring_free()
+        self._begin_measurement(self._measure_name)
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -163,19 +190,23 @@ class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
         client = self.coordinator.config_entry.runtime_data.client
         try:
             reading = await client.async_take_spo2()
+            if reading.get("spo2") is None:
+                LOGGER.warning(
+                    "Colmi ring SpO2 measurement produced no valid reading "
+                    "(is the ring worn snugly on a finger?)"
+                )
+            self.coordinator.apply_spo2(reading)
         except ColmiRingApiClientError as err:
             LOGGER.warning("Colmi ring SpO2 measurement failed: %s", err)
             raise
-        if reading.get("spo2") is None:
-            LOGGER.warning(
-                "Colmi ring SpO2 measurement produced no valid reading "
-                "(is the ring worn snugly on a finger?)"
-            )
-        self.coordinator.apply_spo2(reading)
+        finally:
+            self._end_measurement()
 
 
 class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
     """Trigger an on-demand real-time heart-rate measurement on the ring."""
+
+    _measure_name = MEASURE_HEART_RATE
 
     def __init__(
         self,
@@ -188,10 +219,22 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{entity_description.key}"
         )
+        self._watch_ring_busy()
+
+    @property
+    def available(self) -> bool:
+        """Greyed out while the stream owns the ring or a measurement runs."""
+        motion = self._motion_manager()
+        return (
+            super().available
+            and self.coordinator.ring_busy is None
+            and (motion is None or not motion.holds_link)
+        )
 
     def press(self) -> None:
         """Press the button (measurement takes ~30s; run it in the background)."""
         self._assert_ring_free()
+        self._begin_measurement(self._measure_name)
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -199,19 +242,23 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
         client = self.coordinator.config_entry.runtime_data.client
         try:
             reading = await client.async_take_heart_rate()
+            if reading.get("heart_rate") is None:
+                LOGGER.warning(
+                    "Colmi ring heart-rate measurement produced no valid"
+                    " reading (is the ring worn snugly on a finger?)"
+                )
+            self.coordinator.apply_heart_rate(reading)
         except ColmiRingApiClientError as err:
             LOGGER.warning("Colmi ring heart-rate measurement failed: %s", err)
             raise
-        if reading.get("heart_rate") is None:
-            LOGGER.warning(
-                "Colmi ring heart-rate measurement produced no valid reading "
-                "(is the ring worn snugly on a finger?)"
-            )
-        self.coordinator.apply_heart_rate(reading)
+        finally:
+            self._end_measurement()
 
 
 class ColmiRingTemperatureButton(ColmiRingEntity, ButtonEntity):
     """Trigger an on-demand skin-temperature measurement on the ring."""
+
+    _measure_name = MEASURE_TEMPERATURE
 
     def __init__(
         self,
@@ -224,10 +271,17 @@ class ColmiRingTemperatureButton(ColmiRingEntity, ButtonEntity):
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{entity_description.key}"
         )
+        self._watch_ring_busy()
+
+    @property
+    def available(self) -> bool:
+        """Greyed out while another measurement is running."""
+        return super().available and self.coordinator.ring_busy is None
 
     def press(self) -> None:
         """Press the button (measurement takes up to a minute; background it)."""
         self._assert_ring_free()
+        self._begin_measurement(self._measure_name)
         self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
@@ -235,12 +289,14 @@ class ColmiRingTemperatureButton(ColmiRingEntity, ButtonEntity):
         client = self.coordinator.config_entry.runtime_data.client
         try:
             reading = await client.async_take_temperature()
+            if reading.get("skin_temperature") is None:
+                LOGGER.warning(
+                    "Colmi ring temperature measurement produced no valid"
+                    " reading (is the ring worn snugly on a finger?)"
+                )
+            self.coordinator.apply_skin_temperature(reading)
         except ColmiRingApiClientError as err:
             LOGGER.warning("Colmi ring temperature measurement failed: %s", err)
             raise
-        if reading.get("skin_temperature") is None:
-            LOGGER.warning(
-                "Colmi ring temperature measurement produced no valid reading "
-                "(is the ring worn snugly on a finger?)"
-            )
-        self.coordinator.apply_skin_temperature(reading)
+        finally:
+            self._end_measurement()

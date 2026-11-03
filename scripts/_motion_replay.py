@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Offline replay of an accelerometer capture through the gesture detector.
 
-Runs :class:`custom_components.colmi_ring.gestures.GestureDetector` over a
-capture produced by ``scripts/_accel_probe.py`` (or any CSV with
-``t,x,y,z`` in g) so thresholds can be tuned without touching the ring.
+Runs :class:`custom_components.colmi_ring.gestures.StreamGestureDetector` over
+a capture produced by ``scripts/_accel_probe.py`` (or any CSV with
+``t,x,y,z`` in g) so the hold-based gestures can be tuned without touching
+the ring.
 
 Nothing here imports Home Assistant; the codec and detector are pure, so this
 runs on a plain Python with nothing but the repo checked out.
 
     python scripts/_motion_replay.py data/capture.csv --plot-out data/plots
-    python scripts/_motion_replay.py data/capture.csv --sensitivity 0.65
+    python scripts/_motion_replay.py data/capture.csv --hold-seconds 3
     python scripts/_motion_replay.py data/capture.csv --events-only
 
 Input formats
@@ -69,13 +70,16 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
     AccelSample,
     parse_accel_packet,
 )
+from custom_components.colmi_ring.const import (  # noqa: E402
+    DEFAULT_GESTURE_HOLD_S,
+)
 from custom_components.colmi_ring.gestures import (  # noqa: E402
-    GESTURE_LOWER,
-    GESTURE_RAISE,
-    GestureDetector,
+    GESTURE_FLIP,
+    GESTURE_STILL,
+    StreamGestureDetector,
 )
 
-ALL_GESTURES = (GESTURE_RAISE, GESTURE_LOWER)
+ALL_GESTURES = (GESTURE_STILL, GESTURE_FLIP)
 
 
 @dataclass(slots=True)
@@ -174,17 +178,17 @@ def report_signal(rows: list[Row]) -> None:
     )
 
 
-def run_detector(rows: list[Row], sensitivity: float) -> dict[str, list[float]]:
+def run_detector(rows: list[Row], hold_s: float) -> dict[str, list[float]]:
     """Feed the whole capture through one detector; return fire times."""
-    detector = GestureDetector(sensitivity=sensitivity)
+    detector = StreamGestureDetector(hold_s=hold_s)
     fired: dict[str, list[float]] = {gesture: [] for gesture in ALL_GESTURES}
     for row in rows:
         for event in detector.feed(row.sample, now=row.t):
             fired.setdefault(event.gesture, []).append(row.t)
             print(
                 f"  t={row.t:8.2f}s  {event.gesture:<10} source={event.source}"
-                f"  peak={event.peak_g:.2f}g"
-                f"  v={event.velocity_g_s:+.3f} g*s"
+                f"  held={event.hold_s:.1f}s"
+                f"  angle={event.angle_deg:.0f}deg"
             )
     print(f"\n  detector saw {detector.events_seen} event(s)")
     if detector.sample_rate_hz is not None:
@@ -195,7 +199,7 @@ def run_detector(rows: list[Row], sensitivity: float) -> dict[str, list[float]]:
 def report_gestures(fired: dict[str, list[float]]) -> None:
     print("\n## Detections")
     if not any(fired.values()):
-        print("  none -- lower --sensitivity, or check the signal above")
+        print("  none -- lower --hold-seconds, or check the signal above")
         return
     for gesture in ALL_GESTURES:
         times = fired.get(gesture, [])
@@ -243,10 +247,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("capture", type=Path, help="JSON capture or CSV of samples")
     parser.add_argument(
-        "--sensitivity",
+        "--hold-seconds",
         type=float,
-        default=1.0,
-        help="detector sensitivity multiplier (higher fires sooner)",
+        default=DEFAULT_GESTURE_HOLD_S,
+        help="seconds a pose must be held to count as still/flip",
     )
     parser.add_argument(
         "--resample",
@@ -284,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n## Events")
     if not any(math.isfinite(row.sample.x) for row in rows):
         print("  non-finite samples present; results are meaningless")
-    fired = run_detector(rows, args.sensitivity)
+    fired = run_detector(rows, args.hold_seconds)
     report_gestures(fired)
 
     if args.plot_out is not None and not args.events_only:

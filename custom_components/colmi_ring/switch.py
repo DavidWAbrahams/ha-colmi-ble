@@ -1,17 +1,19 @@
 """Switch platform for colmi_ring: the two things that hold the ring's link.
 
-``Motion Stream`` holds the ring's single Bluetooth link open and streams raw
-accelerometer data, which is what makes gesture detection possible and is also
-why it is opt-in: normal polling stops for the duration and the ring's battery
-drains noticeably faster. The integration turns it off by itself after the
-configured timeout (see ``MotionManager``).
+``Motion Stream`` takes the ring's shared Bluetooth link for itself and streams
+raw accelerometer data, which is what makes gesture detection possible and is
+also why it is opt-in: normal polling stops for the duration and the ring's
+battery drains noticeably faster. The integration turns it off by itself after
+the configured timeout (see ``MotionManager``).
 
-``Wave Detection`` holds that same link without streaming, so the ring's own
-on-device wave detector has a central to report to. It costs less than the
-stream but freezes the sensors for as long as it is on, so it gets its own,
-longer auto-off. The two are mutually exclusive: one link, one session, so
-turning one on while the other runs raises rather than silently killing the
-user's session.
+``Wave Detection`` keeps that same link open without streaming, so the ring's
+own on-device wave detector has a central to report to. It costs less than the
+stream and *shares* the link: polling and the ring's buttons keep working
+while it is on, queueing briefly behind its arm/disarm writes. It still gets
+its own, longer auto-off. The two sessions are mutually exclusive with each
+other, though: RAW mode takes the accelerometer and silences the ring's
+gesture reports, so turning one on while the other runs raises rather than
+silently killing the user's session.
 
 Both report the state of their session rather than the last request, so if the
 ring refuses to connect, or an auto-off timer fires, or a reload shuts a
@@ -26,7 +28,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import CONF_MOTION_ENABLED, LOGGER
+from .const import LOGGER, measurement_busy_message
 from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
@@ -52,22 +54,18 @@ async def async_setup_entry(
 ) -> None:
     """Set up the link-holding switches.
 
-    The wave switch is offered unconditionally: it needs no motion option, and
-    a user who only wants waves should still be able to arm the detector. The
-    stream switch stays behind ``CONF_MOTION_ENABLED``, which also gates the
-    gesture event entities.
+    Both switches are offered to every Colmi setup: neither needs an opt-in
+    option, and each only costs battery while it is actually on. Yucheng rings
+    have no motion manager, so they get neither switch.
     """
     motion = entry.runtime_data.motion
     if motion is None:  # pragma: no cover - setup order guard
         LOGGER.debug("Colmi ring switches have no motion manager")
         return
     entities: list[ColmiRingEntity] = [
-        ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator)
+        ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
+        ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
     ]
-    if entry.options.get(CONF_MOTION_ENABLED, False):
-        entities.append(
-            ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator)
-        )
     async_add_entities(entities)
 
 
@@ -98,6 +96,9 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
             return
         self._unsubscribe = motion.add_state_listener(self._on_stream_state)
         self.async_on_remove(self._unsubscribe)
+        # Availability also flips when a Read measurement starts/finishes
+        # (the stream needs the ring's full attention, LEDs included).
+        self.async_on_remove(self.coordinator.add_busy_listener(self._repaint))
 
     @callback
     def _on_stream_state(self, streaming: bool) -> None:
@@ -112,8 +113,17 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Available whenever the manager exists and HA is connected to it."""
-        return super().available and self._motion_manager() is not None
+        """Unavailable while a Read measurement owns the ring's sensor.
+
+        Starting the RAW stream mid-measurement would hijack the very sensor
+        the measurement is reading, corrupting both; the greyed-out switch is
+        the honest signal, and the refusal below covers the racing call.
+        """
+        return (
+            super().available
+            and self._motion_manager() is not None
+            and self.coordinator.ring_busy is None
+        )
 
     async def async_turn_on(self, **kwargs: object) -> None:
         """Start streaming.
@@ -126,6 +136,11 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
         if motion is None:  # pragma: no cover - guarded by available
             raise HomeAssistantError(
                 "Motion streaming is not enabled for this ring"
+            )
+        if self.coordinator.ring_busy is not None:
+            raise HomeAssistantError(
+                "Cannot start the motion stream: "
+                f"{measurement_busy_message(self.coordinator.ring_busy)}"
             )
         await motion.async_start()
         self.async_write_ha_state()

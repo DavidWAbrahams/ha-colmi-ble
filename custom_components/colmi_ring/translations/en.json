@@ -24,16 +24,17 @@
             "init": {
                 "description": "Heart rate freshness, BLE polling, history backfill, and gesture detection options.",
                 "data": {
-                    "hr_stale_after_polls": "Grace polls before Heart Rate goes unknown after the ring is removed (0 = fastest detection)",
-                    "poll_max_interval": "Maximum BLE polling interval in minutes (the integration polls at your heart-rate sampling period, up to this limit)",
-                    "hr_backfill": "Log heart-rate samples recorded while out of Bluetooth range into history",
-                    "steps_backfill": "Experimental: also backfill steps/distance/calories history (raw graph only, may not show in long-term statistics)",
-                    "motion_enabled": "Enable gesture detection (adds a Motion Stream switch that detects gestures from the ring's live accelerometer stream; streaming pauses normal polling and uses more battery)",
-                    "gesture_sensitivity": "Gesture sensitivity",
-                    "motion_stream_timeout": "Turn the motion stream off automatically after this many minutes (0 = leave it on until switched off)",
-                    "wave_timeout": "Turn wave detection off automatically after this many minutes (0 = leave it on until switched off). Heart rate, battery and steps stop updating while it is on",
-                    "motion_sensor_update_s": "Minimum seconds between accelerometer sensor updates (0 = update for every sample the ring sends; each update is a history row)",
-                    "motion_log_samples": "Log every accelerometer sample to the debug log (for tuning gestures)"
+                    "hr_stale_after_polls": "Heart Rate goes Unknown after this many missed polls",
+                    "poll_max_interval": "Poll the ring this often even if no new data is expected (minutes)",
+                    "hr_backfill": "Recover heart-rate samples recorded while out of Bluetooth range",
+                    "steps_backfill": "Also recover steps/distance/calories recorded while out of Bluetooth range",
+                    "gesture_hold_s": "Gesture hold seconds (how long a pose must be held for the still/flip gestures)",
+                    "motion_stream_timeout": "Motion stream timeout minutes, to save battery (0 = unlimited)",
+                    "wave_timeout": "Wave detection timeout minutes, to save battery (0 = unlimited)",
+                    "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed.",
+                    "vertical_flat_deg": "Angle calibration: raw angle that means flat (rescaled to 0°)",
+                    "vertical_upright_deg": "Angle calibration: raw angle that means upright (rescaled to 90°, 0 = no correction)",
+                    "motion_log_samples": "Accelerometer debug logging"
                 }
             }
         }

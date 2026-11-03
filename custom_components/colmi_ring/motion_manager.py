@@ -1,19 +1,21 @@
 """Owns the ring's two long-lived sessions and publishes what they report.
 
 The manager is the only place that knows a session is open, which matters
-because the ring serves a single central: while either the RAW motion stream or
-the wave listener holds the link, the data coordinator performs no BLE I/O at
-all (see its ``_async_update_data`` gate), so this class is also what tells the
-coordinator to pause and resume.
+because the ring serves a single central: while the RAW motion stream holds the
+link exclusively, the data coordinator performs no BLE I/O at all (see its
+``_async_update_data`` gate), so this class is also what tells the coordinator
+to pause and resume. Wave detection, by contrast, shares the link: its reports
+arrive as notifications and its occasional arm/disarm writes queue behind the
+link's transaction lock, so polling continues while it is on.
 
 Lifecycle
 ---------
 ``async_start`` and :meth:`async_start_waves` flip :attr:`is_streaming` and
-:attr:`is_listening` *before* the connection is opened and clear the published
-heart rate, so nothing can race a poll onto the link, and so a frozen heart rate
-can never be mistaken for a live one. ``async_stop`` and
+:attr:`is_listening` *before* the connection is opened; the stream also clears
+the published heart rate, so nothing can race a poll onto the link and a frozen
+heart rate can never be mistaken for a live one. ``async_stop`` and
 :meth:`async_stop_waves` (or the matching auto-off timer) end the session; when
-the task finally returns, the coordinator is refreshed so the frozen sensors are
+the task finally returns, the coordinator is refreshed so any frozen sensors are
 replaced with real data.
 
 Everything here runs on the Home Assistant event loop. Packets arrive from a
@@ -40,27 +42,29 @@ from .colmi_codec.motion import (
 from .const import (
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
+    CONF_GESTURE_HOLD_S,
+    CONF_VERTICAL_FLAT_DEG,
+    CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
-    CONF_GESTURE_SENSITIVITY,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
+    DEFAULT_GESTURE_HOLD_S,
+    DEFAULT_VERTICAL_FLAT_DEG,
+    DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
-    DEFAULT_GESTURE_SENSITIVITY,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     GESTURE_EVENT_TYPE,
-    GESTURE_SENSITIVITY_SCALE,
     LOGGER,
     STREAM_BUSY_MESSAGE,
+    resolve_vertical_anchors,
 )
 from .gestures import (
     GESTURE_WAVE,
-    GESTURE_LOWER,
-    GESTURE_RAISE,
     SOURCE_RING,
     GestureEvent,
-    GestureDetector,
+    StreamGestureDetector,
     VerticalAngleTracker,
 )
 
@@ -91,13 +95,6 @@ _MAX_UNKNOWN_KINDS = 6
 # per-tick status echoes, not a codec problem, so they must not be warned about.
 _BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02)})
 
-# Gestures the detector is still able to produce but that are never published.
-# A steady hand raise or lower produces no acceleration to integrate at the
-# ring's measured 1 Hz, so what fires is really a tilt, and an automation built
-# on it would act on the wrong gesture. The detector itself is untouched so a
-# future firmware with a faster stream can bring them back by dropping them here.
-_SUPPRESSED_GESTURES = frozenset({GESTURE_LOWER, GESTURE_RAISE})
-
 
 class MotionManager:
     """Own the ring's RAW stream and its on-device wave listener."""
@@ -115,8 +112,9 @@ class MotionManager:
         self._client = client
         self._coordinator = coordinator
 
-        self._detector = GestureDetector(sensitivity=self._sensitivity())
-        self._angle = VerticalAngleTracker()
+        self._detector = StreamGestureDetector(hold_s=self._hold_seconds())
+        flat_deg, vertical_deg = self._vertical_anchors()
+        self._angle = VerticalAngleTracker(flat_deg=flat_deg, vertical_deg=vertical_deg)
         self._session: MotionSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._stream_timer: Callable[[], None] | None = None
@@ -159,11 +157,14 @@ class MotionManager:
 
     # -- configuration ------------------------------------------------------
 
-    def _sensitivity(self) -> float:
-        raw = self._entry.options.get(
-            CONF_GESTURE_SENSITIVITY, DEFAULT_GESTURE_SENSITIVITY
-        )
-        return GESTURE_SENSITIVITY_SCALE.get(str(raw), 1.0)
+    def _hold_seconds(self) -> float:
+        """How long a pose must be held to count, for both stream gestures."""
+        raw = self._entry.options.get(CONF_GESTURE_HOLD_S, DEFAULT_GESTURE_HOLD_S)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(DEFAULT_GESTURE_HOLD_S)
+        return value if value > 0 else float(DEFAULT_GESTURE_HOLD_S)
 
     def _sensor_update_interval(self) -> float:
         """Seconds between accelerometer sensor updates; 0 means every sample.
@@ -200,6 +201,20 @@ class MotionManager:
         except (TypeError, ValueError):
             value = float(DEFAULT_WAVE_TIMEOUT)
         return value if value > 0 else 0.0
+
+    def _vertical_anchors(self) -> tuple[float, float]:
+        """Raw elevations the angle sensor should treat as flat and vertical.
+
+        Read once at construction: changing either option reloads the entry (see
+        ``async_reload_entry``), which rebuilds the manager, so the tracker never
+        has to be re-anchored mid-session.
+        """
+        return resolve_vertical_anchors(
+            self._entry.options.get(CONF_VERTICAL_FLAT_DEG, DEFAULT_VERTICAL_FLAT_DEG),
+            self._entry.options.get(
+                CONF_VERTICAL_UPRIGHT_DEG, DEFAULT_VERTICAL_UPRIGHT_DEG
+            ),
+        )
 
     # -- listeners ----------------------------------------------------------
 
@@ -258,10 +273,11 @@ class MotionManager:
     async def async_start(self) -> None:
         """Open the stream. Safe to call when it is already running.
 
-        Raises :class:`HomeAssistantError` while wave detection is on: the ring
-        serves a single central, so the stream cannot have the link the listener
-        is holding - and its camera mode does not report while RAW mode owns the
-        accelerometer either.
+        Raises :class:`HomeAssistantError` while wave detection is on. This is a
+        firmware mode conflict, not a link conflict: RAW mode takes over the
+        accelerometer, and the ring stops announcing camera gestures while it is
+        on - so a stream layered onto a live wave listener would silently break
+        the gestures the user enabled.
         """
         if self._want_stream:
             return
@@ -275,9 +291,10 @@ class MotionManager:
         # Read once per session like the other options: changing any option
         # reloads the entry, which rebuilds this manager anyway.
         self._sensor_update_s = self._sensor_update_interval()
-        # Rebuilt per session: the gravity reference and the rate estimate both
-        # belong to one continuous connection, not to the whole uptime.
-        self._detector = GestureDetector(sensitivity=self._sensitivity())
+        # Rebuilt per session: the gravity reference, the pose state and the
+        # rate estimate all belong to one continuous connection, not to the
+        # whole uptime.
+        self._detector = StreamGestureDetector(hold_s=self._hold_seconds())
         self._angle.reset()
         self.last_angle_deg = None
         self._logged_rate = False
@@ -346,7 +363,11 @@ class MotionManager:
     # -- wave detection -----------------------------------------------------
 
     async def async_start_waves(self) -> None:
-        """Hold the link so the ring's own wave detector can reach us.
+        """Hold a shared lease so the ring's own wave detector can reach us.
+
+        Unlike the stream this coexists with polling and the ring's buttons:
+        wave reports arrive as notifications, and the occasional command only
+        needs the link's transaction lock for a moment.
 
         Safe to call when it is already listening. Raises
         :class:`HomeAssistantError` while the motion stream is running, for the
@@ -358,12 +379,7 @@ class MotionManager:
             raise HomeAssistantError(STREAM_BUSY_MESSAGE)
 
         self._want_wave = True
-        # Set before connecting, like the stream does: the coordinator stops
-        # polling and the ring's buttons refuse to fire for as long as the link
-        # is ours, and a heart rate frozen at its last value must not read
-        # as live.
         self._set_listening(True)
-        self._coordinator.async_clear_heart_rate()
         self._last_wave_at = 0.0
         self._wave_reports = 0
 
@@ -481,7 +497,9 @@ class MotionManager:
             session.request_stop("user")
             return
         self._wave_session = session
-        LOGGER.info("Colmi ring wave detection open; polling is paused")
+        LOGGER.info(
+            "Colmi ring wave detection open; polling continues on the shared link"
+        )
         self._schedule_wave_auto_off()
 
     def _async_check_rate(self, _now: Any) -> None:
@@ -559,10 +577,6 @@ class MotionManager:
         self.last_angle_deg = self._angle.angle_deg
         self._publish_sample(sample)
         for event in self._detector.feed(sample):
-            # Deliberately not published; see _SUPPRESSED_GESTURES. The detector
-            # still tracks them so its internal state stays as tested.
-            if event.gesture in _SUPPRESSED_GESTURES:
-                continue
             self._publish(event)
 
     def _log_unknown_packet(self, packet: bytearray) -> None:
@@ -653,10 +667,8 @@ class MotionManager:
             GestureEvent(
                 gesture=GESTURE_WAVE,
                 source=SOURCE_RING,
-                # The ring reports a gesture, not a measurement: there are no
-                # acceleration figures behind it to report.
-                peak_g=0.0,
-                velocity_g_s=0.0,
+                # The ring reports a gesture, not a measurement: there is no
+                # hold duration or pose angle behind it to report.
             )
         )
 
@@ -674,10 +686,11 @@ class MotionManager:
     def _announce(self, event: GestureEvent) -> None:
         """Put one gesture on the bus and hand it to the event entities."""
         LOGGER.debug(
-            "Colmi ring gesture: %s (%s, peak %.2f g)",
+            "Colmi ring gesture: %s (%s, held %.1f s, angle %.0f deg)",
             event.gesture,
             event.source,
-            event.peak_g,
+            event.hold_s,
+            event.angle_deg,
         )
         # Fired here rather than from an entity so it works even if the event
         # entities are disabled, and so one automation trigger sees every gesture.
@@ -763,12 +776,13 @@ class MotionManager:
 
     @property
     def holds_link(self) -> bool:
-        """True while either session owns the ring's single GATT link.
+        """True while the RAW stream exclusively owns the ring's GATT link.
 
-        This is what the coordinator and the ring's buttons are gated on: neither
-        session can coexist with a poll, so both have to answer for it.
+        This is what the coordinator and the ring's buttons are gated on. Wave
+        detection no longer appears here: it shares the link, and its reports
+        are notifications that never block a poll.
         """
-        return self.is_streaming or self.is_listening
+        return self.is_streaming
 
     def _set_streaming(self, streaming: bool) -> None:
         if self.is_streaming == streaming:

@@ -131,8 +131,8 @@ async def async_setup_entry(
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
     # it is always constructed (it does no I/O until asked) because the
     # coordinator needs to be able to ask whether the stream is holding the
-    # connection even in setups where the option is off. The switch and event
-    # entities, in contrast, only appear when CONF_MOTION_ENABLED is on.
+    # connection. The switch and event entities appear for every Colmi setup;
+    # the stream only runs while its switch is on.
     motion = (
         MotionManager(hass, entry, client, coordinator)
         if family == FAMILY_COLMI
@@ -168,6 +168,12 @@ async def async_unload_entry(
     motion = entry.runtime_data.motion
     if motion is not None:
         await motion.async_shutdown()
+    # The Colmi client keeps its shared link open after its last user leaves
+    # (the sessions above are gone by now); close it rather than let the idle
+    # timer hold a GATT connection for a dead entry.
+    client = entry.runtime_data.client
+    if isinstance(client, ColmiRingApiClient):
+        await client.async_close()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

@@ -9,16 +9,16 @@ Assistant event type, so an automation can trigger on either::
         event_data:
           gesture: wave
 
-Only the wave is offered today. Raise and lower are recognised by
-``GestureDetector`` but are not published, because a ring streaming at 1 Hz
-cannot resolve a steady lift or drop (see ``_SUPPRESSED_GESTURES`` in
-``motion_manager.py``), so publishing them would only produce unreliable
-automations.
+Three gestures are offered. The wave is reported by the ring's own detector
+while the Wave Detection switch holds the link; the event data's ``source``
+field says so via ``ring``. The stillness and flip gestures are derived here
+from the RAW accelerometer stream while the Motion Stream switch is on
+(``source`` = ``stream``): both are pose gestures, held for seconds rather
+than flicked, so they survive the stock firmware's one-sample-per-second rate.
 
-The wave is reported by the ring's own detector while the Wave Detection switch
-holds the link; the event data's ``source`` field says so via ``ring``. The
-entities are therefore created whether or not motion streaming is enabled: a
-user who only ever turns on Wave Detection still needs something to trigger on.
+The entities are created whenever the motion manager exists: a user who only
+ever turns on Wave Detection still needs something to trigger on, and vice
+versa.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from .const import (
     LOGGER,
 )
 from .entity import ColmiRingEntity
-from .gestures import GESTURE_WAVE, GestureEvent
+from .gestures import GESTURE_FLIP, GESTURE_STILL, GESTURE_WAVE, GestureEvent
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -54,6 +54,16 @@ ENTITY_DESCRIPTIONS = (
         name="Wave",
         icon="mdi:hand-waving",
     ),
+    EventEntityDescription(
+        key=GESTURE_STILL,
+        name="Hand still",
+        icon="mdi:hand-back-right-outline",
+    ),
+    EventEntityDescription(
+        key=GESTURE_FLIP,
+        name="Hand flip",
+        icon="mdi:rotate-3d-variant",
+    ),
 )
 
 
@@ -64,12 +74,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up the gesture event entities.
 
-    Not gated on ``CONF_MOTION_ENABLED`` the way the stream switch is: the wave
-    has a second, independent source, so the entities exist for any Colmi
-    setup. The listeners they register are harmless while nothing publishes to
-    them. The Yucheng family is gated out entirely: its firmware has neither
-    the RAW stream nor the on-device wave detector, so a gesture entity could
-    never fire (and the Wave Detection switch behind it is never created).
+    The entities exist for any Colmi setup: the wave has a second, independent
+    source, and the listeners they register are harmless while nothing
+    publishes to them. The Yucheng family is gated out entirely: its firmware
+    has neither the RAW stream nor the on-device wave detector, so a gesture
+    entity could never fire (and the Wave Detection switch behind it is never
+    created).
     """
     if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) == FAMILY_YCBT:
         return
