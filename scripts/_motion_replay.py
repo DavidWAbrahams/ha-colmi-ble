@@ -71,7 +71,8 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
     parse_accel_packet,
 )
 from custom_components.colmi_ring.const import (  # noqa: E402
-    DEFAULT_GESTURE_HOLD_S,
+    DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_STILL_S,
 )
 from custom_components.colmi_ring.gestures import (  # noqa: E402
     GESTURE_FLIP,
@@ -178,9 +179,13 @@ def report_signal(rows: list[Row]) -> None:
     )
 
 
-def run_detector(rows: list[Row], hold_s: float) -> dict[str, list[float]]:
+def run_detector(
+    rows: list[Row], still_hold_s: float, flip_hold_s: float
+) -> dict[str, list[float]]:
     """Feed the whole capture through one detector; return fire times."""
-    detector = StreamGestureDetector(hold_s=hold_s)
+    detector = StreamGestureDetector(
+        still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+    )
     fired: dict[str, list[float]] = {gesture: [] for gesture in ALL_GESTURES}
     for row in rows:
         for event in detector.feed(row.sample, now=row.t):
@@ -199,7 +204,7 @@ def run_detector(rows: list[Row], hold_s: float) -> dict[str, list[float]]:
 def report_gestures(fired: dict[str, list[float]]) -> None:
     print("\n## Detections")
     if not any(fired.values()):
-        print("  none -- lower --hold-seconds, or check the signal above")
+        print("  none -- lower the hold-seconds flags, or check the signal above")
         return
     for gesture in ALL_GESTURES:
         times = fired.get(gesture, [])
@@ -247,10 +252,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("capture", type=Path, help="JSON capture or CSV of samples")
     parser.add_argument(
-        "--hold-seconds",
+        "--still-hold-seconds",
         type=float,
-        default=DEFAULT_GESTURE_HOLD_S,
-        help="seconds a pose must be held to count as still/flip",
+        default=DEFAULT_GESTURE_HOLD_STILL_S,
+        help="seconds the hand must stay still to count as hand_still",
+    )
+    parser.add_argument(
+        "--flip-hold-seconds",
+        type=float,
+        default=DEFAULT_GESTURE_HOLD_FLIP_S,
+        help="seconds each palm pose must be held to count as hand_flip",
     )
     parser.add_argument(
         "--resample",
@@ -288,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n## Events")
     if not any(math.isfinite(row.sample.x) for row in rows):
         print("  non-finite samples present; results are meaningless")
-    fired = run_detector(rows, args.hold_seconds)
+    fired = run_detector(rows, args.still_hold_seconds, args.flip_hold_seconds)
     report_gestures(fired)
 
     if args.plot_out is not None and not args.events_only:

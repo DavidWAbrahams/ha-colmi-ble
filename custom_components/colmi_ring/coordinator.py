@@ -17,11 +17,10 @@ from .api import (
 from .colmi_codec import date_utils
 from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import (
+    CONF_BACKFILL_ON_RECONNECT,
     CONF_DEVICE_FAMILY,
-    CONF_HR_BACKFILL,
     CONF_HR_STALE_POLLS,
     CONF_POLL_MAX_INTERVAL,
-    CONF_STEPS_BACKFILL,
     CONF_YCBT_MONITOR_INTERVAL,
     DEFAULT_POLL_MAX_INTERVAL,
     DEFAULT_YCBT_MONITOR_INTERVAL,
@@ -131,6 +130,10 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_backfill_flags(self) -> tuple[bool, bool, bool]:
         """(hr_enabled, steps_enabled, include_previous_day) for this poll.
 
+        A single option now drives both metrics: when backfill is on, the
+        ring's whole out-of-range backlog (heart rate and steps alike) is
+        recovered; when off, nothing is imported.
+
         Ask the API client for yesterday's UTC-day ring log until the
         backfill manager records that day as fetched-and-imported: the ring
         keys its logs to UTC days, so e.g. a UTC-7 user's workday samples
@@ -138,10 +141,10 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         *below* the (today-based) watermark, so the watermark alone can
         never surface them.
         """
-        hr_enabled = bool(self.config_entry.options.get(CONF_HR_BACKFILL, True))
-        steps_enabled = bool(
-            self.config_entry.options.get(CONF_STEPS_BACKFILL, False)
+        enabled = bool(
+            self.config_entry.options.get(CONF_BACKFILL_ON_RECONNECT, True)
         )
+        hr_enabled = steps_enabled = enabled
         include_previous_day = False
         if self.backfill is not None:
             prev_day = (

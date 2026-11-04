@@ -16,7 +16,10 @@ from homeassistant.loader import async_get_loaded_integration
 from .api import ColmiRingApiClient
 from .backfill import BackfillManager
 from .const import (
+    CONF_BACKFILL_ON_RECONNECT,
     CONF_DEVICE_FAMILY,
+    CONF_GESTURE_HOLD_FLIP_S,
+    CONF_GESTURE_HOLD_STILL_S,
     CONF_WAVE_TIMEOUT,
     CONF_YCBT_MONITOR_INTERVAL,
     DOMAIN,
@@ -63,8 +66,18 @@ async def async_migrate_entry(
     Version 3 introduces the device family (``colmi`` vs ``ycbt``). Every
     entry that predates it was set up against a Colmi ring, so the family
     is simply stamped ``colmi``.
+
+    Version 4 merges the separate ``hr_backfill`` and ``steps_backfill``
+    options into a single ``backfill_on_reconnect`` flag: enabled if either
+    of the old options was (heart-rate backfill defaulted to on, so the
+    merged flag is on unless the user had explicitly turned it off).
+
+    Version 5 splits ``gesture_hold_s`` into a per-gesture pair
+    (``gesture_hold_still_s`` and ``gesture_hold_flip_s``). An explicit
+    legacy value carries over to both so the user's tuning survives; when
+    none was stored, the new per-gesture defaults apply instead.
     """
-    if entry.version > 3:
+    if entry.version > 5:
         # Downgrade or already current: nothing to do.
         return True
 
@@ -81,14 +94,31 @@ async def async_migrate_entry(
         new_data.setdefault(CONF_DEVICE_FAMILY, FAMILY_COLMI)
         migrated.append("device family stamped colmi")
 
+    if entry.version <= 3:
+        if CONF_BACKFILL_ON_RECONNECT not in new_options:
+            new_options[CONF_BACKFILL_ON_RECONNECT] = bool(
+                new_options.get("hr_backfill", True)
+                or new_options.get("steps_backfill", False)
+            )
+        new_options.pop("hr_backfill", None)
+        new_options.pop("steps_backfill", None)
+        migrated.append("backfill options merged into backfill_on_reconnect")
+
+    if entry.version <= 4:
+        legacy_hold = new_options.pop("gesture_hold_s", None)
+        if legacy_hold is not None:
+            new_options.setdefault(CONF_GESTURE_HOLD_STILL_S, legacy_hold)
+            new_options.setdefault(CONF_GESTURE_HOLD_FLIP_S, legacy_hold)
+        migrated.append("gesture_hold_s split into per-gesture hold options")
+
     hass.config_entries.async_update_entry(
         entry,
         data=new_data,
         options=new_options,
-        version=3,
+        version=5,
     )
     LOGGER.info(
-        "Config entry %s migrated to version 3 (%s)",
+        "Config entry %s migrated to version 5 (%s)",
         entry.entry_id,
         "; ".join(migrated),
     )

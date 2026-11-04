@@ -42,14 +42,16 @@ from .colmi_codec.motion import (
 from .const import (
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
-    CONF_GESTURE_HOLD_S,
+    CONF_GESTURE_HOLD_FLIP_S,
+    CONF_GESTURE_HOLD_STILL_S,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
-    DEFAULT_GESTURE_HOLD_S,
+    DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_STILL_S,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
@@ -112,7 +114,10 @@ class MotionManager:
         self._client = client
         self._coordinator = coordinator
 
-        self._detector = StreamGestureDetector(hold_s=self._hold_seconds())
+        still_hold_s, flip_hold_s = self._hold_seconds()
+        self._detector = StreamGestureDetector(
+            still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+        )
         flat_deg, vertical_deg = self._vertical_anchors()
         self._angle = VerticalAngleTracker(flat_deg=flat_deg, vertical_deg=vertical_deg)
         self._session: MotionSession | None = None
@@ -157,14 +162,25 @@ class MotionManager:
 
     # -- configuration ------------------------------------------------------
 
-    def _hold_seconds(self) -> float:
-        """How long a pose must be held to count, for both stream gestures."""
-        raw = self._entry.options.get(CONF_GESTURE_HOLD_S, DEFAULT_GESTURE_HOLD_S)
+    def _hold_seconds(self) -> tuple[float, float]:
+        """Per-gesture hold thresholds, in seconds: ``(still, flip)``."""
+        return (
+            self._option_seconds(
+                CONF_GESTURE_HOLD_STILL_S, DEFAULT_GESTURE_HOLD_STILL_S
+            ),
+            self._option_seconds(
+                CONF_GESTURE_HOLD_FLIP_S, DEFAULT_GESTURE_HOLD_FLIP_S
+            ),
+        )
+
+    def _option_seconds(self, key: str, fallback: float) -> float:
+        """Read one seconds-valued option, falling back when unusable."""
+        raw = self._entry.options.get(key, fallback)
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            value = float(DEFAULT_GESTURE_HOLD_S)
-        return value if value > 0 else float(DEFAULT_GESTURE_HOLD_S)
+            value = float(fallback)
+        return value if value > 0 else float(fallback)
 
     def _sensor_update_interval(self) -> float:
         """Seconds between accelerometer sensor updates; 0 means every sample.
@@ -294,7 +310,10 @@ class MotionManager:
         # Rebuilt per session: the gravity reference, the pose state and the
         # rate estimate all belong to one continuous connection, not to the
         # whole uptime.
-        self._detector = StreamGestureDetector(hold_s=self._hold_seconds())
+        still_hold_s, flip_hold_s = self._hold_seconds()
+        self._detector = StreamGestureDetector(
+            still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+        )
         self._angle.reset()
         self.last_angle_deg = None
         self._logged_rate = False

@@ -55,14 +55,12 @@ def clamp_ycbt_monitor_interval(value: object) -> int:
     return max(YCBT_MONITOR_INTERVAL_MIN, min(YCBT_MONITOR_INTERVAL_MAX, minutes))
 
 
-# Import heart-rate samples recorded while out of BLE range into HA history
-# (direct recorder states insert). Safe for the MEASUREMENT state class.
-CONF_HR_BACKFILL = "hr_backfill"
-
-# Experimental: same treatment for the steps/distance/calories sensors, whose
-# TOTAL_INCREASING day totals are imported as cumulative bins. Raw history
-# only (no long-term statistics for old ranges); see plans/hr-backfill-plan.md.
-CONF_STEPS_BACKFILL = "steps_backfill"
+# Import samples recorded on the ring while out of BLE range into HA history
+# (direct recorder states insert). Heart rate is a plain MEASUREMENT and
+# imports cleanly; the steps/distance/calories sensors are TOTAL_INCREASING
+# day totals imported as cumulative bins (raw history only, no long-term
+# statistics for old ranges); see plans/hr-backfill-plan.md.
+CONF_BACKFILL_ON_RECONNECT = "backfill_on_reconnect"
 
 # --- Motion / gesture detection -------------------------------------------
 #
@@ -93,16 +91,22 @@ def measurement_busy_message(running: str) -> str:
         f" {running} measurement in progress"
     )
 
-# Seconds a pose must be held to count as a hold: how long the hand must stay
-# still for the stillness gesture, and how long each palm pose must be held for
-# the flip gesture (palm up for X s, flipped, palm down for X s).
-CONF_GESTURE_HOLD_S = "gesture_hold_s"
-DEFAULT_GESTURE_HOLD_S = 2.0
+# Seconds the hand must stay still for the stillness gesture. Longer than the
+# flip hold on purpose: a resting hand should take its time announcing itself,
+# so casual pauses do not fire the event.
+CONF_GESTURE_HOLD_STILL_S = "gesture_hold_still_s"
+DEFAULT_GESTURE_HOLD_STILL_S = 10.0
+
+# Seconds each palm pose must be held for the flip gesture (palm up for X s,
+# flipped, palm down for X s). Short because the flip is an intentional two-
+# part gesture, not a resting state.
+CONF_GESTURE_HOLD_FLIP_S = "gesture_hold_flip_s"
+DEFAULT_GESTURE_HOLD_FLIP_S = 2.0
 
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
-DEFAULT_MOTION_STREAM_TIMEOUT = 30
+DEFAULT_MOTION_STREAM_TIMEOUT = 15
 
 # Minutes the wave listener holds the ring's link before switching itself off.
 # Its own option because the cost is different in kind: the wave listener does
@@ -111,7 +115,7 @@ DEFAULT_MOTION_STREAM_TIMEOUT = 30
 # longer default than the stream, and 0 means "leave it on until I say
 # otherwise" (see CONF_MOTION_STREAM_TIMEOUT for the same convention).
 CONF_WAVE_TIMEOUT = "wave_timeout"
-DEFAULT_WAVE_TIMEOUT = 120
+DEFAULT_WAVE_TIMEOUT = 0
 
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
@@ -157,7 +161,7 @@ MOTION_STILL_ACCEL_G = 0.25
 # A held pose tolerates this much wander from the direction it was anchored to
 # before the hold is considered broken. Comfortably above sensor and hand
 # jitter, comfortably below the tens of degrees of a deliberate pose change.
-MOTION_HOLD_TOLERANCE_DEG = 30.0
+MOTION_HOLD_TOLERANCE_DEG = 20.0
 
 # The two poses of a flip must be at least this far apart. A palm-up to
 # palm-down rotation is 180 degrees; the margin below it absorbs a flip that is

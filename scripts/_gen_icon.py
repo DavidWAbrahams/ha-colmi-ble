@@ -1,7 +1,10 @@
-"""Generate the HACS brand icon/logo for colmi_ring (a simple gold ring).
+"""Generate the brand icon/logo for colmi_ring (a simple gold ring).
 
 Run from the repo root: ``python scripts/_gen_icon.py``
-Writes repository/icons/colmi_ring.png and repository/logos/colmi_ring.png
+
+Writes custom_components/colmi_ring/brand/ (HA >= 2026.3 local brand
+images, served by HA at /api/brands/integration/colmi_ring/...):
+icon.png (256), icon@2x.png (512), logo.png (128), logo@2x.png (256).
 """
 
 from __future__ import annotations
@@ -50,46 +53,33 @@ def _ring(draw: ImageDraw.ImageDraw, ss: int, cx: int, cy: int) -> None:
     )
 
 
-def _gem(draw: ImageDraw.ImageDraw, ss: int, cx: int, cy: int) -> None:
-    """Small brilliant-cut stone set at the top of the band."""
-    gy = cy - int(176 * ss)
-    r = int(40 * ss)
-    top = (cx, gy - r)
-    right = (cx + r, gy)
-    bottom = (cx, gy + r)
-    left = (cx - r, gy)
-
-    draw.polygon([top, right, bottom, left], fill=GOLD_MID, outline=GOLD_EDGE)
-    # Two facets: lit upper-right, shaded lower-left.
-    draw.polygon([top, right, (cx, gy)], fill=GOLD_HI)
-    draw.polygon([(cx, gy), bottom, left], fill=GOLD_LO)
-    draw.line([top, left], fill=GOLD_EDGE, width=max(1, int(1.5 * ss)))
-    draw.line([right, bottom], fill=GOLD_EDGE, width=max(1, int(1.5 * ss)))
-
-
-def _render(with_gem: bool) -> Image.Image:
+def _render() -> Image.Image:
     ss = SCALE
     side = SIZE * ss
     img = Image.new("RGBA", (side, side), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    cx, cy = side // 2, side // 2 + int(22 * ss)
+    cx, cy = side // 2, side // 2
     _ring(draw, ss, cx, cy)
-    if with_gem:
-        _gem(draw, ss, cx, cy)
 
     return img.resize((SIZE, SIZE), Image.LANCZOS)
 
 
+def _save(img: Image.Image, path: Path, size: int) -> None:
+    img.resize((size, size), Image.LANCZOS).save(path)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    out = root / "repository"
-    (out / "icons").mkdir(parents=True, exist_ok=True)
-    (out / "logos").mkdir(parents=True, exist_ok=True)
+    brand = root / "custom_components" / "colmi_ring" / "brand"
+    brand.mkdir(parents=True, exist_ok=True)
+    base = _render()  # 512x512 RGBA, transparent
+    _save(base, brand / "icon.png", 256)
+    _save(base, brand / "icon@2x.png", 512)
+    _save(base, brand / "logo.png", 128)
+    _save(base, brand / "logo@2x.png", 256)
 
-    _render(with_gem=True).save(out / "icons" / "colmi_ring.png")
-    _render(with_gem=True).save(out / "logos" / "colmi_ring.png")
-    print("wrote repository/icons/colmi_ring.png and repository/logos/colmi_ring.png")
+    print("wrote custom_components/colmi_ring/brand/{icon,icon@2x,logo,logo@2x}.png")
 
 
 if __name__ == "__main__":

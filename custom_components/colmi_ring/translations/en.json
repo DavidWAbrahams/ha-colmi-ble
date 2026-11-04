@@ -26,12 +26,12 @@
                 "data": {
                     "hr_stale_after_polls": "Heart Rate goes Unknown after this many missed polls",
                     "poll_max_interval": "Poll the ring this often even if no new data is expected (minutes)",
-                    "hr_backfill": "Recover heart-rate samples recorded while out of Bluetooth range",
-                    "steps_backfill": "Also recover steps/distance/calories recorded while out of Bluetooth range",
-                    "gesture_hold_s": "Gesture hold seconds (how long a pose must be held for the still/flip gestures)",
+                    "backfill_on_reconnect": "Recover samples recorded on the ring while out of Bluetooth range",
+                    "gesture_hold_still_s": "Hold still gesture: hold still for this many seconds",
+                    "gesture_hold_flip_s": "Hand flip gesture: hold still this many seconds before and after flipping hand 180°",
                     "motion_stream_timeout": "Motion stream timeout minutes, to save battery (0 = unlimited)",
                     "wave_timeout": "Wave detection timeout minutes, to save battery (0 = unlimited)",
-                    "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed.",
+                    "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed",
                     "vertical_flat_deg": "Angle calibration: raw angle that means flat (rescaled to 0°)",
                     "vertical_upright_deg": "Angle calibration: raw angle that means upright (rescaled to 90°, 0 = no correction)",
                     "motion_log_samples": "Accelerometer debug logging"

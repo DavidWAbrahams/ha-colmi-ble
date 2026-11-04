@@ -16,8 +16,8 @@ seconds, which a single sample per second is plenty to confirm.
 from the raw vector as gravity direction plus movement:
 
 * ``hand_still``: the gravity-removed acceleration stays small for
-  ``gesture_hold_s`` seconds. Fires once per quiet episode, so holding a
-  resting hand produces one event rather than one per second.
+  ``gesture_hold_still_s`` seconds. Fires once per quiet episode, so holding
+  a resting hand produces one event rather than one per second.
 * ``hand_flip``: a held pose, a quick turn, and a second held pose far from
   the first - in practice palm up, flip, palm down. The two poses are compared
   as the *angle between their gravity directions*, close to 180 degrees for a
@@ -53,7 +53,8 @@ from dataclasses import dataclass
 
 from .colmi_codec.motion import AccelSample
 from .const import (
-    DEFAULT_GESTURE_HOLD_S,
+    DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_STILL_S,
     MOTION_FLIP_MIN_ANGLE_DEG,
     MOTION_FLIP_TRANSITION_BASE_S,
     MOTION_FLIP_TRANSITION_DT_FACTOR,
@@ -155,13 +156,21 @@ class StreamGestureDetector:
     looks like once per session.
     """
 
-    def __init__(self, hold_s: float = DEFAULT_GESTURE_HOLD_S) -> None:
-        """Create a detector holding poses for ``hold_s`` seconds."""
-        try:
-            hold = float(hold_s)
-        except (TypeError, ValueError):
-            hold = float(DEFAULT_GESTURE_HOLD_S)
-        self._hold_s = min(max(hold, 1.0), 60.0)
+    def __init__(
+        self,
+        still_hold_s: float = DEFAULT_GESTURE_HOLD_STILL_S,
+        flip_hold_s: float = DEFAULT_GESTURE_HOLD_FLIP_S,
+    ) -> None:
+        """Create a detector with per-gesture hold thresholds.
+
+        ``still_hold_s`` is how long a calm episode must last before
+        ``hand_still`` fires; ``flip_hold_s`` is how long each of the two
+        poses of a ``hand_flip`` must be held.
+        """
+        self._still_hold_s = self._clamp_hold(
+            still_hold_s, DEFAULT_GESTURE_HOLD_STILL_S
+        )
+        self._flip_hold_s = self._clamp_hold(flip_hold_s, DEFAULT_GESTURE_HOLD_FLIP_S)
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
@@ -182,6 +191,15 @@ class StreamGestureDetector:
 
         self.events_seen = 0
         self.samples_seen = 0
+
+    @staticmethod
+    def _clamp_hold(value: float, fallback: float) -> float:
+        """Coerce an option value into the usable 1..60 s hold range."""
+        try:
+            hold = float(value)
+        except (TypeError, ValueError):
+            hold = float(fallback)
+        return min(max(hold, 1.0), 60.0)
 
     # -- stream diagnostics (for MotionManager's once-per-session log) ----
 
@@ -326,7 +344,7 @@ class StreamGestureDetector:
     def _track_stillness(
         self, *, calm: bool, now: float
     ) -> list[GestureEvent]:
-        """One ``hand_still`` per calm episode, once it has lasted ``hold_s``.
+        """One ``hand_still`` per calm episode, once it has lasted ``still_hold_s``.
 
         Calm means the gravity-removed acceleration stays small: a held pose,
         however slightly unsteady, sits inside the threshold, while a walking
@@ -343,7 +361,7 @@ class StreamGestureDetector:
             self._still_since = now
             return []
         held = now - self._still_since
-        if self._still_fired or held < self._hold_s:
+        if self._still_fired or held < self._still_hold_s:
             return []
         self._still_fired = True
         return [
@@ -374,7 +392,7 @@ class StreamGestureDetector:
             and _separation_deg(hold.direction, unit) <= MOTION_HOLD_TOLERANCE_DEG
         ):
             hold.last_calm_time = now
-            if hold.confirmed or now - hold.start_time < self._hold_s:
+            if hold.confirmed or now - hold.start_time < self._flip_hold_s:
                 return []
             return self._confirm_hold(hold, now)
 
