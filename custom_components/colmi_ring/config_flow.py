@@ -255,7 +255,7 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(
                             min=1,
-                            max=60,
+                            max=360,
                             step=0.5,
                             mode=selector.NumberSelectorMode.BOX,
                         )

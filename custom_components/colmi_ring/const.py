@@ -106,7 +106,7 @@ DEFAULT_GESTURE_HOLD_FLIP_S = 2.0
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
-DEFAULT_MOTION_STREAM_TIMEOUT = 30
+DEFAULT_MOTION_STREAM_TIMEOUT = 15
 
 # Minutes the wave listener holds the ring's link before switching itself off.
 # Its own option because the cost is different in kind: the wave listener does
@@ -115,7 +115,7 @@ DEFAULT_MOTION_STREAM_TIMEOUT = 30
 # longer default than the stream, and 0 means "leave it on until I say
 # otherwise" (see CONF_MOTION_STREAM_TIMEOUT for the same convention).
 CONF_WAVE_TIMEOUT = "wave_timeout"
-DEFAULT_WAVE_TIMEOUT = 120
+DEFAULT_WAVE_TIMEOUT = 0
 
 # Log every decoded accelerometer sample at DEBUG level (tuning aid).
 CONF_MOTION_LOG_SAMPLES = "motion_log_samples"
@@ -161,7 +161,7 @@ MOTION_STILL_ACCEL_G = 0.25
 # A held pose tolerates this much wander from the direction it was anchored to
 # before the hold is considered broken. Comfortably above sensor and hand
 # jitter, comfortably below the tens of degrees of a deliberate pose change.
-MOTION_HOLD_TOLERANCE_DEG = 30.0
+MOTION_HOLD_TOLERANCE_DEG = 20.0
 
 # The two poses of a flip must be at least this far apart. A palm-up to
 # palm-down rotation is 180 degrees; the margin below it absorbs a flip that is
