@@ -43,7 +43,7 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 
 | Switch | What it does | What it costs |
 | --- | --- | --- |
-| `Wave Detection` | Asks the ring to run its own on-device wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable timeout (default unlimited) |
+| `Wave Detection` | Asks the ring to run its own on-device hand wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable timeout (default unlimited) |
 | `Motion Stream` | Makes the ring stream raw accelerometer data continuously. The integration derives two gestures from that stream (`Hand still`, `Hand flip` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
 Both switches are available on any Colmi ring; nothing runs (and nothing costs
