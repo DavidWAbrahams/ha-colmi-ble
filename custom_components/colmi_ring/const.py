@@ -103,6 +103,12 @@ DEFAULT_GESTURE_HOLD_STILL_S = 10.0
 CONF_GESTURE_HOLD_FLIP_S = "gesture_hold_flip_s"
 DEFAULT_GESTURE_HOLD_FLIP_S = 2.0
 
+# Seconds the hand must stay still *and* raised for the raised-hand gesture.
+# Shorter than the stillness hold: raising the hand is a deliberate act, so it
+# announces itself faster than a resting hand is allowed to.
+CONF_GESTURE_HOLD_RAISED_S = "gesture_hold_raised_s"
+DEFAULT_GESTURE_HOLD_RAISED_S = 4.0
+
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
@@ -223,6 +229,13 @@ MOTION_VERTICAL_SNAP_TAU_S = 0.1
 # pose estimate toward wherever the hand happens to be accelerating; the estimate
 # simply holds its value while they last.
 MOTION_VERTICAL_TRUST_G = 0.3
+
+# How high (degrees, on the Vertical Angle sensor's calibrated scale) the hole
+# axis must point for the hand to count as raised in the raised-hand gesture.
+# Comfortably below the 90 a fully vertical finger reads, so a natural raised
+# hand with a slightly bent finger still qualifies, and comfortably above the
+# ~45 of a hand held out in front.
+MOTION_RAISED_HAND_MIN_DEG = 70.0
 
 # --- Vertical angle calibration --------------------------------------------
 #

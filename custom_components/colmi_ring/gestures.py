@@ -12,12 +12,18 @@ and a movement that takes half a second to complete is over before the ring
 looks. What survives that rate are *poses* - directions the hand holds for
 seconds, which a single sample per second is plenty to confirm.
 
-:class:`StreamGestureDetector` therefore detects two pose gestures, both read
+:class:`StreamGestureDetector` therefore detects three pose gestures, all read
 from the raw vector as gravity direction plus movement:
 
 * ``hand_still``: the gravity-removed acceleration stays small for
   ``gesture_hold_still_s`` seconds. Fires once per quiet episode, so holding
   a resting hand produces one event rather than one per second.
+* ``raised_hand``: the same calm episode, but with the hole axis also held
+  high - at least ``MOTION_RAISED_HAND_MIN_DEG`` on the Vertical Angle
+  sensor's scale - for ``gesture_hold_raised_s`` seconds. It is the
+  stillness gesture plus an elevation gate: a raised, steady hand (the
+  classic "may I ask a question?" pose) fires, while the same hand resting
+  on a desk does not.
 * ``hand_flip``: a held pose, a quick turn, and a second held pose far from
   the first - in practice palm up, flip, palm down. The two poses are compared
   as the *angle between their gravity directions*, close to 180 degrees for a
@@ -54,6 +60,7 @@ from dataclasses import dataclass
 from .colmi_codec.motion import AccelSample
 from .const import (
     DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
     MOTION_FLIP_MIN_ANGLE_DEG,
     MOTION_FLIP_TRANSITION_BASE_S,
@@ -62,6 +69,7 @@ from .const import (
     MOTION_GRAVITY_TAU_S,
     MOTION_GRAVITY_TRUST_G,
     MOTION_HOLD_TOLERANCE_DEG,
+    MOTION_RAISED_HAND_MIN_DEG,
     MOTION_SAMPLE_GAP_MAX_S,
     MOTION_STILL_ACCEL_G,
     MOTION_VERTICAL_AXIS,
@@ -75,6 +83,7 @@ from .const import (
 GESTURE_WAVE = "wave"
 GESTURE_STILL = "hand_still"
 GESTURE_FLIP = "hand_flip"
+GESTURE_RAISED_HAND = "raised_hand"
 
 # Where a gesture came from, reported in event data.
 SOURCE_RING = "ring"  # detected by the ring itself (camera-button gesture)
@@ -98,7 +107,9 @@ class GestureEvent:
     # 0 for the ring's own wave report, which is a statement, not a
     # measurement, and 0 for gestures with no hold behind them.
     hold_s: float = 0.0
-    # Angle between the two poses of a flip, in degrees. 0 otherwise.
+    # The gesture's pose angle in degrees: the separation between the two
+    # poses of a flip, or the hole-axis elevation a raised hand fired at.
+    # 0 otherwise.
     angle_deg: float = 0.0
 
     def as_event_data(self) -> dict[str, float | str]:
@@ -139,19 +150,30 @@ def _separation_deg(a: AccelSample, b: AccelSample) -> float:
     """Angle in degrees between two directions, 0..180.
 
     No absolute value on the dot product: 180 degrees must read as 180, since
-    that is exactly the number a palm flip produces. (The vertical angle
-    tracker wants the folded, sign-free version; that one lives there.)
+    that is exactly the number a palm flip produces. (The vertical elevation
+    below wants the folded, sign-free version.)
     """
     cosine = max(-1.0, min(1.0, a.dot(b)))
     return math.degrees(math.acos(cosine))
 
 
+def _elevation_deg(unit: AccelSample) -> float:
+    """Raw elevation of the hole axis above the horizontal plane, 0..90.
+
+    ``|component|`` of the unit gravity direction along the hole axis is
+    ``sin(elevation)``; ``asin`` recovers the elevation, folded to 0..90
+    because the axis reading gravity at +1 g and at -1 g is equally vertical.
+    """
+    along = abs(getattr(unit, MOTION_VERTICAL_AXIS))
+    return math.degrees(math.asin(min(1.0, along)))
+
+
 class StreamGestureDetector:
     """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`.
 
-    Feed it every sample of a session and it returns the ``hand_still`` and
-    ``hand_flip`` gestures the stream completes. It also reports the stream's
-    sample rate and median magnitude, which is everything
+    Feed it every sample of a session and it returns the ``hand_still``,
+    ``hand_flip`` and ``raised_hand`` gestures the stream completes. It also
+    reports the stream's sample rate and median magnitude, which is everything
     ``MotionManager._async_check_rate`` needs to log what the stream actually
     looks like once per session.
     """
@@ -160,17 +182,22 @@ class StreamGestureDetector:
         self,
         still_hold_s: float = DEFAULT_GESTURE_HOLD_STILL_S,
         flip_hold_s: float = DEFAULT_GESTURE_HOLD_FLIP_S,
+        raised_hold_s: float = DEFAULT_GESTURE_HOLD_RAISED_S,
     ) -> None:
         """Create a detector with per-gesture hold thresholds.
 
         ``still_hold_s`` is how long a calm episode must last before
         ``hand_still`` fires; ``flip_hold_s`` is how long each of the two
-        poses of a ``hand_flip`` must be held.
+        poses of a ``hand_flip`` must be held; ``raised_hold_s`` is how long
+        the hand must stay calm *and* raised before ``raised_hand`` fires.
         """
         self._still_hold_s = self._clamp_hold(
             still_hold_s, DEFAULT_GESTURE_HOLD_STILL_S
         )
         self._flip_hold_s = self._clamp_hold(flip_hold_s, DEFAULT_GESTURE_HOLD_FLIP_S)
+        self._raised_hold_s = self._clamp_hold(
+            raised_hold_s, DEFAULT_GESTURE_HOLD_RAISED_S
+        )
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
@@ -188,6 +215,12 @@ class StreamGestureDetector:
         # it has already fired (one event per episode, not per second).
         self._still_since: float | None = None
         self._still_fired = False
+
+        # The same for the raised-hand episode: calm with the hole axis held
+        # high. Its own clock because its hold is shorter, so an episode can
+        # satisfy the raised gate before (or without) the stillness one.
+        self._raised_since: float | None = None
+        self._raised_fired = False
 
         self.events_seen = 0
         self.samples_seen = 0
@@ -228,12 +261,22 @@ class StreamGestureDetector:
     # -- main entry point -------------------------------------------------
 
     def feed(
-        self, sample: AccelSample, now: float | None = None
+        self,
+        sample: AccelSample,
+        now: float | None = None,
+        angle_deg: float | None = None,
     ) -> list[GestureEvent]:
         """Feed one accelerometer sample; return any gestures it completed.
 
         ``now`` is a monotonic timestamp and defaults to the monotonic clock,
         which keeps offline replay honest when a capture provides its own.
+
+        ``angle_deg`` is the current reading of the Vertical Angle sensor,
+        when one is available: the raised-hand gate is judged against exactly
+        what that sensor reports (calibrated and smoothed), so a user watching
+        the sensor sees the gesture fire when the number says it should. It
+        is optional so the detector stays replayable on raw captures alone;
+        without it the elevation is read from the sample directly.
         """
         if now is None:
             now = time.monotonic()
@@ -251,6 +294,8 @@ class StreamGestureDetector:
             self._anchor = None
             self._still_since = None
             self._still_fired = False
+            self._raised_since = None
+            self._raised_fired = False
 
         if self._gravity is None:
             self._gravity = sample
@@ -264,10 +309,16 @@ class StreamGestureDetector:
             unit is not None
             and sample.minus(self._gravity).magnitude_g <= MOTION_STILL_ACCEL_G
         )
+        elevation = angle_deg if angle_deg is not None else (
+            _elevation_deg(unit) if unit is not None else None
+        )
 
         events: list[GestureEvent] = []
         events.extend(self._track_stillness(calm=calm, now=now))
         events.extend(self._track_pose(calm=calm, unit=unit, now=now))
+        events.extend(
+            self._track_raised_hand(calm=calm, elevation=elevation, now=now)
+        )
 
         self.events_seen += len(events)
         self.samples_seen += 1
@@ -283,6 +334,8 @@ class StreamGestureDetector:
         self._anchor = None
         self._still_since = None
         self._still_fired = False
+        self._raised_since = None
+        self._raised_fired = False
         self.events_seen = 0
         self.samples_seen = 0
 
@@ -369,6 +422,41 @@ class StreamGestureDetector:
                 gesture=GESTURE_STILL,
                 source=SOURCE_STREAM,
                 hold_s=round(held, 2),
+            )
+        ]
+
+    def _track_raised_hand(
+        self, *, calm: bool, elevation: float | None, now: float
+    ) -> list[GestureEvent]:
+        """One ``raised_hand`` per raised-and-calm episode, once it lasts long enough.
+
+        The same episode logic as :meth:`_track_stillness`, gated additionally
+        on the hole axis pointing high: either the hand moving or the hand
+        dropping below ``MOTION_RAISED_HAND_MIN_DEG`` ends the episode and
+        re-arms the gesture. The elevation is judged per sample rather than
+        averaged: a calm hand's elevation is already a settled reading (the
+        sensor value itself is low-passed when supplied), and a droop below
+        the threshold is a real lowering of the hand, not noise. The gesture
+        deliberately overlaps ``hand_still`` - a raised hand held long enough
+        fires both, and automations pick which one they mean.
+        """
+        if not calm or elevation is None or elevation < MOTION_RAISED_HAND_MIN_DEG:
+            self._raised_since = None
+            self._raised_fired = False
+            return []
+        if self._raised_since is None:
+            self._raised_since = now
+            return []
+        held = now - self._raised_since
+        if self._raised_fired or held < self._raised_hold_s:
+            return []
+        self._raised_fired = True
+        return [
+            GestureEvent(
+                gesture=GESTURE_RAISED_HAND,
+                source=SOURCE_STREAM,
+                hold_s=round(held, 2),
+                angle_deg=round(elevation, 1),
             )
         ]
 
@@ -524,11 +612,8 @@ class VerticalAngleTracker:
             # gravity. Hold the estimate rather than follow it.
             return self.angle_deg
 
-        # |component| of the unit gravity direction along the hole axis is
-        # sin(elevation); asin recovers the elevation, folded to 0..90 because
-        # the axis reading gravity at +1 g and at -1 g is equally vertical.
-        along = abs(getattr(unit, MOTION_VERTICAL_AXIS))
-        target = math.degrees(math.asin(min(1.0, along)))
+        # The elevation of the hole axis, folded to 0..90 (see _elevation_deg).
+        target = _elevation_deg(unit)
 
         if self._elevation is None:
             self._elevation = target

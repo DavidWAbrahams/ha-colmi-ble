@@ -9,12 +9,13 @@ Assistant event type, so an automation can trigger on either::
         event_data:
           gesture: wave
 
-Three gestures are offered. The wave is reported by the ring's own detector
+Four gestures are offered. The wave is reported by the ring's own detector
 while the Wave Detection switch holds the link; the event data's ``source``
-field says so via ``ring``. The stillness and flip gestures are derived here
-from the RAW accelerometer stream while the Motion Stream switch is on
-(``source`` = ``stream``): both are pose gestures, held for seconds rather
-than flicked, so they survive the stock firmware's one-sample-per-second rate.
+field says so via ``ring``. The stillness, flip and raised-hand gestures are
+derived here from the RAW accelerometer stream while the Motion Stream switch
+is on (``source`` = ``stream``): all are pose gestures, held for seconds
+rather than flicked, so they survive the stock firmware's
+one-sample-per-second rate.
 
 The entities are created whenever the motion manager exists: a user who only
 ever turns on Wave Detection still needs something to trigger on, and vice
@@ -35,7 +36,13 @@ from .const import (
     LOGGER,
 )
 from .entity import ColmiRingEntity
-from .gestures import GESTURE_FLIP, GESTURE_STILL, GESTURE_WAVE, GestureEvent
+from .gestures import (
+    GESTURE_FLIP,
+    GESTURE_RAISED_HAND,
+    GESTURE_STILL,
+    GESTURE_WAVE,
+    GestureEvent,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,6 +70,11 @@ ENTITY_DESCRIPTIONS = (
         key=GESTURE_FLIP,
         name="Hand flip",
         icon="mdi:rotate-3d-variant",
+    ),
+    EventEntityDescription(
+        key=GESTURE_RAISED_HAND,
+        name="Raised hand",
+        icon="mdi:hand-back-right",
     ),
 )
 

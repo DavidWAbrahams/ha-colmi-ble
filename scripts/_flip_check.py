@@ -55,6 +55,7 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
 )
 from custom_components.colmi_ring.gestures import (  # noqa: E402
     GESTURE_FLIP,
+    GESTURE_RAISED_HAND,
     GESTURE_STILL,
     SOURCE_STREAM,
     GestureEvent,
@@ -63,6 +64,7 @@ from custom_components.colmi_ring.gestures import (  # noqa: E402
 )
 
 HOLD_S = 2.0
+RAISED_HOLD_S = 4.0
 failures: list[str] = []
 
 UP = AccelSample(0.0, 0.0, 1.0)  # palm up
@@ -269,6 +271,66 @@ check(
     "separation: up vs side is 90",
     abs(up_side - 90.0) < 1e-6,
     f"deg={up_side}",
+)
+
+
+# 10. Raised hand: the stillness gesture plus an elevation gate. UP reads 90
+# degrees of elevation, SIDE reads 0, so UP+calm is raised and SIDE+calm is not.
+detector = StreamGestureDetector(
+    still_hold_s=10.0, flip_hold_s=HOLD_S, raised_hold_s=RAISED_HOLD_S
+)
+fired = stream(detector, held(UP, 6.0, 1.0), rate=1.0)
+raised = times_of(fired, GESTURE_RAISED_HAND)
+check(
+    "raised hand fires once, at its own hold",
+    len(raised) == 1 and abs(raised[0] - RAISED_HOLD_S) < 1e-9,
+    f"times={raised}",
+)
+if raised:
+    event = events_of(fired, GESTURE_RAISED_HAND)[0]
+    check(
+        "raised hand payload: elevation and hold",
+        abs(event.angle_deg - 90.0) < 1e-6 and abs(event.hold_s - RAISED_HOLD_S) < 1e-6,
+        f"angle={event.angle_deg} hold={event.hold_s}",
+    )
+else:
+    check("raised hand payload: elevation and hold", False, "no raised hand fired")
+
+# 11. Negative: calm with the hole axis horizontal never reads as raised.
+detector = StreamGestureDetector(
+    still_hold_s=10.0, flip_hold_s=HOLD_S, raised_hold_s=RAISED_HOLD_S
+)
+fired = stream(detector, held(SIDE, 8.0, 1.0), rate=1.0)
+check(
+    "calm but flat is not a raised hand",
+    not times_of(fired, GESTURE_RAISED_HAND),
+)
+
+# 12. Dropping the hand mid-episode re-arms: the second raise must earn its
+# own full hold rather than banking time from the first.
+detector = StreamGestureDetector(
+    still_hold_s=10.0, flip_hold_s=HOLD_S, raised_hold_s=RAISED_HOLD_S
+)
+fired = stream(
+    detector,
+    held(UP, 3.0, 1.0) + held(SIDE, 6.0, 1.0) + held(UP, 6.0, 1.0),
+    rate=1.0,
+)
+raised = times_of(fired, GESTURE_RAISED_HAND)
+check(
+    "lowering the hand re-arms the raised hand gesture",
+    len(raised) == 1 and abs(raised[0] - 13.0) < 1e-9,
+    f"times={raised}",
+)
+
+# 13. Negative: a shaking hand is not calm, however high it points.
+detector = StreamGestureDetector(
+    still_hold_s=10.0, flip_hold_s=HOLD_S, raised_hold_s=RAISED_HOLD_S
+)
+fired = stream(detector, waving(8.0, 1.0), rate=1.0)
+check(
+    "a shaking hand never raises",
+    not times_of(fired, GESTURE_RAISED_HAND),
 )
 
 

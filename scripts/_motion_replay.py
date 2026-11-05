@@ -72,15 +72,17 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
 )
 from custom_components.colmi_ring.const import (  # noqa: E402
     DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
 )
 from custom_components.colmi_ring.gestures import (  # noqa: E402
     GESTURE_FLIP,
+    GESTURE_RAISED_HAND,
     GESTURE_STILL,
     StreamGestureDetector,
 )
 
-ALL_GESTURES = (GESTURE_STILL, GESTURE_FLIP)
+ALL_GESTURES = (GESTURE_STILL, GESTURE_FLIP, GESTURE_RAISED_HAND)
 
 
 @dataclass(slots=True)
@@ -180,11 +182,13 @@ def report_signal(rows: list[Row]) -> None:
 
 
 def run_detector(
-    rows: list[Row], still_hold_s: float, flip_hold_s: float
+    rows: list[Row], still_hold_s: float, flip_hold_s: float, raised_hold_s: float
 ) -> dict[str, list[float]]:
     """Feed the whole capture through one detector; return fire times."""
     detector = StreamGestureDetector(
-        still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+        still_hold_s=still_hold_s,
+        flip_hold_s=flip_hold_s,
+        raised_hold_s=raised_hold_s,
     )
     fired: dict[str, list[float]] = {gesture: [] for gesture in ALL_GESTURES}
     for row in rows:
@@ -264,6 +268,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds each palm pose must be held to count as hand_flip",
     )
     parser.add_argument(
+        "--raised-hold-seconds",
+        type=float,
+        default=DEFAULT_GESTURE_HOLD_RAISED_S,
+        help="seconds a calm, raised hand must be held to count as raised_hand",
+    )
+    parser.add_argument(
         "--resample",
         action="store_true",
         help="re-time the stream at its median gap (undoes burst dumping)",
@@ -299,7 +309,12 @@ def main(argv: list[str] | None = None) -> int:
     print("\n## Events")
     if not any(math.isfinite(row.sample.x) for row in rows):
         print("  non-finite samples present; results are meaningless")
-    fired = run_detector(rows, args.still_hold_seconds, args.flip_hold_seconds)
+    fired = run_detector(
+        rows,
+        args.still_hold_seconds,
+        args.flip_hold_seconds,
+        args.raised_hold_seconds,
+    )
     report_gestures(fired)
 
     if args.plot_out is not None and not args.events_only:

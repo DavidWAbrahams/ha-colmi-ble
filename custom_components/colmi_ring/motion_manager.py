@@ -43,6 +43,7 @@ from .const import (
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
     CONF_GESTURE_HOLD_FLIP_S,
+    CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
@@ -51,6 +52,7 @@ from .const import (
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     DEFAULT_GESTURE_HOLD_FLIP_S,
+    DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
@@ -114,9 +116,11 @@ class MotionManager:
         self._client = client
         self._coordinator = coordinator
 
-        still_hold_s, flip_hold_s = self._hold_seconds()
+        still_hold_s, flip_hold_s, raised_hold_s = self._hold_seconds()
         self._detector = StreamGestureDetector(
-            still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+            still_hold_s=still_hold_s,
+            flip_hold_s=flip_hold_s,
+            raised_hold_s=raised_hold_s,
         )
         flat_deg, vertical_deg = self._vertical_anchors()
         self._angle = VerticalAngleTracker(flat_deg=flat_deg, vertical_deg=vertical_deg)
@@ -162,14 +166,17 @@ class MotionManager:
 
     # -- configuration ------------------------------------------------------
 
-    def _hold_seconds(self) -> tuple[float, float]:
-        """Per-gesture hold thresholds, in seconds: ``(still, flip)``."""
+    def _hold_seconds(self) -> tuple[float, float, float]:
+        """Per-gesture hold thresholds, in seconds: ``(still, flip, raised)``."""
         return (
             self._option_seconds(
                 CONF_GESTURE_HOLD_STILL_S, DEFAULT_GESTURE_HOLD_STILL_S
             ),
             self._option_seconds(
                 CONF_GESTURE_HOLD_FLIP_S, DEFAULT_GESTURE_HOLD_FLIP_S
+            ),
+            self._option_seconds(
+                CONF_GESTURE_HOLD_RAISED_S, DEFAULT_GESTURE_HOLD_RAISED_S
             ),
         )
 
@@ -591,11 +598,14 @@ class MotionManager:
             )
         # The vertical angle tracker sees every sample, like the detector: its
         # low-pass needs the uninterrupted stream, while the published angle is
-        # rate-limited with the sample itself.
+        # rate-limited with the sample itself. The detector gets the current
+        # angle too, so the raised-hand gesture fires on exactly what the
+        # Vertical Angle sensor reports rather than on a second, private
+        # estimate of the same quantity.
         self._angle.feed(sample)
         self.last_angle_deg = self._angle.angle_deg
         self._publish_sample(sample)
-        for event in self._detector.feed(sample):
+        for event in self._detector.feed(sample, angle_deg=self.last_angle_deg):
             self._publish(event)
 
     def _log_unknown_packet(self, packet: bytearray) -> None:

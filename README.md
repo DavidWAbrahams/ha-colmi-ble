@@ -44,7 +44,7 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 | Switch | What it does | What it costs |
 | --- | --- | --- |
 | `Wave Detection` | Asks the ring to run its own on-device hand wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable timeout (default unlimited) |
-| `Motion Stream` | Makes the ring stream raw accelerometer data continuously. The integration derives two gestures from that stream (`Hand still`, `Hand flip` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
+| `Motion Stream` | Makes the ring stream raw accelerometer data continuously. The integration derives three gestures from that stream (`Hand still`, `Hand flip`, `Raised hand` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
 Both switches are available on any Colmi ring; nothing runs (and nothing costs
 battery) until you turn one on. While the `Motion Stream` switch is on, it also
@@ -67,9 +67,12 @@ integration's options.
 | --- | --- |
 | `hand_still` | your hand stays roughly motionless for the hold time |
 | `hand_flip` | you hold one pose (e.g. palm up), quickly turn your hand 180°, and hold the opposite pose (palm down) |
+| `raised_hand` | your hand stays roughly motionless *and* raised - the `Vertical Angle` sensor above ~70° - for the hold time (4 s by default). Holding a raised hand still long enough fires `hand_still` too; automations pick the gesture they mean |
 
 Each gesture also has a matching *event entity* (`event.<ring>_wave`, `event.<ring>_hand_still`,
-`event.<ring>_hand_flip`), so automations can trigger on either the entity or the event below.
+`event.<ring>_hand_flip`, `event.<ring>_raised_hand`), so automations can trigger on either the
+entity or the event below. For `raised_hand`, the event data's `angle_deg` carries the elevation
+the gesture fired at.
 
 There is a `colmi_ring_gesture` event that carries the gesture, and any future ones that
 we may implement:
