@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_ADDRESS
@@ -58,6 +60,10 @@ _YCBT_FEE7_SERVICE = "0000fee7-0000-1000-8000-00805f9b34fb"
 # Company IDs seen in Yucheng ring manufacturer data (little-endian in the
 # adv payload, which HA already parses into the dict key).
 _YCBT_MFG_IDS = frozenset({0x7830, 0x7810})
+# Colmi rings advertise as "Rnn_XXXX" (R02_3090, R06_3090, ...). The underscore
+# is what distinguishes them from the Yucheng names (R20, R99, R11M, no
+# underscore), so unlike a bare "Rnn" this name shape is a genuine Colmi hint.
+_COLMI_NAME_RE = re.compile(r"^R\d\d_", re.IGNORECASE)
 
 
 def _family_hint_from_discovery(info: BluetoothServiceInfo) -> str:
@@ -78,6 +84,11 @@ def _family_hint_from_discovery(info: BluetoothServiceInfo) -> str:
         or yucheng_mfg
     ):
         return FAMILY_YCBT
+    # An "Rnn_" name (R02_3090, R06_3090) is the Colmi shape: Yucheng rings
+    # advertise R20/R99/R11M without the underscore. Rings that advertise
+    # nothing but flags and a name (some R06 firmwares) land here.
+    if _COLMI_NAME_RE.match(info.name or ""):
+        return FAMILY_COLMI
     return ""
 
 
