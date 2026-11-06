@@ -317,9 +317,11 @@ class MotionManager:
         # Rebuilt per session: the gravity reference, the pose state and the
         # rate estimate all belong to one continuous connection, not to the
         # whole uptime.
-        still_hold_s, flip_hold_s = self._hold_seconds()
+        still_hold_s, flip_hold_s, raised_hold_s = self._hold_seconds()
         self._detector = StreamGestureDetector(
-            still_hold_s=still_hold_s, flip_hold_s=flip_hold_s
+            still_hold_s=still_hold_s,
+            flip_hold_s=flip_hold_s,
+            raised_hold_s=raised_hold_s,
         )
         self._angle.reset()
         self.last_angle_deg = None
