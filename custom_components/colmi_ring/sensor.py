@@ -16,6 +16,7 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfLength,
     UnitOfTemperature,
+    UnitOfTime,
 )
 from homeassistant.core import callback
 
@@ -80,9 +81,9 @@ ENTITY_DESCRIPTIONS = (
     ),
 )
 
-# Skin temperature comes from the Yucheng all-metrics history stream (and
-# the on-demand temperature session), neither of which the Colmi protocol
-# client implements, so the sensor is created for YCBT entries only.
+# Skin temperature and HRV come from the Yucheng all-metrics history stream
+# (and the on-demand temperature session), none of which the Colmi protocol
+# client implements, so these sensors are created for YCBT entries only.
 YCBT_ENTITY_DESCRIPTIONS = (
     SensorEntityDescription(
         key="skin_temperature",
@@ -92,8 +93,17 @@ YCBT_ENTITY_DESCRIPTIONS = (
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
     ),
+    # HRV in milliseconds (the Yucheng SDK's unit for this byte); no device
+    # class fits HRV, so it rides on a plain measurement sensor.
+    SensorEntityDescription(
+        key="hrv",
+        name="Heart Rate Variability",
+        icon="mdi:heart-plus",
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
+    ),
 )
-
 
 @dataclass(frozen=True, slots=True)
 class _AccelSensor:
@@ -260,6 +270,9 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
                 timestamp = self.coordinator.data.get(
                     "skin_temperature_timestamp"
                 )
+                self._attr_extra_state_attributes = {"timestamp": timestamp}
+            elif self.entity_description.key == "hrv":
+                timestamp = self.coordinator.data.get("hrv_timestamp")
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
         super()._handle_coordinator_update()
 

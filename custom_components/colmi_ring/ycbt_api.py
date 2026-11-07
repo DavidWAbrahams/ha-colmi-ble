@@ -629,6 +629,9 @@ class YcbtRingApiClient:
         # (watermark-deduped), so without this the sensor would flap to
         # unknown on every poll that drains no new records.
         self._skin_reading: dict[str, Any] | None = None
+        # Last known HRV (ms): same persist-across-polls reason as
+        # _skin_reading; rides in the same all-metrics records.
+        self._hrv_reading: dict[str, Any] | None = None
         self._store = Store(
             hass,
             _HWM_STORE_VERSION,
@@ -801,6 +804,16 @@ class YcbtRingApiClient:
                     ),
                 }
 
+            # HRV (ms, per the Yucheng SDK) rides in the same records, at
+            # AllRecord.hrv; same keep-the-newest treatment as temperature.
+            hrv_rows = [record for record in all_fresh if record.hrv]
+            if hrv_rows:
+                latest_hrv = max(hrv_rows, key=lambda record: record.timestamp_ms)
+                self._hrv_reading = {
+                    "hrv": latest_hrv.hrv,
+                    "hrv_timestamp": _ms_to_dt(latest_hrv.timestamp_ms),
+                }
+
             by_ts: dict[datetime, int] = {}
             for record in all_fresh:
                 if record.hr:
@@ -866,6 +879,8 @@ class YcbtRingApiClient:
             "skin_temperature_timestamp": (self._skin_reading or {}).get(
                 "skin_temperature_timestamp"
             ),
+            "hrv": (self._hrv_reading or {}).get("hrv"),
+            "hrv_timestamp": (self._hrv_reading or {}).get("hrv_timestamp"),
             "steps": steps_total,
             "distance": distance_total,
             "calories": calories_total,

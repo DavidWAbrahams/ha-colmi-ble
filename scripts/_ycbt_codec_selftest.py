@@ -118,17 +118,19 @@ def check_records() -> None:
     rec0 = bytearray(ts2k_val.to_bytes(4, "little")) + bytes([0x00, 0x00])
     assert yc_rec.parse_hr_records(bytes(rec0), tz_offset_sec=tz) == []
 
-    # AllRecord: hr@6, spo2@9, steps u16@4
+    # AllRecord: hr@6, spo2@9, hrv@11, steps u16@4
     payload = bytearray(20)
     payload[0:4] = ts2k_val.to_bytes(4, "little")
     payload[4:6] = (1234).to_bytes(2, "little")
     payload[6] = 66
     payload[9] = 97
+    payload[11] = 42  # HRV, ms
     payload[13], payload[14] = 36, 52  # 36.52 degC
     ars = yc_rec.parse_all_records(bytes(payload), tz_offset_sec=tz)
     assert len(ars) == 1
     a = ars[0]
     assert a.steps == 1234 and a.hr == 66 and a.spo2 == 97
+    assert a.hrv == 42
     assert abs(a.temperature - 36.52) < 1e-9
 
     # battery / steps / fw / name scalars
