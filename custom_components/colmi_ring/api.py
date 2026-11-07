@@ -41,9 +41,11 @@ from .colmi_codec import (
     reboot,
     set_time as set_time_mod,
     steps,
+    stress,
 )
 from .colmi_codec.hr import HeartRateLogParser
 from .colmi_codec.steps import SportDetailParser
+from .colmi_codec.stress import StressLogParser
 
 from .const import (
     LOGGER,
@@ -95,6 +97,10 @@ USER_LOCK_WAIT_S = 15.0
 # battery than under the old connect-per-session client (10 s comfortably
 # covers a poll's command gaps and a button pressed straight after a refresh).
 LINK_IDLE_DISCONNECT_S = 10.0
+
+# The ring records one stress score per 30-minute slot of its (UTC-synced)
+# day, so the stress log only needs re-reading when that slot number changes.
+STRESS_SLOT_S = 30 * 60
 
 
 def _latest_sample_is_zero(
@@ -294,6 +300,7 @@ class _RingConnection:
             ),
             real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
+            stress.CMD_READ_STRESS: StressLogParser().parse,
         }
         self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
 
@@ -468,6 +475,12 @@ class _RingConnection:
             target = date_utils.start_of_day(date_utils.now())
         return await self._command(
             hr.read_heart_rate_packet(target), hr.CMD_READ_HEART_RATE
+        )
+
+    async def get_stress_log(self) -> stress.StressLog | stress.NoData:
+        """Read today's stress log (one value per 30-minute slot)."""
+        return await self._command(
+            stress.read_stress_packet(), stress.CMD_READ_STRESS
         )
 
     async def get_steps(
@@ -1006,6 +1019,12 @@ class ColmiRingApiClient:
         # cannot take two at once; refuse the second press immediately rather
         # than queueing it for fifteen seconds behind the first.
         self._measuring: str | None = None
+        # Newest stress sample from the day-history log, and the 30-min slot
+        # it was read for. The log only gains a value on slot boundaries, so
+        # a fetch is attempted at most once per slot and the cached reading
+        # is reported on every poll in between.
+        self._stress_reading: dict[str, Any] | None = None
+        self._stress_slot: int | None = None
 
     async def async_close(self) -> None:
         """Tear the shared link down now (entry unload/reload).
@@ -1074,9 +1093,7 @@ class ColmiRingApiClient:
                     self._ring_address,
                 )
 
-            steps_total: int | None = None
-            distance_total: int | None = None
-            calories_total: int | None = None
+            steps_total = distance_total = calories_total = None
             try:
                 # The ring logs sport detail in 15-min bins keyed to its own
                 # clock, which we just synced to UTC above, so ask for offset 0
@@ -1168,6 +1185,13 @@ class ColmiRingApiClient:
                         entries, key=lambda x: x[1]
                     )
 
+            # Stress is logged one value per 30-min slot of the ring's day,
+            # so the log is re-read only when that slot changes and the
+            # cached newest sample is reported in between. This stays after
+            # the clock sync above: the stress log carries no timestamps of
+            # its own, so its slots are anchored to UTC midnight.
+            stress_value, stress_timestamp = await self._async_stress_reading(conn)
+
             # Yesterday's ring logs extend the backfill time series only;
             # every live sensor value above stays strictly today-based.
             # ``prev_day`` reports which earlier day was answered this poll so
@@ -1188,12 +1212,65 @@ class ColmiRingApiClient:
             "steps": steps_total,
             "distance": distance_total,
             "calories": calories_total,
+            "stress": stress_value,
+            "stress_timestamp": stress_timestamp,
             "hr_entries": hr_entries,
             "sport_bins": sport_bins,
             # ISO date of a previous-day log query the ring ANSWERED this
             # poll (None when not requested or not answered).
             "prev_day": prev_day,
         }
+
+    async def _async_stress_reading(
+        self, conn: _RingConnection
+    ) -> tuple[int | None, datetime | None]:
+        """Return the newest (stress, timestamp), refetching once per slot.
+
+        The ring fills one stress slot per 30 minutes, so the log is only
+        re-read when the current slot number differs from the last one
+        attempted; between slots (and after a failed fetch) the cached
+        reading is reported as-is.
+        """
+        slot = int(date_utils.now().timestamp()) // STRESS_SLOT_S
+        if slot != self._stress_slot:
+            self._stress_slot = slot
+            self._stress_reading = await self._async_read_stress(conn)
+        reading = self._stress_reading or {}
+        value: int | None = reading.get("value")
+        timestamp: datetime | None = reading.get("timestamp")
+        return value, timestamp
+
+    async def _async_read_stress(
+        self, conn: _RingConnection
+    ) -> dict[str, Any] | None:
+        """Read today's stress log and return its newest sample, or None.
+
+        Rings without the 0x37 log just time out (or answer empty); that
+        clears the cached reading, and the next attempt waits for the next
+        30-minute slot rather than re-probing every poll.
+        """
+        try:
+            log = await conn.get_stress_log()
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Colmi ring %s did not answer stress query",
+                self._ring_address,
+            )
+            return self._stress_reading  # a failed fetch keeps the last value
+        if not isinstance(log, stress.StressLog):
+            LOGGER.debug(
+                "Colmi ring %s reported an empty stress history",
+                self._ring_address,
+            )
+            return None
+        now = date_utils.now()
+        # The day's tail slots run past midnight and are zero, but a stale
+        # ring clock could put non-zero slots in the "future"; ignore them.
+        samples = [s for s in log.samples_with_times() if s[1] <= now]
+        if not samples:
+            return None
+        value, ts = max(samples, key=lambda s: s[1])
+        return {"value": value, "timestamp": ts}
 
     async def _async_extend_previous_day(
         self,

@@ -105,6 +105,21 @@ YCBT_ENTITY_DESCRIPTIONS = (
     ),
 )
 
+# Stress comes from the Colmi daily stress ("pressure") history log, which the
+# Yucheng protocol client does not implement, so this sensor is created for
+# Colmi entries only. The ring fills one 0-100 score per 30-minute slot.
+COLMI_ENTITY_DESCRIPTIONS = (
+    SensorEntityDescription(
+        key="stress",
+        name="Stress",
+        icon="mdi:brain",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
+    ),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _AccelSensor:
     """One face of the raw sample: how to describe it, and which part to read."""
@@ -197,6 +212,8 @@ async def async_setup_entry(
     descriptions = list(ENTITY_DESCRIPTIONS)
     if entry.data.get(CONF_DEVICE_FAMILY) == FAMILY_YCBT:
         descriptions.extend(YCBT_ENTITY_DESCRIPTIONS)
+    else:
+        descriptions.extend(COLMI_ENTITY_DESCRIPTIONS)
     async_add_entities(
         ColmiRingSensor(
             coordinator=coordinator,
@@ -273,6 +290,9 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
             elif self.entity_description.key == "hrv":
                 timestamp = self.coordinator.data.get("hrv_timestamp")
+                self._attr_extra_state_attributes = {"timestamp": timestamp}
+            elif self.entity_description.key == "stress":
+                timestamp = self.coordinator.data.get("stress_timestamp")
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
         super()._handle_coordinator_update()
 
