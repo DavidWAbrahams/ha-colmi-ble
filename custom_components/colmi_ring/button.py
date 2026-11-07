@@ -13,6 +13,7 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     MEASURE_HEART_RATE,
+    MEASURE_HRV,
     MEASURE_SPO2,
     MEASURE_TEMPERATURE,
 )
@@ -87,6 +88,19 @@ async def async_setup_entry(
                     key="colmi_ring_temperature_button",
                     name="Read Temperature",
                     icon="mdi:thermometer",
+                ),
+            )
+        )
+    # On-demand HRV exists only on the Colmi protocol family: the real-time
+    # HRV reading (type 10) has no Yucheng equivalent.
+    if entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI) != FAMILY_YCBT:
+        buttons.append(
+            ColmiRingHrvButton(
+                coordinator=coordinator,
+                entity_description=ButtonEntityDescription(
+                    key="colmi_ring_hrv_button",
+                    name="Read HRV",
+                    icon="mdi:heart-multiple",
                 ),
             )
         )
@@ -250,6 +264,58 @@ class ColmiRingHeartRateButton(ColmiRingEntity, ButtonEntity):
             self.coordinator.apply_heart_rate(reading)
         except ColmiRingApiClientError as err:
             LOGGER.warning("Colmi ring heart-rate measurement failed: %s", err)
+            raise
+        finally:
+            self._end_measurement()
+
+
+class ColmiRingHrvButton(ColmiRingEntity, ButtonEntity):
+    """Trigger an on-demand real-time heart-rate-variability reading."""
+
+    _measure_name = MEASURE_HRV
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        entity_description: ButtonEntityDescription,
+    ) -> None:
+        """Initialize the button class."""
+        super().__init__(coordinator)
+        self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{entity_description.key}"
+        )
+        self._watch_ring_busy()
+
+    @property
+    def available(self) -> bool:
+        """Greyed out while the stream owns the ring or a measurement runs."""
+        motion = self._motion_manager()
+        return (
+            super().available
+            and self.coordinator.ring_busy is None
+            and (motion is None or not motion.holds_link)
+        )
+
+    def press(self) -> None:
+        """Press the button (measurement takes ~30s; run it in the background)."""
+        self._assert_ring_free()
+        self._begin_measurement(self._measure_name)
+        self.hass.async_create_task(self.async_press())
+
+    async def async_press(self) -> None:
+        """Take an on-demand HRV reading and publish it to the sensor."""
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            reading = await client.async_take_hrv()
+            if reading.get("hrv") is None:
+                LOGGER.warning(
+                    "Colmi ring HRV measurement produced no valid"
+                    " reading (is the ring worn snugly on a finger?)"
+                )
+            self.coordinator.apply_hrv(reading)
+        except ColmiRingApiClientError as err:
+            LOGGER.warning("Colmi ring HRV measurement failed: %s", err)
             raise
         finally:
             self._end_measurement()

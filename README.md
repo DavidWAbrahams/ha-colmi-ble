@@ -1,4 +1,5 @@
 # What?
+
 Integrate the Colmi line of smart rings with Home Assistant.
 Colmi rings (like the R02, R06, R10 etc) can be found for under $20 on AliExpress.
 These can be distiguished because they use QRing as their phone app.
@@ -9,10 +10,12 @@ There is also partial support for some clones that are sold interchangeably on A
 This does not include gesture support.
 
 # How?
+
 Home Assistant will periodically pull data from your ring via Bluetooth Low Energy.
 This is built on top of tahnok's Python API (https://github.com/tahnok/colmi_r02_client) and ludeeus's Home Assistant Integration blueprint (https://github.com/ludeeus/integration_blueprint)
 
 # Requirements
+
 Your home assistant device must have the ability to make active Bluetooth Low Energy (BLE) connections. The bluetooth adapter in a raspberry pi or some PC motherboards will satisfy this. It will also work with ESPHome bluetooth proxies if they are configured something like this:
 
 ```
@@ -25,14 +28,17 @@ bluetooth_proxy:
 ```
 
 # Setup
+
 Install HACS. Add this repo to your Custom Repositories. Install "Colmi Ring" from the HACS list.
 
 If for some reason autodiscovery doesn't work, try going to Settings -> Devices and Services -> Add Integration -> Colmi Ring
 
 # A note on SpO2
+
 The ring's SpO2 (blood oxygen) reading may be a larger battery drain than heart rate, which is why Colmi's own firmware doesn't sample it automatically and there is no automatic sampling rate here either. The "Read SpO2" button triggers an on-demand measurement. You can automate pressing that button in Home Assistant as you wish, understanding that battery life will be reduced.
 
 # Filling in the gaps (backfill)
+
 The ring only reports data while it is within Bluetooth range of Home Assistant. When you leave the house, the BLE connection drops and Home Assistant stops receiving data.
 
 The ring doesn't stop measuring, though. It keeps logging heart rate and activity to internal memory. When you come home and the ring reconnects, this integration reads that stored log and tries to backfill the missing time.
@@ -41,10 +47,10 @@ You can toggle these behaviors under Settings -> Devices and Services -> Colmi R
 
 # Gestures
 
-| Switch | What it does | What it costs |
-| --- | --- | --- |
-| `Wave Detection` | Asks the ring to run its own on-device hand wave detector and report when it fires | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable timeout (default unlimited) |
-| `Motion Stream` | Makes the ring stream raw accelerometer data continuously. The integration derives three gestures from that stream (`Hand still`, `Hand flip`, `Raised hand` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
+| Switch           | What it does                                                                                                                                                                                                                                                        | What it costs                                                                                                                                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Wave Detection` | Asks the ring to run its own on-device hand wave detector and report when it fires                                                                                                                                                                                  | Shares the Bluetooth link: heart rate, battery and steps keep updating while it is on; turns itself off after a configurable timeout (default unlimited)                                                             |
+| `Motion Stream`  | Makes the ring stream raw accelerometer data continuously. The integration derives three gestures from that stream (`Hand still`, `Hand flip`, `Raised hand` - see below), and the raw values are published as sensors so you can build your own gestures in HA too | Takes the link exclusively, so polling and the buttons freeze while it is on, and it drains the battery quickly; turns itself off after a configurable number of minutes (30 by default, restarted on every gesture) |
 
 Both switches are available on any Colmi ring; nothing runs (and nothing costs
 battery) until you turn one on. While the `Motion Stream` switch is on, it also
@@ -54,22 +60,22 @@ provides:
   `Acceleration` (the magnitude) - see below, and
 - a `Vertical Angle` sensor - see below.
 
-The two switches are mutually exclusive with *each other*. The RAW stream puts the firmware into a
+The two switches are mutually exclusive with _each other_. The RAW stream puts the firmware into a
 mode that takes over the accelerometer and stops the wave detector's reports.
 
 The stream-derived gestures are designed within the limits of the hardware: the stock R02
-firmware sends one sample per second, so these gestures are about *poses held for seconds*,
+firmware sends one sample per second, so these gestures are about _poses held for seconds_,
 not quick motions. They work at 1 Hz and get a little crisper if
 you flash the 4 Hz firmware mentioned below. How long a pose must be held is configurable in the
 integration's options.
 
-| Gesture | Fires when |
-| --- | --- |
-| `hand_still` | your hand stays roughly motionless for the hold time |
-| `hand_flip` | you hold one pose (e.g. palm up), quickly turn your hand 180°, and hold the opposite pose (palm down) |
-| `raised_hand` | your hand stays roughly motionless *and* raised - the `Vertical Angle` sensor above ~70° - for the hold time (4 s by default). Holding a raised hand still long enough fires `hand_still` too; automations pick the gesture they mean |
+| Gesture       | Fires when                                                                                                                                                                                                                            |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hand_still`  | your hand stays roughly motionless for the hold time                                                                                                                                                                                  |
+| `hand_flip`   | you hold one pose (e.g. palm up), quickly turn your hand 180°, and hold the opposite pose (palm down)                                                                                                                                 |
+| `raised_hand` | your hand stays roughly motionless _and_ raised - the `Vertical Angle` sensor above ~70° - for the hold time (4 s by default). Holding a raised hand still long enough fires `hand_still` too; automations pick the gesture they mean |
 
-Each gesture also has a matching *event entity* (`event.<ring>_wave`, `event.<ring>_hand_still`,
+Each gesture also has a matching _event entity_ (`event.<ring>_wave`, `event.<ring>_hand_still`,
 `event.<ring>_hand_flip`, `event.<ring>_raised_hand`), so automations can trigger on either the
 entity or the event below. For `raised_hand`, the event data's `angle_deg` carries the elevation
 the gesture fired at.
@@ -93,12 +99,12 @@ action:
 While the `Motion Stream` switch is on, the ring's raw accelerometer readings are also published as
 four sensors, all in units of `g` and in the ring's own axis frame:
 
-| Sensor | Value |
-| --- | --- |
+| Sensor                         | Value                          |
+| ------------------------------ | ------------------------------ |
 | `sensor.<ring>_acceleration_x` | X axis, as the ring reports it |
 | `sensor.<ring>_acceleration_y` | Y axis, as the ring reports it |
 | `sensor.<ring>_acceleration_z` | Z axis, as the ring reports it |
-| `sensor.<ring>_acceleration` | `sqrt(x^2 + y^2 + z^2)` |
+| `sensor.<ring>_acceleration`   | `sqrt(x^2 + y^2 + z^2)`        |
 
 On my R02 ring, the axis are like this:
 z: the axis through the finger hole
@@ -124,5 +130,20 @@ residual motion keep a "flat" reading a degree or two above 0 and an upright one
 a degree or two below 90. If you want the sensors to actually use the full 0-90 scale,
 there are two configuration options to manually adjust the endpoints.
 
+# A note on heart rate variability and stress
+
+Both are exposed, with the same caveat: on a $20 optical ring they are
+best treated as interesting, not medical.
+
+`Heart Rate Variability` (HRV, in ms) comes from the Yucheng rings' background
+history stream, and on Colmi rings from an on-demand measurement started by the
+"Read HRV" button, which behaves like the "Read SpO2" button: ~30 s long, safe
+to automate but will consume battery faster.
+
+`Stress` (0-100 %) is Colmi-only. I'm not clear on what it truly measures, but
+it may be some mash up of heart rate and variability. The ring reports it in 30
+minute increments through the day.
+
 # TODO
-1) Consider dubious metrics like blood pressure, blood sugar, ECG, HRV, stress etc. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
+
+1. Consider dubious metrics like blood pressure, blood sugar, ECG. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.

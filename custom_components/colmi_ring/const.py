@@ -76,10 +76,12 @@ STREAM_BUSY_MESSAGE = "Unavailable while the motion stream is on"
 WAVE_BUSY_MESSAGE = "Unavailable while wave detection is on"
 
 # The ring's optical sensor lights different LEDs per reading type, so the
-# on-demand measurements (Read Heart Rate / Read SpO2 / Read Temperature) can
-# only run one at a time. The coordinator's ``ring_busy`` flag carries the
-# running measurement's name while the controls grey each other out.
+# on-demand measurements (Read Heart Rate / Read SpO2 / Read Temperature /
+# Read HRV) can only run one at a time. The coordinator's ``ring_busy`` flag
+# carries the running measurement's name while the controls grey each other
+# out.
 MEASURE_HEART_RATE = "heart rate"
+MEASURE_HRV = "heart rate variability"
 MEASURE_SPO2 = "SpO2"
 MEASURE_TEMPERATURE = "skin temperature"
 

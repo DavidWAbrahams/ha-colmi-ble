@@ -79,11 +79,23 @@ ENTITY_DESCRIPTIONS = (
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
+    # HRV in milliseconds; both families fill it, by different means: the
+    # Yucheng all-metrics history stream, or a Colmi on-demand real-time
+    # reading (the Read HRV button). No device class fits HRV, so it rides
+    # on a plain measurement sensor.
+    SensorEntityDescription(
+        key="hrv",
+        name="Heart Rate Variability",
+        icon="mdi:heart-multiple",
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
+    ),
 )
 
-# Skin temperature and HRV come from the Yucheng all-metrics history stream
-# (and the on-demand temperature session), none of which the Colmi protocol
-# client implements, so these sensors are created for YCBT entries only.
+# Skin temperature comes from the Yucheng all-metrics history stream (and
+# the on-demand temperature session), neither of which the Colmi protocol
+# client implements, so the sensor is created for YCBT entries only.
 YCBT_ENTITY_DESCRIPTIONS = (
     SensorEntityDescription(
         key="skin_temperature",
@@ -92,16 +104,6 @@ YCBT_ENTITY_DESCRIPTIONS = (
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
-    ),
-    # HRV in milliseconds (the Yucheng SDK's unit for this byte); no device
-    # class fits HRV, so it rides on a plain measurement sensor.
-    SensorEntityDescription(
-        key="hrv",
-        name="Heart Rate Variability",
-        icon="mdi:heart-plus",
-        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
-        state_class=SensorStateClass.MEASUREMENT,
-        suggested_display_precision=0,
     ),
 )
 

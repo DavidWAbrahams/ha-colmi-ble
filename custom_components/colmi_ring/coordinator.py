@@ -61,6 +61,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # A live real-time reading, kept only while it is fresher than the
         # ring's logged HR sample (see _async_update_data precedence).
         self.hr_live: dict[str, Any] | None = None
+        # {"hrv": int | None, "hrv_timestamp": datetime | None} or None.
+        # The latest on-demand HRV reading from the Read HRV button; like
+        # SpO2 it persists across polls (the Colmi poll data has no hrv key
+        # of its own, so this overlay is the sensor's only Colmi source).
+        self.hrv_reading: dict[str, Any] | None = None
         # Name of the on-demand measurement in progress ("heart rate", "SpO2",
         # ...), or None. The optical sensor takes one measurement at a time,
         # so the Read buttons and the Motion Stream switch grey out while this
@@ -196,6 +201,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(exception) from exception
         self._apply_spo2_reading(data)
         self._apply_live_heart_rate(data)
+        self._apply_hrv_reading(data)
         if self._heart_rate_is_stale(data):
             # The newest sample is old enough that the ring is almost certainly
             # off the finger; report "unknown" instead of a stale value.
@@ -245,6 +251,20 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             data["heart_rate_timestamp"] = self.hr_live.get("heart_rate_timestamp")
         else:
             self.hr_live = None
+
+    def _apply_hrv_reading(self, data: dict[str, Any]) -> None:
+        """Overlay the persisted on-demand HRV reading, if any.
+
+        Yucheng polls already carry their own hrv keys (the client persists
+        history-derived HRV itself), and the coordinator's ``hrv_reading``
+        stays unset for those entries, so ``setdefault`` leaves them alone.
+        """
+        if self.hrv_reading is not None:
+            data["hrv"] = self.hrv_reading.get("hrv")
+            data["hrv_timestamp"] = self.hrv_reading.get("hrv_timestamp")
+        else:
+            data.setdefault("hrv", None)
+            data.setdefault("hrv_timestamp", None)
 
     # Floor for the adaptive poll interval (Colmi family). The ring's HR log
     # is a 5-min slot grid, so polling faster than that can never reveal a
@@ -355,6 +375,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         data["skin_temperature_timestamp"] = reading.get(
             "skin_temperature_timestamp"
         )
+        self.async_set_updated_data(data)
+
+    def apply_hrv(self, reading: dict[str, Any]) -> None:
+        """Store a fresh HRV reading and push it to entities immediately."""
+        self.hrv_reading = reading
+        data = dict(self.data) if self.data else {}
+        data["hrv"] = reading.get("hrv")
+        data["hrv_timestamp"] = reading.get("hrv_timestamp")
         self.async_set_updated_data(data)
 
     def apply_heart_rate(self, reading: dict[str, Any]) -> None:

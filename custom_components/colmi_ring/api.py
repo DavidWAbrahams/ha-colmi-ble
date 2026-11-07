@@ -50,6 +50,7 @@ from .colmi_codec.stress import StressLogParser
 from .const import (
     LOGGER,
     MEASURE_HEART_RATE,
+    MEASURE_HRV,
     MEASURE_SPO2,
     MOTION_STREAM_SILENCE_TIMEOUT_S,
     measurement_busy_message,
@@ -1419,6 +1420,29 @@ class ColmiRingApiClient:
         return {
             "heart_rate": median,
             "heart_rate_timestamp": datetime.now(tz=timezone.utc),
+        }
+
+    async def async_take_hrv(self) -> dict[str, Any]:
+        """Take an on-demand real-time heart-rate-variability measurement.
+
+        Returns a dict with ``hrv`` (int ms) and ``hrv_timestamp`` (aware
+        datetime), or ``hrv`` = None if the ring produced no valid reading.
+        """
+        self._claim_measurement(MEASURE_HRV)
+        try:
+            async with self._link.acquire("hrv", USER_LOCK_WAIT_S) as conn:
+                samples = await conn.poll_real_time_reading(
+                    real_time.RealTimeReading.HRV
+                )
+        finally:
+            self._measuring = None
+        if not samples:
+            return {"hrv": None, "hrv_timestamp": None}
+        samples.sort()
+        median = samples[len(samples) // 2]
+        return {
+            "hrv": median,
+            "hrv_timestamp": datetime.now(tz=timezone.utc),
         }
 
     # How often the stream watchdog inspects link/silence state.
