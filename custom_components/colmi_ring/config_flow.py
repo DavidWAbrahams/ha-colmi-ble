@@ -46,6 +46,7 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
+    VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
 )
 from .ycbt_api import YcbtRingApiClient
 
@@ -363,9 +364,9 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         ),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(
-                            # 0 means "no correction" (raw reading already
-                            # tops out at 90).
-                            min=0,
+                            # 90 is the uncorrected map; below 70 the gain
+                            # would distort ordinary readings too much.
+                            min=VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
                             max=90,
                             step=0.1,
                             mode=selector.NumberSelectorMode.BOX,

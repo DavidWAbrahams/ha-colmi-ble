@@ -33,8 +33,8 @@
                     "motion_stream_timeout": "Motion stream timeout minutes, to save battery (0 = unlimited)",
                     "wave_timeout": "Wave detection timeout minutes, to save battery (0 = unlimited)",
                     "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed",
-                    "vertical_flat_deg": "Angle calibration: raw angle that means flat (rescaled to 0°)",
-                    "vertical_upright_deg": "Angle calibration: raw angle that means upright (rescaled to 90°, 0 = no correction)",
+                    "vertical_flat_deg": "Angle calibration: raw angle that means flat (reported as 0°). Set 0 if a flat hand already reads ~0; raise it (20 max) if it reads high.",
+                    "vertical_upright_deg": "Angle calibration: raw angle that means upright (reported as 90°). Set 90 if a fully vertical hand already reads ~90; lower it (70 min) if it reads low.",
                     "motion_log_samples": "Accelerometer debug logging"
                 }
             }

@@ -253,31 +253,34 @@ MOTION_RAISED_HAND_MIN_DEG = 70.0
 # than noise. Averaging cannot remove it; only an anchor can.
 #
 # Both are options rather than constants because the offset is a property of the
-# unit and the wear, not of the code. Each defaults to no correction.
+# unit and the wear, not of the code. Both default to the uncorrected map: the
+# raw elevation already reads 0 flat and 90 upright.
 
 # Raw elevation (degrees) that reads as flat, i.e. is reported as 0.
 CONF_VERTICAL_FLAT_DEG = "vertical_flat_deg"
 DEFAULT_VERTICAL_FLAT_DEG = 0.0
 
-# Raw elevation (degrees) that reads as vertical, i.e. is reported as 90. Zero
-# means "the raw reading already tops out at 90", so no correction.
+# Raw elevation (degrees) that reads as vertical, i.e. is reported as 90.
 CONF_VERTICAL_UPRIGHT_DEG = "vertical_upright_deg"
-DEFAULT_VERTICAL_UPRIGHT_DEG = 0.0
+DEFAULT_VERTICAL_UPRIGHT_DEG = 90.0
 
 # How far either anchor may move from its uncorrected value. Beyond these the
-# map would gain so much that ordinary readings stop being meaningful; the
-# useful range for a real ring is a couple of degrees at each end.
-VERTICAL_FLAT_ANCHOR_MAX_DEG = 10.0
-VERTICAL_UPRIGHT_ANCHOR_MIN_DEG = 80.0
+# map would gain so much that ordinary readings stop being meaningful: the flat
+# end may be pushed up to 20, while the upright end may be pulled down to 70 so
+# a hand that never reads fully vertical still reaches 90.
+VERTICAL_FLAT_ANCHOR_MAX_DEG = 20.0
+VERTICAL_UPRIGHT_ANCHOR_MIN_DEG = 70.0
 
 
 def resolve_vertical_anchors(flat: object, upright: object) -> tuple[float, float]:
     """Coerce the two anchor options into a valid ``(flat, vertical)`` pair.
 
-    Garbage or half-migrated values fall back to no correction rather than to a
-    plausible-looking map, because a silently wrong calibration is worse than an
-    obviously uncorrected one. A pair that cannot define an increasing map - the
-    flat anchor at or above the vertical one - is rejected outright.
+    Garbage, or an upright anchor outside the usable 70..90 range, falls back to
+    the uncorrected default rather than to a plausible-looking map, because a
+    silently wrong calibration is worse than an obviously uncorrected one. That
+    also covers entries saved before the upright anchor had a real default. A
+    pair that cannot define an increasing map - the flat anchor at or above the
+    vertical one - is rejected outright.
     """
     try:
         flat_deg = float(flat)  # type: ignore[arg-type]
@@ -289,11 +292,8 @@ def resolve_vertical_anchors(flat: object, upright: object) -> tuple[float, floa
         upright_deg = DEFAULT_VERTICAL_UPRIGHT_DEG
 
     flat_deg = min(max(flat_deg, 0.0), VERTICAL_FLAT_ANCHOR_MAX_DEG)
-    if upright_deg <= 0:
-        # The default: no correction at the high end.
-        upright_deg = 90.0
-    else:
-        upright_deg = min(max(upright_deg, VERTICAL_UPRIGHT_ANCHOR_MIN_DEG), 90.0)
+    if not VERTICAL_UPRIGHT_ANCHOR_MIN_DEG <= upright_deg <= 90.0:
+        upright_deg = DEFAULT_VERTICAL_UPRIGHT_DEG
 
     if upright_deg <= flat_deg:
         return 0.0, 90.0
