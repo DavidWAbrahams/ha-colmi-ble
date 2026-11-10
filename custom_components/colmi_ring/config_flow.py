@@ -103,9 +103,11 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 5
 
     # Ring we were started from (Bluetooth discovery), if any: used to
-    # pre-populate the address field and default the family picker.
+    # pre-populate the address field, default the family picker, and name
+    # the entry after the ring's advertisement name ("R88 5CA3").
     _discovered_address: str | None = None
     _discovered_family_hint: str = ""
+    _discovered_name: str | None = None
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfo
@@ -114,6 +116,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(format_mac(discovery_info.address))
         self._abort_if_unique_id_configured()
         self._discovered_address = discovery_info.address
+        self._discovered_name = discovery_info.name or None
         self._discovered_family_hint = _family_hint_from_discovery(
             discovery_info
         )
@@ -149,7 +152,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 )
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title=user_input[CONF_ADDRESS],
+                    title=self._entry_title(user_input[CONF_ADDRESS]),
                     data=user_input,
                 )
 
@@ -183,6 +186,31 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             errors=_errors,
         )
+
+    def _entry_title(self, ring_address: str) -> str:
+        """Name the entry after the ring's advertisement name if we know it.
+
+        The entry title is what the integrations card and the device show
+        as their default name, so a bare MAC makes every ring read like an
+        error. Prefer the name from the discovery that started this flow;
+        for a hand-typed address fall back to the name HA's Bluetooth
+        cache holds from its recent advertisements (the family probe in
+        _test_credentials has just confirmed the ring is in range, so it
+        is almost always cached). The address only wins when the ring
+        genuinely advertises no name.
+        """
+        if self._discovered_name:
+            return self._discovered_name
+        from homeassistant.components.bluetooth import (  # noqa: PLC0415
+            async_ble_device_from_address,
+        )
+
+        device = async_ble_device_from_address(
+            self.hass, ring_address, connectable=True
+        )
+        if device is not None and device.name:
+            return device.name
+        return ring_address
 
     @staticmethod
     @callback
