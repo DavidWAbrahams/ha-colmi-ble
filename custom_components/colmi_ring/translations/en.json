@@ -11,8 +11,8 @@
             }
         },
         "error": {
-            "auth": "Username/Password is wrong.",
-            "connection": "Unable to connect to the server.",
+            "auth": "The ring refused pairing (it answers 'not bound'). Close or unpair it in the OEM SmartHealth app, reboot the ring, and try again.",
+            "connection": "Unable to connect to the ring. Is it in range and not held by another app?",
             "unknown": "Unknown error occurred."
         },
         "abort": {

@@ -47,6 +47,7 @@ from .api import (
     POLL_LOCK_WAIT_S,
     REPLY_TIMEOUT,
     USER_LOCK_WAIT_S,
+    ColmiRingApiClientAuthenticationError,
     ColmiRingApiClientBusyError,
     ColmiRingApiClientCommunicationError,
     ColmiRingApiClientError,
@@ -564,13 +565,17 @@ class _YcbtConnection:
         """Bind/time/enable burst mirroring the companion app's sync entry.
 
         Returns True when the ring accepted it. On a 0xFC "not bound"
-        refusal the whole burst is replayed once: the set-time + enables are
-        exactly the frames the OEM app uses to re-establish the bond state.
+        refusal the burst is replayed once, led by the SDK's user-bind
+        write (0x0109): it is the firmware's bind state that gates the
+        Setting/Get commands, so replaying the refused frames alone - as
+        earlier builds did - changes nothing on a ring that wants to be
+        bound first (seen pairing an R99 that had just been unbound from
+        the OEM app).
         """
         for attempt in (1, 2):
             rejections_before = self.rejections
             self.clear_replies()
-            for packet in (
+            packets = [
                 yc_pkt.setting_time(_now_local()),
                 # The four all-day monitors. Each takes {enable, interval};
                 # these are what make the ring record anything between
@@ -586,7 +591,10 @@ class _YcbtConnection:
                 yc_pkt.get_device_info(),
                 yc_pkt.get_power_statistics(),
                 yc_pkt.get_now_step(),
-            ):
+            ]
+            if attempt == 2:
+                packets.insert(0, yc_pkt.set_user_bind())
+            for packet in packets:
                 await self.send(packet)
                 await asyncio.sleep(0.15)
             # Let the replies land: battery/steps come off these queues right
@@ -1145,10 +1153,12 @@ class YcbtRingApiClient:
     async def async_probe_family(self) -> None:
         """Config-flow verification: connect once and require no rejection.
 
-        Raises a :class:`ColmiRingApiClientError` subclass when the ring
-        refuses the Yucheng init sequence. A Colmi ring never answers these
-        frames with 0xFC (it ignores unknown traffic instead), so "connected
-        but rejected after retry" is a confident *not this family* signal,
+        Raises :class:`ColmiRingApiClientAuthenticationError` when the ring
+        refuses the Yucheng init sequence even after the bind-recovery
+        retry, so the UI can say "the ring refused pairing" rather than the
+        generic connection failure. A Colmi ring never answers these frames
+        with 0xFC (it ignores unknown traffic instead), so "connected but
+        rejected after retry" is a confident *not this family* signal,
         while a plain connect failure is just an unreachable ring.
         """
         async with self._connection("probe", USER_LOCK_WAIT_S) as conn:
@@ -1156,6 +1166,8 @@ class YcbtRingApiClient:
             if not accepted:
                 msg = (
                     f"Ring {self._ring_address} refused the Yucheng init"
-                    " sequence (0xFC not-bound after retry)"
+                    " sequence (answered 0xFC 'not bound' even after the"
+                    " user-bind retry); close or unpair the OEM"
+                    " SmartHealth app, reboot the ring, and retry"
                 )
-                raise ColmiRingApiClientCommunicationError(msg)
+                raise ColmiRingApiClientAuthenticationError(msg)

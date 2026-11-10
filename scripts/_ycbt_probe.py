@@ -289,6 +289,12 @@ async def init_burst(
     for attempt in (1, 2):
         capture.note(f"init_burst_{attempt}")
         rejections_before = capture.rejections
+        if attempt == 2:
+            # The firmware's bind state gates the Setting/Get commands, so a
+            # retry that only replays refused frames changes nothing; lead
+            # with the SDK user-bind write (0x0109) like the companion app.
+            await send(client, link.write_char, yc_pkt.set_user_bind())
+            await asyncio.sleep(0.2)
         await send(client, link.write_char, yc_pkt.setting_time(datetime.now()))
         await asyncio.sleep(0.2)
         for mon in (

@@ -198,7 +198,11 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         Both branches raise :class:`ColmiRingApiClientCommunicationError`
         (surfaced as the ``connection`` error) when the ring refuses the
         protocol it was assigned, so a wrong picker choice can never store
-        an entry that will poll-fail forever.
+        an entry that will poll-fail forever. The Yucheng branch raises
+        :class:`ColmiRingApiClientAuthenticationError` when the ring is
+        reachable but refuses pairing (answers the init sequence with the
+        ``0xFC`` "not bound" refusal even after the bind retry), so the UI
+        can point at the OEM app holding the ring instead of range.
         """
         if family == FAMILY_YCBT:
             client: ColmiRingApiClient | YcbtRingApiClient = YcbtRingApiClient(

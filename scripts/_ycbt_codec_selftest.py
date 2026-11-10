@@ -58,9 +58,15 @@ def check_wire_format() -> None:
         lambda: yc_pkt.set_blood_pressure_monitor(30),
         lambda: yc_pkt.set_temperature_monitor(30),
         lambda: yc_pkt.set_blood_oxygen_monitor(30),
+        lambda: yc_pkt.set_user_bind(),
     ):
         enc = maker().encode()
         assert yc_pkt.crc_ok(enc), maker
+
+    # user-bind recovery frame: opcode 0x0109, single-byte bind payload
+    pkt = yc_pkt.set_user_bind()
+    assert pkt.data_type == yc.SETTING_USER_BIND_ECHO, hex(pkt.data_type)
+    assert pkt.payload == bytes([0x01]), pkt.payload.hex()
 
     # Monitor payload golden: {enable, intervalMinutes}, per the vendor SDK's
     # settings encoder (a lone minute byte is ACKed but never applied).
