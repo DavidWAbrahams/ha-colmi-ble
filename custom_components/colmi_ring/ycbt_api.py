@@ -277,9 +277,11 @@ class _YcbtConnection:
         self._live_listeners: list[Callable[[int, yc_pkt.YcbtPacket], None]] = []
         self._hrs_listeners: list[Callable[[int], None]] = []
         self._hrs_uuid: str | None = None
-        # Count of 0xFC "not bound" refusals seen on this link; the init
-        # sequence uses the delta to decide whether a bind recovery retry ran.
-        self.rejections = 0
+        # Opcodes the firmware answered with its single-byte 0xFC refusal on
+        # the current init burst. A 0xFC is per-command, not a session
+        # verdict, so the burst rethinks itself only when *nothing* was
+        # answered.
+        self.refusals: set[int] = set()
 
     # ------------------------------------------------------- lifecycle
 
@@ -496,14 +498,14 @@ class _YcbtConnection:
             yc_pkt.crc_ok(raw),
         )
         if yc_pkt.is_rejection(packet):
-            self.rejections += 1
+            self.refusals.add(packet.data_type)
             LOGGER.debug(
-                "Yucheng ring %s answered 0xFC (not bound) on opcode 0x%04X",
+                "Yucheng ring %s answered 0xFC (refused) on opcode 0x%04X",
                 self._address,
                 packet.data_type,
             )
-            # Not queued: the init sequence watches the rejection count to
-            # decide whether the bind recovery retry needs to run.
+            # Not queued: callers already treat "no reply" as missing data,
+            # and async_init reads this set to tell "refused" from "silent".
             return
         self._queues.setdefault(packet.data_type, asyncio.Queue()).put_nowait(packet)
         for listener in list(self._live_listeners):
@@ -561,19 +563,23 @@ class _YcbtConnection:
             while not queue.empty():
                 queue.get_nowait()
 
-    async def async_init(self) -> bool:
+    async def async_init(self) -> tuple[set[int], set[int]]:
         """Bind/time/enable burst mirroring the companion app's sync entry.
 
-        Returns True when the ring accepted it. On a 0xFC "not bound"
-        refusal the burst is replayed once, led by the SDK's user-bind
-        write (0x0109): it is the firmware's bind state that gates the
-        Setting/Get commands, so replaying the refused frames alone - as
-        earlier builds did - changes nothing on a ring that wants to be
-        bound first (seen pairing an R99 that had just been unbound from
-        the OEM app).
+        Returns ``(answered, refused)``: the opcodes the ring replied to,
+        and the opcodes it answered with 0xFC, on the last burst. Field
+        rings show 0xFC is a *per-command* refusal - a variant lacking a
+        feature declines just that opcode while battery, steps and name
+        still land - so the burst counts as accepted as soon as anything
+        is answered. The one case that replays the burst, led by the SDK's
+        user-bind write (0x0109), is a ring that refused commands and
+        answered none of them: what a genuine "not bound" lockout looks
+        like.
         """
+        refused: set[int] = set()
+        answered: set[int] = set()
         for attempt in (1, 2):
-            rejections_before = self.rejections
+            self.refusals = set()
             self.clear_replies()
             packets = [
                 yc_pkt.setting_time(_now_local()),
@@ -600,15 +606,25 @@ class _YcbtConnection:
             # Let the replies land: battery/steps come off these queues right
             # after init, and over a proxy the last frame can take a second.
             await asyncio.sleep(1.5)
-            if self.rejections == rejections_before:
-                return True
+            refused = set(self.refusals)
+            answered = {
+                opcode for opcode, queue in self._queues.items() if not queue.empty()
+            }
+            if answered or not refused:
+                break
             LOGGER.debug(
-                "Yucheng ring %s rejected init burst attempt %d (0xFC);"
-                " replaying once",
+                "Yucheng ring %s refused every init command on attempt %d"
+                " (0xFC); replaying once behind a bind write",
                 self._address,
                 attempt,
             )
-        return False
+        if refused and answered:
+            LOGGER.debug(
+                "Yucheng ring %s init accepted; refused opcodes: %s",
+                self._address,
+                ", ".join(f"0x{opcode:04X}" for opcode in sorted(refused)),
+            )
+        return answered, refused
 
 
 class YcbtRingApiClient:
@@ -928,15 +944,16 @@ class YcbtRingApiClient:
         Applies the interval to all four all-day monitors (heart rate,
         blood pressure, temperature, blood oxygen) so they share one
         schedule. Unlike the Colmi settings command there is no read
-        opcode, so the accepted value is confirmed only by the heart-rate
+        opcode, so the accepted value is confirmed by the heart-rate
         monitor's opcode echo (this family answers every Setting command
-        with a generic 1-byte status echoing its opcode) and by the absence
-        of a 0xFC rejection. Returns the clamped value actually written;
-        raises when the ring refused or never answered.
+        with a generic 1-byte status echoing its opcode); a 0xFC refusal
+        of that opcode leaves no echo either, so it fails the same check.
+        A refusal on any *other* monitor opcode is that variant skipping a
+        feature and does not fail the write. Returns the clamped value
+        actually written; raises when the ring refused or never answered.
         """
         minutes = clamp_ycbt_monitor_interval(minutes)
         async with self._connection("interval", USER_LOCK_WAIT_S) as conn:
-            rejections_before = conn.rejections
             conn.clear_replies()
             for packet in (
                 yc_pkt.set_monitor_interval(minutes),
@@ -947,7 +964,7 @@ class YcbtRingApiClient:
                 await conn.send(packet)
                 await asyncio.sleep(0.15)
             reply = await conn.get_reply(yc.SET_MONITOR_INTERVAL)
-            if reply is None or conn.rejections > rejections_before:
+            if reply is None:
                 msg = (
                     f"Yucheng ring {self._ring_address} did not accept "
                     f"monitoring interval {minutes} min"
@@ -1151,23 +1168,34 @@ class YcbtRingApiClient:
         return samples
 
     async def async_probe_family(self) -> None:
-        """Config-flow verification: connect once and require no rejection.
+        """Config-flow verification: connect once and prove it answers us.
 
-        Raises :class:`ColmiRingApiClientAuthenticationError` when the ring
-        refuses the Yucheng init sequence even after the bind-recovery
-        retry, so the UI can say "the ring refused pairing" rather than the
-        generic connection failure. A Colmi ring never answers these frames
-        with 0xFC (it ignores unknown traffic instead), so "connected but
-        rejected after retry" is a confident *not this family* signal,
-        while a plain connect failure is just an unreachable ring.
+        The ring is this family when it answers *any* init command. A few
+        per-command 0xFC refusals on features a variant lacks are normal
+        (battery/steps/name still land) and only get logged. When nothing
+        is answered the two outcomes get distinct UI errors: every command
+        refused with 0xFC - the firmware's "not bound" answer, or a ring
+        that isn't really Yucheng - raises
+        :class:`ColmiRingApiClientAuthenticationError`, while total silence
+        raises :class:`ColmiRingApiClientCommunicationError` (a Colmi ring
+        ignores unknown frames outright, so silence is the wrong-family or
+        unreachable-ring case).
         """
         async with self._connection("probe", USER_LOCK_WAIT_S) as conn:
-            accepted = await conn.async_init()
-            if not accepted:
+            answered, refused = await conn.async_init()
+            if answered:
+                return
+            refused_text = ", ".join(f"0x{opcode:04X}" for opcode in sorted(refused))
+            if refused:
                 msg = (
-                    f"Ring {self._ring_address} refused the Yucheng init"
-                    " sequence (answered 0xFC 'not bound' even after the"
-                    " user-bind retry); close or unpair the OEM"
-                    " SmartHealth app, reboot the ring, and retry"
+                    f"Ring {self._ring_address} answered every init command"
+                    f" with 0xFC 'not bound' (refused opcodes: {refused_text})"
+                    " even after the bind retry; it is locked to another"
+                    " central or is not a Yucheng ring"
                 )
                 raise ColmiRingApiClientAuthenticationError(msg)
+            msg = (
+                f"Ring {self._ring_address} connected but ignored every"
+                " Yucheng command; it may not be a Yucheng (YCBT) ring"
+            )
+            raise ColmiRingApiClientCommunicationError(msg)

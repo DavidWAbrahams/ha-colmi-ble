@@ -99,8 +99,10 @@ REAL_UPLOAD_MEASURE_PROGRESS = 0x060D
 REAL_UPLOAD_BODY_DATA = 0x0610
 REAL_UPLOAD_BATTERY = 0x0615
 
-#: Single-byte refusal the firmware answers when the link is not bound
-#: (stale bond). Triggers the once-per-session re-bind recovery burst.
+#: Single-byte "refused" answer the firmware sends for a command it will
+#: not serve. Observed per-command on feature-poor variants; the burst
+#: recovery (with a leading bind write) only treats "everything refused"
+#: as a real not-bound lockout.
 REJECTION_BYTE = 0xFC
 #: Answer to a Get* command sent without its magic prefix.
 NEEDS_MAGIC_BYTE = 0xFE

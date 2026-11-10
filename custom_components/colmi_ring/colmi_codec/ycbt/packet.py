@@ -165,12 +165,11 @@ def set_blood_oxygen_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
 def set_user_bind(bind: int = 0x01) -> YcbtPacket:
     """Write the SDK's user-bind ("pairing state") frame ``0x0109``.
 
-    Until the link carries a bind write the firmware answers the Setting/Get
-    commands with the single-byte ``0xFC`` "not bound" refusal, and replaying
-    those same commands changes nothing - the companion app pairs (binds) on
-    every connect, and the bind is what flips the firmware's state. There is
-    no user profile to write here, so this sends the SDK's minimal bind
-    payload, best-effort, immediately before the recovery burst.
+    The companion app sends this on every connect, and the SDK treats it
+    as declaring the link bound. Field rings have shown the single-byte
+    ``0xFC`` answer is per-command rather than a session lockout, so this
+    is only worth replaying for a ring that refused *every* command; it
+    goes there best-effort, immediately before the recovery burst.
     """
     return YcbtPacket(yc.SETTING_USER_BIND_ECHO, bytes([bind & 0xFF]))
 

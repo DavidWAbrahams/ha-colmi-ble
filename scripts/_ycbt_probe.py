@@ -100,6 +100,10 @@ class Capture:
     frames: list[Frame] = field(default_factory=list)
     marks: list[tuple[float, str]] = field(default_factory=list)
     rejections: int = 0
+    #: Opcodes answered with 0xFC, and opcodes answered with anything else.
+    #: Per-command, because a 0xFC refuses one command, not the session.
+    refused: set[int] = field(default_factory=set)
+    answered: set[int] = field(default_factory=set)
     hrs_beats: int = 0
 
     def note(self, label: str) -> None:
@@ -246,8 +250,13 @@ class FrameBus:
             return
         if yc_pkt.is_rejection(packet):
             self.capture.rejections += 1
-            print("  << !! 0xFC firmware rejection (not bound)")
+            self.capture.refused.add(frame.opcode)
+            print(
+                f"  << !! 0xFC firmware refusal on 0x{frame.opcode:04X}"
+                f" {opcode_name(frame.opcode)}"
+            )
             return
+        self.capture.answered.add(frame.opcode)
         if frame.opcode == yc.REAL_UPLOAD_HEART and len(packet.payload) >= 1:
             self.last_hr = packet.payload[0] & 0xFF
         elif frame.opcode == yc.REAL_UPLOAD_BLOOD_OXY and len(packet.payload) >= 1:
@@ -281,18 +290,19 @@ async def wait(capture: Capture, seconds: float, why: str = "") -> None:
 async def init_burst(
     client: BleakClient, link: Link, bus: FrameBus, capture: Capture
 ) -> bool:
-    """Send the companion-app init sequence; re-send once on 0xFC rejection.
+    """Send the companion-app init sequence; re-send once on total refusal.
 
-    Returns True if the burst was accepted (no rejection seen on the retry).
+    Returns True if the burst was accepted. A 0xFC is a per-command refusal
+    (variants decline the opcodes they lack), so anything answered counts
+    as accepted; only "refused everything, answered nothing" retries, led
+    by the SDK user-bind write like the companion app.
     """
     assert link.write_char is not None
     for attempt in (1, 2):
         capture.note(f"init_burst_{attempt}")
-        rejections_before = capture.rejections
+        refused_before = set(capture.refused)
+        answered_before = set(capture.answered)
         if attempt == 2:
-            # The firmware's bind state gates the Setting/Get commands, so a
-            # retry that only replays refused frames changes nothing; lead
-            # with the SDK user-bind write (0x0109) like the companion app.
             await send(client, link.write_char, yc_pkt.set_user_bind())
             await asyncio.sleep(0.2)
         await send(client, link.write_char, yc_pkt.setting_time(datetime.now()))
@@ -316,9 +326,16 @@ async def init_burst(
             await send(client, link.write_char, cmd)
             await asyncio.sleep(0.2)
         await wait(capture, 4.0, "init burst replies")
-        if capture.rejections == rejections_before:
+        refused = capture.refused - refused_before
+        answered = capture.answered - answered_before
+        if answered or not refused:
+            if refused:
+                refused_text = ", ".join(
+                    f"0x{o:04X} {opcode_name(o)}" for o in sorted(refused)
+                )
+                print(f"  .. accepted; refused opcodes: {refused_text}")
             return True
-        print("  !! ring answered 0xFC; retrying burst once (stale bond recovery)")
+        print("  !! ring refused every init command; retrying once behind a bind write")
     return False
 
 
@@ -422,6 +439,11 @@ def report(capture: Capture) -> None:
     )
     print(f"frames: {total}  undecodable: {counts[None]}  crc-mismatched: {crc_bad}")
     print(f"0xFC rejections: {capture.rejections}  0x2A37 HRS samples: {capture.hrs_beats}")
+    if capture.refused:
+        refused_text = ", ".join(
+            f"0x{o:04X} {opcode_name(o)}" for o in sorted(capture.refused)
+        )
+        print(f"refused opcodes (0xFC): {refused_text}")
     for opcode, count in sorted((k, v) for k, v in counts.items() if k is not None):
         print(f"  0x{opcode:04X} {opcode_name(opcode):<28} x{count}")
 

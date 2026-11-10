@@ -11,8 +11,8 @@
             }
         },
         "error": {
-            "auth": "The ring refused pairing (it answers 'not bound'). Close or unpair it in the OEM SmartHealth app, reboot the ring, and try again.",
-            "connection": "Unable to connect to the ring. Is it in range and not held by another app?",
+            "auth": "The ring answered every command with 'not bound'. Another phone or PC may still hold its Bluetooth pairing: remove it from that device's Bluetooth (paired devices) list, power-cycle the ring (charger in, then off your finger), and try again.",
+            "connection": "Unable to reach the ring over Bluetooth. Is it in range, awake, and not held by another device or app?",
             "unknown": "Unknown error occurred."
         },
         "abort": {

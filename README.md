@@ -8,7 +8,7 @@ It also supports gestures!
 
 There is also partial support for some clones that are sold interchangeably on AliExpress, i.e. the YCBT R20 and R99 which use "Smarthealth" app. I've been burned by sellers mislabeling their product and wanted something to work for you in that case.
 This does not include gesture support.
-Yucheng rings answer "not bound" while the Smarthealth app still holds their pairing: if pairing in Home Assistant fails with that message, unpair (or force-stop) the OEM app first, reboot the ring, and retry.
+Yucheng rings answer "not bound" while another central still holds their pairing: if pairing in Home Assistant fails with that message, remove the ring from every phone/PC Bluetooth paired-devices list (including the Smarthealth app's phone), power-cycle the ring, and retry. There is no factory reset on these rings; an OS-level "forget device" plus a power cycle is the reset.
 
 # How?
 
