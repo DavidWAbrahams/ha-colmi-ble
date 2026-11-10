@@ -289,12 +289,20 @@ class ColmiRingHrvButton(ColmiRingEntity, ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Greyed out while the stream owns the ring or a measurement runs."""
+        """Greyed out while the stream owns the ring or a measurement runs.
+
+        Also greyed out when the ring's capability reply says it has no HRV
+        (seen on R02 firmware): pressing then only burns battery, lights the
+        sensor, and ends in an unknown HRV. While the ring has not answered
+        the capability query yet the button stays available rather than risk
+        hiding a working feature.
+        """
         motion = self._motion_manager()
         return (
             super().available
             and self.coordinator.ring_busy is None
             and (motion is None or not motion.holds_link)
+            and (self.coordinator.data or {}).get("supports_hrv") is not False
         )
 
     def press(self) -> None:

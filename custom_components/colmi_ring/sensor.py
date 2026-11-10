@@ -272,6 +272,22 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
             return None
         return data.get(self.entity_description.key)
 
+    @property
+    def available(self) -> bool:
+        """HRV is unavailable on Colmi firmware that reports no HRV support.
+
+        Only a definite ``supports_hrv`` of ``False`` hides the sensor: Yucheng
+        rings source HRV from their history stream and never report the
+        capability, and a Colmi ring that has not answered the capability
+        query yet leaves the key ``None``.
+        """
+        if (
+            self.entity_description.key == "hrv"
+            and (self.coordinator.data or {}).get("supports_hrv") is False
+        ):
+            return False
+        return super().available
+
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data (adds battery charging / spo2 timestamp attrs)."""

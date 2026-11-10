@@ -72,6 +72,26 @@ UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 # proxy, so we raise it.
 REPLY_TIMEOUT = 10.0
 
+# How long a real-time measurement waits for its FIRST usable sample. Silence
+# alone is bounded by REALTIME_EMPTY_WAITS_MAX timeouts, but a zero-valued
+# reply (the ring's "not measured yet") resets that counter, and a firmware
+# without the reading keeps answering zero forever - measured on an R02 asked
+# for real-time HRV. Zeros are also normal for a few seconds when a supported
+# measurement warms up, so the wait for the first sample is bounded by time
+# rather than rounds; once samples flow, only the timeout cap remains. Without
+# some bound the loop never reaches STOP and leaves the sensor light blinking
+# and the shared link held indefinitely.
+REALTIME_FIRST_SAMPLE_S = 60.0
+# Consecutive reply timeouts tolerated while streaming (upstream tolerates
+# many; we cap them so a button press finishes in bounded time even when the
+# ring never streams at all - per-sample timeout stays generous for proxy
+# latency).
+REALTIME_EMPTY_WAITS_MAX = 5
+# The capability bitmap (the set-time reply) is a nicety: rings that answer
+# command 1 do so at once, so a ring that does not answer is not worth
+# delaying a poll for longer than this.
+CAPABILITY_REPLY_TIMEOUT_S = 2.0
+
 # How long each kind of caller will wait for the ring's shared link.
 #
 # Under the shared link (see ``SharedLink``) a caller never waits behind a
@@ -300,6 +320,7 @@ class _RingConnection:
                 hr_settings.parse_heart_rate_log_settings
             ),
             real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
+            set_time_mod.CMD_SET_TIME: set_time_mod.parse_set_time_packet,
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
             stress.CMD_READ_STRESS: StressLogParser().parse,
         }
@@ -497,9 +518,23 @@ class _RingConnection:
             steps.read_steps_packet(days), steps.CMD_GET_STEP_SOMEDAY
         )
 
-    async def set_time(self, ts: datetime) -> None:
-        """Write the current time to the ring (no reply expected)."""
+    async def set_time(self, ts: datetime) -> dict[str, Any] | None:
+        """Sync the ring's clock; return the capability reply, if it answers.
+
+        The clock write itself is fire-and-forget, but the firmware answers
+        command 1 with a capability bitmap (``parse_set_time_packet``), so we
+        collect that reply here rather than leave it on the wire. A ring that
+        never answers yields ``None`` after a short wait, which keeps the
+        poll's timing for firmwares that stay silent.
+        """
         await self._send(set_time_mod.set_time_packet(ts))
+        try:
+            return await asyncio.wait_for(
+                self._queues[set_time_mod.CMD_SET_TIME].get(),
+                timeout=CAPABILITY_REPLY_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            return None
 
     async def blink_twice(self) -> None:
         """Trigger the ring's blink-twice locate action (no reply expected)."""
@@ -587,7 +622,9 @@ class _RingConnection:
         The ring streams repeated readings (e.g. SPO2 %) after a START packet;
         we gather a handful of non-zero samples then send STOP. Returns the
         collected samples (possibly empty if none were valid). Mirrors the
-        upstream driver's poll loop.
+        upstream driver's poll loop, except that the wait for samples is
+        bounded by time as well as by timeouts, so the STOP below is always
+        reached and the loop can never hang on a ring that streams only zeros.
         """
         queue = self._queues[real_time.CMD_START_REAL_TIME]
         # Drop any stale samples from a previous measurement.
@@ -598,13 +635,24 @@ class _RingConnection:
 
         valid: list[int] = []
         empty_waits = 0
-        # Upstream collects 6 valid samples tolerating many empty waits; we cap
-        # consecutive empty waits so the button press finishes in bounded time
-        # even if the ring never streams (per-sample timeout stays generous for
-        # proxy latency).
-        while len(valid) < 6 and empty_waits < 5:
+        # A zero reply means "measuring, no value yet": the ring is alive, so
+        # zeros do not count toward the timeout cap - but they must not keep
+        # the loop alive forever either. Upstream reset its timeout counter on
+        # any packet, which let a firmware that answers a real-time HRV
+        # request with permanent zeros (measured on an R02, whose firmware
+        # lacks HRV) spin this loop forever: no STOP sent, the sensor light
+        # blinking on the finger, the shared link held, and the button's
+        # finally block never clearing the ring's busy flag. The stall
+        # deadline re-arms on every usable sample, so a supported reading may
+        # take its time warming up (or pause mid-stream) without being cut
+        # off, while a perpetual-zero firmware gives up in ~a minute.
+        stalled_deadline = time.monotonic() + REALTIME_FIRST_SAMPLE_S
+        while len(valid) < 6 and empty_waits < REALTIME_EMPTY_WAITS_MAX:
+            remaining = stalled_deadline - time.monotonic()
+            if remaining <= 0:
+                break
             # On a shared link the connection can drop mid-measurement; noticing
-            # it here beats timing out five more times on a queue nothing will
+            # it here beats timing out a few more times on a queue nothing will
             # ever feed again.
             if self.dead.is_set():
                 raise ColmiRingApiClientCommunicationError(
@@ -613,20 +661,27 @@ class _RingConnection:
                 )
             try:
                 data: real_time.Reading | real_time.ReadingError = (
-                    await asyncio.wait_for(queue.get(), timeout=REPLY_TIMEOUT)
+                    await asyncio.wait_for(
+                        queue.get(), timeout=min(REPLY_TIMEOUT, remaining)
+                    )
                 )
             except asyncio.TimeoutError:
                 empty_waits += 1
                 continue
-            empty_waits = 0
             if isinstance(data, real_time.ReadingError):
                 await self._send(real_time.get_stop_packet(reading_type))
                 raise ColmiRingApiClientError(
                     f"Ring returned error code {data.code} for real-time "
                     f"reading {reading_type.name}"
                 )
-            if data.value != 0:
-                valid.append(data.value)
+            if data.value == 0:
+                # Alive but not yet measured: clears the timeout streak (the
+                # ring answered) without extending the stall deadline.
+                empty_waits = 0
+                continue
+            valid.append(data.value)
+            empty_waits = 0
+            stalled_deadline = time.monotonic() + REALTIME_FIRST_SAMPLE_S
 
         await self._send(real_time.get_stop_packet(reading_type))
         return valid
@@ -1073,6 +1128,10 @@ class ColmiRingApiClient:
         # direct evidence the optical sensor is not on skin right now, even
         # if the newest *non-zero* sample is still within the staleness grace.
         hr_zero_reading = False
+        # From the capability bitmap in the set-time reply: True/False once the
+        # ring has answered command 1, None while unknown. None keeps the HRV
+        # button available (no false negatives); a definite False disables it.
+        supports_hrv: bool | None = None
         async with self._link.acquire("poll", POLL_LOCK_WAIT_S) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
@@ -1135,7 +1194,13 @@ class ColmiRingApiClient:
             # ring, so it returns no data. Sync the ring clock to UTC first so the
             # day we ask for matches the day the ring logs to (the upstream
             # library likewise requires set-time before reading logs).
-            await conn.set_time(date_utils.now())
+            # The reply doubles as the ring's capability bitmap: it says
+            # whether this firmware has HRV at all (measured: R02 no, R06 yes),
+            # which gates the Read HRV button instead of letting it run a
+            # measurement the ring can only answer with zeros.
+            caps = await conn.set_time(date_utils.now())
+            if isinstance(caps, dict) and isinstance(caps.get("mSupportHrv"), bool):
+                supports_hrv = caps["mSupportHrv"]
             await asyncio.sleep(0.5)
             log = await conn.get_heart_rate_log()
             if not isinstance(log, hr.HeartRateLog):
@@ -1208,6 +1273,7 @@ class ColmiRingApiClient:
             "heart_rate_timestamp": heart_rate_timestamp,
             "hr_zero_reading": hr_zero_reading,
             "hr_settings": settings,
+            "supports_hrv": supports_hrv,
             "battery_level": battery_level,
             "battery_charging": battery_charging,
             "steps": steps_total,
