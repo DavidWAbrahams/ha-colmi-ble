@@ -71,18 +71,20 @@ from custom_components.colmi_ring.colmi_codec.motion import (  # noqa: E402
     parse_accel_packet,
 )
 from custom_components.colmi_ring.const import (  # noqa: E402
+    DEFAULT_GESTURE_HOLD_CHOP_S,
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
 )
 from custom_components.colmi_ring.gestures import (  # noqa: E402
+    GESTURE_CHOP,
     GESTURE_FLIP,
     GESTURE_RAISED_HAND,
     GESTURE_STILL,
     StreamGestureDetector,
 )
 
-ALL_GESTURES = (GESTURE_STILL, GESTURE_FLIP, GESTURE_RAISED_HAND)
+ALL_GESTURES = (GESTURE_STILL, GESTURE_FLIP, GESTURE_RAISED_HAND, GESTURE_CHOP)
 
 
 @dataclass(slots=True)
@@ -182,13 +184,18 @@ def report_signal(rows: list[Row]) -> None:
 
 
 def run_detector(
-    rows: list[Row], still_hold_s: float, flip_hold_s: float, raised_hold_s: float
+    rows: list[Row],
+    still_hold_s: float,
+    flip_hold_s: float,
+    raised_hold_s: float,
+    chop_hold_s: float,
 ) -> dict[str, list[float]]:
     """Feed the whole capture through one detector; return fire times."""
     detector = StreamGestureDetector(
         still_hold_s=still_hold_s,
         flip_hold_s=flip_hold_s,
         raised_hold_s=raised_hold_s,
+        chop_hold_s=chop_hold_s,
     )
     fired: dict[str, list[float]] = {gesture: [] for gesture in ALL_GESTURES}
     for row in rows:
@@ -274,6 +281,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds a calm, raised hand must be held to count as raised_hand",
     )
     parser.add_argument(
+        "--chop-hold-seconds",
+        type=float,
+        default=DEFAULT_GESTURE_HOLD_CHOP_S,
+        help="seconds each half of a hand chop (raised, then flat) must be held",
+    )
+    parser.add_argument(
         "--resample",
         action="store_true",
         help="re-time the stream at its median gap (undoes burst dumping)",
@@ -314,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         args.still_hold_seconds,
         args.flip_hold_seconds,
         args.raised_hold_seconds,
+        args.chop_hold_seconds,
     )
     report_gestures(fired)
 

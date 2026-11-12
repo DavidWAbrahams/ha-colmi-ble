@@ -30,6 +30,7 @@
                     "gesture_hold_still_s": "Hold still gesture: hold still for this many seconds",
                     "gesture_hold_flip_s": "Hand flip gesture: hold still this many seconds before and after flipping hand 180°",
                     "gesture_hold_raised_s": "Raised hand gesture: hold your hand still and raised (Vertical Angle above ~70°) for this many seconds",
+                    "gesture_hold_chop_s": "Hand chop gesture: hold raised (above ~70°) and then flat (below ~20°) for this many seconds each, with a rapid drop between",
                     "motion_stream_timeout": "Motion stream timeout minutes, to save battery (0 = unlimited)",
                     "wave_timeout": "Wave detection timeout minutes, to save battery (0 = unlimited)",
                     "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed",

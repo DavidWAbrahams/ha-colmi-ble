@@ -9,12 +9,12 @@ Assistant event type, so an automation can trigger on either::
         event_data:
           gesture: wave
 
-Four gestures are offered. The wave is reported by the ring's own detector
+Five gestures are offered. The wave is reported by the ring's own detector
 while the Wave Detection switch holds the link; the event data's ``source``
-field says so via ``ring``. The stillness, flip and raised-hand gestures are
-derived here from the RAW accelerometer stream while the Motion Stream switch
-is on (``source`` = ``stream``): all are pose gestures, held for seconds
-rather than flicked, so they survive the stock firmware's
+field says so via ``ring``. The stillness, flip, raised-hand and chop gestures
+are derived here from the RAW accelerometer stream while the Motion Stream
+switch is on (``source`` = ``stream``): all are pose gestures, held for
+seconds rather than flicked, so they survive the stock firmware's
 one-sample-per-second rate.
 
 The entities are created whenever the motion manager exists: a user who only
@@ -37,6 +37,7 @@ from .const import (
 )
 from .entity import ColmiRingEntity
 from .gestures import (
+    GESTURE_CHOP,
     GESTURE_FLIP,
     GESTURE_RAISED_HAND,
     GESTURE_STILL,
@@ -78,6 +79,11 @@ ENTITY_DESCRIPTIONS = (
         key=GESTURE_RAISED_HAND,
         name="Raised hand",
         icon="mdi:hand-back-right",
+    ),
+    EventEntityDescription(
+        key=GESTURE_CHOP,
+        name="Hand chop",
+        icon="mdi:content-cut",
     ),
 )
 

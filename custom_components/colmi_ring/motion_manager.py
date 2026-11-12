@@ -42,6 +42,7 @@ from .colmi_codec.motion import (
 from .const import (
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
+    CONF_GESTURE_HOLD_CHOP_S,
     CONF_GESTURE_HOLD_FLIP_S,
     CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
@@ -51,6 +52,7 @@ from .const import (
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
+    DEFAULT_GESTURE_HOLD_CHOP_S,
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
@@ -116,11 +118,17 @@ class MotionManager:
         self._client = client
         self._coordinator = coordinator
 
-        still_hold_s, flip_hold_s, raised_hold_s = self._hold_seconds()
+        (
+            still_hold_s,
+            flip_hold_s,
+            raised_hold_s,
+            chop_hold_s,
+        ) = self._hold_seconds()
         self._detector = StreamGestureDetector(
             still_hold_s=still_hold_s,
             flip_hold_s=flip_hold_s,
             raised_hold_s=raised_hold_s,
+            chop_hold_s=chop_hold_s,
         )
         flat_deg, vertical_deg = self._vertical_anchors()
         self._angle = VerticalAngleTracker(flat_deg=flat_deg, vertical_deg=vertical_deg)
@@ -166,8 +174,8 @@ class MotionManager:
 
     # -- configuration ------------------------------------------------------
 
-    def _hold_seconds(self) -> tuple[float, float, float]:
-        """Per-gesture hold thresholds, in seconds: ``(still, flip, raised)``."""
+    def _hold_seconds(self) -> tuple[float, float, float, float]:
+        """Per-gesture hold thresholds, in seconds: ``(still, flip, raised, chop)``."""
         return (
             self._option_seconds(
                 CONF_GESTURE_HOLD_STILL_S, DEFAULT_GESTURE_HOLD_STILL_S
@@ -177,6 +185,9 @@ class MotionManager:
             ),
             self._option_seconds(
                 CONF_GESTURE_HOLD_RAISED_S, DEFAULT_GESTURE_HOLD_RAISED_S
+            ),
+            self._option_seconds(
+                CONF_GESTURE_HOLD_CHOP_S, DEFAULT_GESTURE_HOLD_CHOP_S
             ),
         )
 
@@ -317,11 +328,17 @@ class MotionManager:
         # Rebuilt per session: the gravity reference, the pose state and the
         # rate estimate all belong to one continuous connection, not to the
         # whole uptime.
-        still_hold_s, flip_hold_s, raised_hold_s = self._hold_seconds()
+        (
+            still_hold_s,
+            flip_hold_s,
+            raised_hold_s,
+            chop_hold_s,
+        ) = self._hold_seconds()
         self._detector = StreamGestureDetector(
             still_hold_s=still_hold_s,
             flip_hold_s=flip_hold_s,
             raised_hold_s=raised_hold_s,
+            chop_hold_s=chop_hold_s,
         )
         self._angle.reset()
         self.last_angle_deg = None

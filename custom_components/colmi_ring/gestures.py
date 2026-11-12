@@ -12,7 +12,7 @@ and a movement that takes half a second to complete is over before the ring
 looks. What survives that rate are *poses* - directions the hand holds for
 seconds, which a single sample per second is plenty to confirm.
 
-:class:`StreamGestureDetector` therefore detects three pose gestures, all read
+:class:`StreamGestureDetector` therefore detects four pose gestures, all read
 from the raw vector as gravity direction plus movement:
 
 * ``hand_still``: the gravity-removed acceleration stays small for
@@ -37,6 +37,14 @@ from the raw vector as gravity direction plus movement:
   of "less than a second" the firmware allows, while a faster firmware keeps
   a tight window.
 
+* ``hand_chop``: a raised pose becomes flat. The hole axis is held above
+  ``MOTION_CHOP_RAISED_MIN_DEG`` to arm the gesture, then must land below
+  ``MOTION_CHOP_FLAT_MAX_DEG`` and be held there for ``gesture_hold_chop_s``
+  seconds, with the drop itself judged quick by the same rate-scaled
+  transition window the flip uses. The two elevation bands are deliberately
+  separated by a gap, so resting at chest height neither arms the gesture
+  nor completes one.
+
 The old flick detector that this replaced integrated vertical velocity to
 separate a snap raise from a slow lift; at 1 Hz it could not resolve either,
 and what it fired on was a tilt, so it and its sensitivity option were removed
@@ -59,9 +67,12 @@ from dataclasses import dataclass
 
 from .colmi_codec.motion import AccelSample
 from .const import (
+    DEFAULT_GESTURE_HOLD_CHOP_S,
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
+    MOTION_CHOP_FLAT_MAX_DEG,
+    MOTION_CHOP_RAISED_MIN_DEG,
     MOTION_FLIP_MIN_ANGLE_DEG,
     MOTION_FLIP_TRANSITION_BASE_S,
     MOTION_FLIP_TRANSITION_DT_FACTOR,
@@ -84,6 +95,7 @@ GESTURE_WAVE = "wave"
 GESTURE_STILL = "hand_still"
 GESTURE_FLIP = "hand_flip"
 GESTURE_RAISED_HAND = "raised_hand"
+GESTURE_CHOP = "hand_chop"
 
 # Where a gesture came from, reported in event data.
 SOURCE_RING = "ring"  # detected by the ring itself (camera-button gesture)
@@ -183,13 +195,16 @@ class StreamGestureDetector:
         still_hold_s: float = DEFAULT_GESTURE_HOLD_STILL_S,
         flip_hold_s: float = DEFAULT_GESTURE_HOLD_FLIP_S,
         raised_hold_s: float = DEFAULT_GESTURE_HOLD_RAISED_S,
+        chop_hold_s: float = DEFAULT_GESTURE_HOLD_CHOP_S,
     ) -> None:
         """Create a detector with per-gesture hold thresholds.
 
         ``still_hold_s`` is how long a calm episode must last before
         ``hand_still`` fires; ``flip_hold_s`` is how long each of the two
         poses of a ``hand_flip`` must be held; ``raised_hold_s`` is how long
-        the hand must stay calm *and* raised before ``raised_hand`` fires.
+        the hand must stay calm *and* raised before ``raised_hand`` fires;
+        ``chop_hold_s`` is how long each half of a ``hand_chop`` - the raised
+        pose that arms it and the flat pose that completes it - must be held.
         """
         self._still_hold_s = self._clamp_hold(
             still_hold_s, DEFAULT_GESTURE_HOLD_STILL_S
@@ -198,6 +213,7 @@ class StreamGestureDetector:
         self._raised_hold_s = self._clamp_hold(
             raised_hold_s, DEFAULT_GESTURE_HOLD_RAISED_S
         )
+        self._chop_hold_s = self._clamp_hold(chop_hold_s, DEFAULT_GESTURE_HOLD_CHOP_S)
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
@@ -221,6 +237,17 @@ class StreamGestureDetector:
         # satisfy the raised gate before (or without) the stillness one.
         self._raised_since: float | None = None
         self._raised_fired = False
+
+        # The chop's three clocks: when the current raised (arming) episode
+        # started, when the raised pose was last confirmed calm (the drop's
+        # start), and when the current flat hold started. ``_chop_armed`` is
+        # the raised half having lasted long enough; ``_chop_fired`` keeps one
+        # event per chop.
+        self._chop_raised_since: float | None = None
+        self._chop_raised_last: float | None = None
+        self._chop_armed = False
+        self._chop_flat_since: float | None = None
+        self._chop_fired = False
 
         self.events_seen = 0
         self.samples_seen = 0
@@ -296,6 +323,7 @@ class StreamGestureDetector:
             self._still_fired = False
             self._raised_since = None
             self._raised_fired = False
+            self._reset_chop()
 
         if self._gravity is None:
             self._gravity = sample
@@ -319,6 +347,7 @@ class StreamGestureDetector:
         events.extend(
             self._track_raised_hand(calm=calm, elevation=elevation, now=now)
         )
+        events.extend(self._track_chop(calm=calm, elevation=elevation, now=now))
 
         self.events_seen += len(events)
         self.samples_seen += 1
@@ -336,6 +365,7 @@ class StreamGestureDetector:
         self._still_fired = False
         self._raised_since = None
         self._raised_fired = False
+        self._reset_chop()
         self.events_seen = 0
         self.samples_seen = 0
 
@@ -459,6 +489,78 @@ class StreamGestureDetector:
                 angle_deg=round(elevation, 1),
             )
         ]
+
+    def _reset_chop(self) -> None:
+        """Forget every clock of the hand chop gesture."""
+        self._chop_raised_since = None
+        self._chop_raised_last = None
+        self._chop_armed = False
+        self._chop_flat_since = None
+        self._chop_fired = False
+
+    def _track_chop(
+        self, *, calm: bool, elevation: float | None, now: float
+    ) -> list[GestureEvent]:
+        """One ``hand_chop`` per raised-then-flat move, once both halves hold.
+
+        The raised half arms the gesture the way ``raised_hand`` works: calm
+        with the hole axis above ``MOTION_CHOP_RAISED_MIN_DEG`` for
+        ``chop_hold_s`` seconds. Its clock keeps its last calm stamp live
+        across brief shakes (a non-calm sample stops it progressing rather
+        than ending it, exactly like the flip's anchor), and that stamp is
+        what times the drop. Once armed, a calm sample below
+        ``MOTION_CHOP_FLAT_MAX_DEG`` opens the flat hold; the gesture fires
+        when that hold too has lasted ``chop_hold_s`` and the drop between
+        the two was quick by the flip's rate-scaled window. The elevation
+        bands are separated by a gap, and the drop itself is never calm, so
+        no sample belongs to both halves: a slow lowering simply ages the
+        transition window out and never fires. Firing disarms the gesture,
+        so the hand must be raised again for the next chop.
+        """
+        if elevation is None:
+            return []
+
+        events: list[GestureEvent] = []
+        if calm and elevation >= MOTION_CHOP_RAISED_MIN_DEG:
+            # Raised half: the arming episode. (It also closes any half-open
+            # flat hold - raising back up is not a completion.)
+            self._chop_flat_since = None
+            if self._chop_raised_since is None:
+                self._chop_raised_since = now
+            self._chop_raised_last = now
+            if (
+                not self._chop_armed
+                and now - self._chop_raised_since >= self._chop_hold_s
+            ):
+                self._chop_armed = True
+                self._chop_fired = False
+        elif calm and elevation <= MOTION_CHOP_FLAT_MAX_DEG:
+            # Flat half: only counts if the raised half armed it.
+            self._chop_raised_since = None
+            if self._chop_armed and self._chop_raised_last is not None:
+                if self._chop_flat_since is None:
+                    self._chop_flat_since = now
+                elif not self._chop_fired:
+                    held = now - self._chop_flat_since
+                    transition = self._chop_flat_since - self._chop_raised_last
+                    if (
+                        held >= self._chop_hold_s
+                        and transition <= self._transition_window_s()
+                    ):
+                        self._chop_fired = True
+                        self._chop_armed = False
+                        self._chop_raised_last = None
+                        events.append(
+                            GestureEvent(
+                                gesture=GESTURE_CHOP,
+                                source=SOURCE_STREAM,
+                                hold_s=round(held, 2),
+                                angle_deg=round(elevation, 1),
+                            )
+                        )
+        # Between the bands, or a sample too rough to read gravity from: the
+        # drop's transition simply keeps aging against the frozen stamps.
+        return events
 
     def _track_pose(
         self, *, calm: bool, unit: AccelSample | None, now: float

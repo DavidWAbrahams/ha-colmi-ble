@@ -21,6 +21,7 @@ from .api import (
 from .const import (
     CONF_BACKFILL_ON_RECONNECT,
     CONF_DEVICE_FAMILY,
+    CONF_GESTURE_HOLD_CHOP_S,
     CONF_GESTURE_HOLD_FLIP_S,
     CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
@@ -32,6 +33,7 @@ from .const import (
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
+    DEFAULT_GESTURE_HOLD_CHOP_S,
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
@@ -324,6 +326,19 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_GESTURE_HOLD_RAISED_S,
                         default=self.config_entry.options.get(
                             CONF_GESTURE_HOLD_RAISED_S, DEFAULT_GESTURE_HOLD_RAISED_S
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=60,
+                            step=0.5,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_GESTURE_HOLD_CHOP_S,
+                        default=self.config_entry.options.get(
+                            CONF_GESTURE_HOLD_CHOP_S, DEFAULT_GESTURE_HOLD_CHOP_S
                         ),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(

@@ -111,6 +111,12 @@ DEFAULT_GESTURE_HOLD_FLIP_S = 2.0
 CONF_GESTURE_HOLD_RAISED_S = "gesture_hold_raised_s"
 DEFAULT_GESTURE_HOLD_RAISED_S = 4.0
 
+# Seconds each half of the hand chop must be held: vertical first, then
+# horizontal. One option for both halves because the gesture is symmetric -
+# it is the shift between the two poses that is the gesture.
+CONF_GESTURE_HOLD_CHOP_S = "gesture_hold_chop_s"
+DEFAULT_GESTURE_HOLD_CHOP_S = 2.0
+
 # Minutes the RAW stream stays open before it is turned off automatically, so a
 # forgotten switch cannot flatten the battery. Restarted on every gesture.
 CONF_MOTION_STREAM_TIMEOUT = "motion_stream_timeout"
@@ -238,6 +244,24 @@ MOTION_VERTICAL_TRUST_G = 0.3
 # hand with a slightly bent finger still qualifies, and comfortably above the
 # ~45 of a hand held out in front.
 MOTION_RAISED_HAND_MIN_DEG = 70.0
+
+# --- Hand chop tuning -------------------------------------------------------
+#
+# The chop is a move between two elevation bands: it starts above the raised
+# band, drops through the gap between the bands (which is not part of either
+# hold), and ends below the flat band. The bands are deliberately separated:
+# a hand resting somewhere between them belongs to neither half of the
+# gesture, and the transition window expires the armed state on its own.
+
+# How high the hole axis must be held (degrees, calibrated scale) to arm the
+# chop. Same bar as the raised-hand gesture: the user raises the hand first.
+MOTION_CHOP_RAISED_MIN_DEG = 70.0
+
+# How flat (degrees, calibrated scale) the hole axis must land for the chop to
+# complete. Comfortably below the raised bar and below the gap: a hand laid
+# flat on a table reads well inside it, while one merely lowered to chest
+# height does not.
+MOTION_CHOP_FLAT_MAX_DEG = 20.0
 
 # --- Vertical angle calibration --------------------------------------------
 #
