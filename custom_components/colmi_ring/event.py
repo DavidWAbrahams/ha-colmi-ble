@@ -59,7 +59,10 @@ ENTITY_DESCRIPTIONS = (
     EventEntityDescription(
         key=GESTURE_WAVE,
         name="Wave",
-        icon="mdi:hand-waving",
+        # mdi:hand-waving postdates the Material Design Icons set this HA
+        # version ships, so it renders as no icon at all; mdi:motion-sensor
+        # (already used by the Motion Stream switch) reads as "hand moving".
+        icon="mdi:motion-sensor",
     ),
     EventEntityDescription(
         key=GESTURE_STILL,
