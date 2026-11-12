@@ -37,7 +37,8 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         return self.coordinator.motion
 
     def _assert_ring_free(self) -> None:
-        """Refuse a ring command while the motion stream owns the connection.
+        """
+        Refuse a ring command while the motion stream owns the connection.
 
         RAW mode takes the ring's single sensor pipeline for itself, so a button
         press while the stream holds the link exclusively would fail confusingly
@@ -51,7 +52,8 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         raise HomeAssistantError(STREAM_BUSY_MESSAGE)
 
     def _watch_ring_busy(self) -> None:
-        """Repaint this entity when a measurement or the stream starts/stops.
+        """
+        Repaint this entity when a measurement or the stream starts/stops.
 
         Availability that depends on ``coordinator.ring_busy`` (or on the
         stream) would otherwise only refresh on the next coordinator poll,
@@ -73,7 +75,8 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
         self.async_write_ha_state()
 
     def _begin_measurement(self, name: str) -> None:
-        """Claim the ring's one-measurement-at-a-time slot, or refuse.
+        """
+        Claim the ring's one-measurement-at-a-time slot, or refuse.
 
         Claimed synchronously in the press handler (no await between check
         and set) so a second press cannot slip past the greyed-out UI in the

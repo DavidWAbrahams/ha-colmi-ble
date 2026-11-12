@@ -69,7 +69,8 @@ async def async_setup_entry(
 
 
 class ColmiRingOnFingerBinarySensor(ColmiRingEntity, BinarySensorEntity):
-    """Derived wear-state sensor.
+    """
+    Derived wear-state sensor.
 
     Fusion rule:
     - Off while the ring is charging (it is on the charger, not a finger).
@@ -114,7 +115,8 @@ class ColmiRingOnFingerBinarySensor(ColmiRingEntity, BinarySensorEntity):
 
 
 class ColmiRingBatteryChargingBinarySensor(ColmiRingEntity, BinarySensorEntity):
-    """Charging-state sensor.
+    """
+    Charging-state sensor.
 
     Exposes the ring's raw charging flag as a ``battery_charging``
     device-class binary sensor (on = charging) so it is visible to HA's

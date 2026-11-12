@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline replay of an accelerometer capture through the gesture detector.
+"""
+Offline replay of an accelerometer capture through the gesture detector.
 
 Runs :class:`custom_components.colmi_ring.gestures.StreamGestureDetector` over
 a capture produced by ``scripts/_accel_probe.py`` (or any CSV with
@@ -46,7 +47,8 @@ if str(REPO_ROOT) not in sys.path:  # pragma: no cover - script bootstrap
 
 
 def _bootstrap_package(name: str, path: Path) -> types.ModuleType:
-    """Register *name* as a package without executing its ``__init__``.
+    """
+    Register *name* as a package without executing its ``__init__``.
 
     The real ``custom_components.colmi_ring/__init__.py`` is a Home Assistant
     integration and imports ``homeassistant``, which a plain dev checkout does
@@ -98,9 +100,7 @@ class Row:
 def load_rows(path: Path) -> list[Row]:
     """Load samples from a JSON capture or a CSV, rebased to t=0."""
     text = path.read_text(encoding="utf-8")
-    rows = (
-        _load_capture(text) if path.suffix.lower() == ".json" else _load_csv(text)
-    )
+    rows = _load_capture(text) if path.suffix.lower() == ".json" else _load_csv(text)
     if not rows:
         msg = f"no accelerometer samples found in {path}"
         raise ValueError(msg)

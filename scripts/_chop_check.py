@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline sanity checks for the hand chop gesture (temporary, dev-only).
+"""
+Offline sanity checks for the hand chop gesture (temporary, dev-only).
 
 Run: python scripts/_chop_check.py
 
@@ -94,9 +95,7 @@ def stream(
     return fired
 
 
-def times_of(
-    fired: list[tuple[GestureEvent, float]], gesture: str
-) -> list[float]:
+def times_of(fired: list[tuple[GestureEvent, float]], gesture: str) -> list[float]:
     return [now for event, now in fired if event.gesture == gesture]
 
 

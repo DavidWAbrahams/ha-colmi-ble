@@ -1,4 +1,5 @@
-"""Payload parsers for YCBT frames: scalars and history record streams.
+"""
+Payload parsers for YCBT frames: scalars and history record streams.
 
 Record layouts follow the wire format reverse-engineered from HCI snoops
 of the official companion app and the public YCBT SDK reference
@@ -56,7 +57,8 @@ def parse_device_name(payload: bytes) -> str | None:
 
 
 def parse_firmware_version(payload: bytes) -> str | None:
-    """Firmware version ``"{maj}.{min}"`` from a device-info reply.
+    """
+    Firmware version ``"{maj}.{min}"`` from a device-info reply.
 
     Byte 2 = minor, byte 3 = major (little-endian field convention).
     """
@@ -66,7 +68,8 @@ def parse_firmware_version(payload: bytes) -> str | None:
 
 
 def hr_from_snapshot(payload: bytes) -> int | None:
-    """bpm from a ``REAL_UPLOAD_SNAPSHOT`` (0x0600) push, byte 4.
+    """
+    Bpm from a ``REAL_UPLOAD_SNAPSHOT`` (0x0600) push, byte 4.
 
     The rest of that layout is still TBD; byte 4 is the only byte the
     companion app is known to consume (and it stays unverified there too).
@@ -120,9 +123,7 @@ def parse_bp_records(payload: bytes, tz_offset_sec: int = 0) -> list[BpRecord]:
         dia = payload[i + 6] & 0xFF
         hr = payload[i + 7] & 0xFF
         if 0 < sys_ <= BP_SYS_MAX and dia <= BP_DIA_MAX:
-            out.append(
-                BpRecord(read_ts2k_ms(payload, i, tz_offset_sec), sys_, dia, hr)
-            )
+            out.append(BpRecord(read_ts2k_ms(payload, i, tz_offset_sec), sys_, dia, hr))
     return out
 
 
@@ -156,9 +157,7 @@ class SleepSession:
     stages: list[SleepStage] = field(default_factory=list)
 
 
-def parse_sleep_sessions(
-    payload: bytes, tz_offset_sec: int = 0
-) -> list[SleepSession]:
+def parse_sleep_sessions(payload: bytes, tz_offset_sec: int = 0) -> list[SleepSession]:
     """Parse a ``HEALTH_STREAM_SLEEP`` payload (20-byte header + N 8-byte stages)."""
     out: list[SleepSession] = []
     if not payload or len(payload) < 20:
@@ -173,13 +172,13 @@ def parse_sleep_sessions(
         session = SleepSession(start_time_ms=start_ms, end_time_ms=end_ms)
         if sentinel == 0xFFFF:
             session.deep_sleep_count = (payload[i + 14] & 0xFF) | (
-                ((payload[i + 15] & 0xFF) << 8)
+                (payload[i + 15] & 0xFF) << 8
             )
             session.light_sleep_count = 0
         else:
             session.deep_sleep_count = sentinel
             session.light_sleep_count = (payload[i + 14] & 0xFF) | (
-                ((payload[i + 15] & 0xFF) << 8)
+                (payload[i + 15] & 0xFF) << 8
             )
         session.deep_sleep_sec = (
             (payload[i + 16] & 0xFF) | ((payload[i + 17] & 0xFF) << 8)
@@ -209,7 +208,7 @@ def parse_sleep_sessions(
         out.append(session)
         # Advance to the next session header; a malformed (short) length
         # must still move forward so the walk can never spin forever.
-        i += session_len if session_len >= 20 else 20
+        i += max(session_len, 20)
         if session_len < 20:
             break
     return out
@@ -217,7 +216,8 @@ def parse_sleep_sessions(
 
 @dataclass(frozen=True)
 class AllRecord:
-    """Composite 20-byte all-metrics record from the ``0x0518`` stream.
+    """
+    Composite 20-byte all-metrics record from the ``0x0518`` stream.
 
     Fields not consumed by this integration (rr/hrv/cvrr/temp/bodyfat/
     blood-sugar) are parsed anyway so the byte layout stays fully pinned.

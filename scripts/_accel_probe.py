@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Phase 0 discovery probe for the Colmi ring accelerometer RAW stream.
+"""
+Phase 0 discovery probe for the Colmi ring accelerometer RAW stream.
 
 Dev-only tool; not part of the integration. It talks to the ring with plain
 ``bleak`` from this workstation, following the RAW-mode protocol published by
@@ -61,7 +62,8 @@ TYPE_POSITION = 3
 
 
 def _load_make_packet():
-    """Load ``make_packet`` straight from the codec file.
+    """
+    Load ``make_packet`` straight from the codec file.
 
     Loaded by path rather than by package import so the probe does not execute
     the integration's ``__init__`` (which imports Home Assistant).
@@ -89,7 +91,8 @@ def int12(value: int) -> int:
 def decode_axes(
     data: bytes, *, low_bits_high: bool
 ) -> tuple[float, float, float] | None:
-    """Return ``(gx, gy, gz)`` in g, or None if this is not a position packet.
+    """
+    Return ``(gx, gy, gz)`` in g, or None if this is not a position packet.
 
     Each axis is a 12-bit big-endian value split over two bytes, in wire order
     **Y, Z, X**. The reference demo masks the low bits from the *low* nibble of
@@ -144,9 +147,7 @@ class Capture:
                 continue
             start = ordered[index][0]
             end = (
-                ordered[index + 1][0]
-                if index + 1 < len(ordered)
-                else time.monotonic()
+                ordered[index + 1][0] if index + 1 < len(ordered) else time.monotonic()
             )
             return [p for p in self.packets if start <= p.t < end]
         return []
@@ -158,9 +159,7 @@ class Capture:
                 handle.write(json.dumps({"t": mark_t, "mark": label}) + "\n")
             for pkt in self.packets:
                 handle.write(
-                    json.dumps(
-                        {"t": pkt.t, "hex": pkt.data.hex(), "char": pkt.char}
-                    )
+                    json.dumps({"t": pkt.t, "hex": pkt.data.hex(), "char": pkt.char})
                     + "\n"
                 )
 
@@ -180,7 +179,8 @@ def _notifiable(char) -> bool:
 
 
 def pick_characteristics(client: BleakClient) -> tuple[Any, list[Any]]:
-    """Return the write characteristic and every notifiable one.
+    """
+    Return the write characteristic and every notifiable one.
 
     Prefers the vendor UART UUIDs the integration already uses; otherwise
     subscribes to all notifiable characteristics, as the reference demo does,
@@ -237,7 +237,8 @@ async def run_stream_phases(client: BleakClient, capture: Capture) -> None:
 async def try_camera_gesture(
     client: BleakClient, write_char: Any, capture: Capture, label: str, heading: str
 ) -> None:
-    """Toggle the ring's on-device camera-button gesture and watch for packets.
+    """
+    Toggle the ring's on-device camera-button gesture and watch for packets.
 
     ``label`` names the phase pair in the capture, so the same test can run with
     RAW mode off and again with it on; ``report_camera_gesture`` compares the two.
@@ -246,13 +247,9 @@ async def try_camera_gesture(
     alone would prove nothing.
     """
     print(f"\n--- {heading} ---")
-    await send(
-        client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([4]))
-    )
+    await send(client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([4])))
     await phase(capture, f"{label}_on", 12, "Wave repeatedly")
-    await send(
-        client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([6]))
-    )
+    await send(client, write_char, make_packet(CMD_CAMERA_GESTURE, bytearray([6])))
     await phase(capture, f"{label}_off", 6, "Wave again (gesture disabled)")
 
 
@@ -351,15 +348,14 @@ def _phase_window(capture: Capture, label: str) -> tuple[float, float] | None:
     for index, (mark_t, name) in enumerate(ordered):
         if name != label:
             continue
-        end = (
-            ordered[index + 1][0] if index + 1 < len(ordered) else time.monotonic()
-        )
+        end = ordered[index + 1][0] if index + 1 < len(ordered) else time.monotonic()
         return (mark_t, end)
     return None
 
 
 def _in_span(capture: Capture, label: str, packets: list[Packet]) -> list[Packet]:
-    """The already-filtered sample packets that fall inside a named phase.
+    """
+    The already-filtered sample packets that fall inside a named phase.
 
     ``packets`` is the dominant-type subset, so command replies and other
     chatter never get decoded as motion samples.
@@ -429,9 +425,7 @@ def _report_peak(capture: Capture, label: str, packets: list[Packet]) -> None:
         print(f"  {mag:5.2f} g at t={when:.3f}")
 
 
-def _report_axis_extremes(
-    capture: Capture, label: str, packets: list[Packet]
-) -> None:
+def _report_axis_extremes(capture: Capture, label: str, packets: list[Packet]) -> None:
     axes = [
         decoded
         for pkt in _in_span(capture, label, packets)
@@ -465,7 +459,8 @@ _GESTURE_PHASES: tuple[tuple[str, str], ...] = (
 
 
 def report_camera_gesture(capture: Capture) -> None:
-    """Whether ``02 04`` is answered, and whether RAW mode suppresses it.
+    """
+    Whether ``02 04`` is answered, and whether RAW mode suppresses it.
 
     Home Assistant used to arm the camera-button gesture only *while* RAW
     streaming ran, so a firmware that feeds both from one accelerometer pipeline
@@ -544,9 +539,7 @@ def report(capture: Capture) -> None:
 
 def _dominant_type(capture: Capture) -> tuple[int, int] | None:
     counts: Counter[tuple[int, int]] = Counter(
-        (pkt.data[0], pkt.data[1])
-        for pkt in capture.packets
-        if len(pkt.data) >= 2
+        (pkt.data[0], pkt.data[1]) for pkt in capture.packets if len(pkt.data) >= 2
     )
     if not counts:
         return None
@@ -563,7 +556,9 @@ async def probe(address: str, passive_seconds: int, capture: Capture) -> None:
     async with BleakClient(address, timeout=30.0) as client:
         write_char, notify_chars = pick_characteristics(client)
         if write_char is None:
-            raise SystemExit("no writable characteristic found; is HA holding the ring?")
+            raise SystemExit(
+                "no writable characteristic found; is HA holding the ring?"
+            )
         print(f"  write: {write_char.uuid}")
         for char in notify_chars:
             print(f"  listen: {char.uuid}")
@@ -576,9 +571,7 @@ async def probe(address: str, passive_seconds: int, capture: Capture) -> None:
         for char in notify_chars:
             await client.start_notify(char, on_notify)
 
-        await phase(
-            capture, "passive", passive_seconds, "Listening (send nothing yet)"
-        )
+        await phase(capture, "passive", passive_seconds, "Listening (send nothing yet)")
         # The gesture is tested *before* RAW mode is enabled as well as during
         # it. Home Assistant only ever arms it on top of a running stream, so if
         # the firmware routes both features through one accelerometer pipeline

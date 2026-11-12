@@ -1,4 +1,5 @@
-"""Accelerometer (RAW motion) and on-device gesture packets.
+"""
+Accelerometer (RAW motion) and on-device gesture packets.
 
 Protocol reference: ``mrfloydst/smartringmidi`` ``bluetooth.html``, whose axis
 bit-packing is itself derived from ``atc1441/ATC_RF03_Ring``.
@@ -138,7 +139,8 @@ def _axis(high: int, low: int) -> float:
 
 
 def parse_accel_packet(packet: bytearray) -> AccelSample | None:
-    """Return the accelerometer sample in ``packet``, or ``None``.
+    """
+    Return the accelerometer sample in ``packet``, or ``None``.
 
     ``None`` means "not a position packet" (or too short to decode). Returning
     instead of raising matters here: unlike the single-shot parsers, this runs

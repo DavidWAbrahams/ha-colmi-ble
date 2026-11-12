@@ -1,4 +1,5 @@
-"""Event platform for colmi_ring: the detected gestures.
+"""
+Event platform for colmi_ring: the detected gestures.
 
 Each gesture is one event entity, and every gesture also fires the same Home
 Assistant event type, so an automation can trigger on either::
@@ -93,7 +94,8 @@ async def async_setup_entry(
     entry: ColmiRingConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the gesture event entities.
+    """
+    Set up the gesture event entities.
 
     The entities exist for any Colmi setup: the wave has a second, independent
     source, and the listeners they register are harmless while nothing
@@ -115,7 +117,8 @@ async def async_setup_entry(
 
 
 class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
-    """Fires when this gesture is reported by the ring.
+    """
+    Fires when this gesture is reported by the ring.
 
     The entity's own event is named after the gesture, so it can be used as a
     per-gesture automation trigger. The integration *also* fires the

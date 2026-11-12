@@ -5,8 +5,8 @@ place for accurate counting.
 We always set the time in UTC.
 """
 
-from datetime import datetime, timezone
 import logging
+from datetime import UTC, datetime
 
 from .packet import make_packet
 
@@ -16,9 +16,9 @@ CMD_SET_TIME = 1
 
 
 def set_time_packet(target: datetime) -> bytearray:
-    if target.tzinfo != timezone.utc:
+    if target.tzinfo != UTC:
         logger.info("Converting target time to utc")
-        target = target.astimezone(tz=timezone.utc)
+        target = target.astimezone(tz=UTC)
 
     assert target.year >= 2000
     data = bytearray(7)

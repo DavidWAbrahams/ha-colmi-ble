@@ -1,4 +1,5 @@
-"""Gesture detection over the ring's RAW accelerometer stream.
+"""
+Gesture detection over the ring's RAW accelerometer stream.
 
 Pure logic: no Home Assistant, no Bluetooth, no I/O, so it can be replayed
 offline against a captured sample log.
@@ -136,7 +137,8 @@ class GestureEvent:
 
 @dataclass(slots=True)
 class _PoseHold:
-    """A wrist pose, and how long the ring has been holding it.
+    """
+    A wrist pose, and how long the ring has been holding it.
 
     ``direction`` is the unit gravity vector of the sample that opened the
     hold; the hold lives while calm samples keep arriving within the tolerance
@@ -159,7 +161,8 @@ def _unit(vector: AccelSample) -> AccelSample | None:
 
 
 def _separation_deg(a: AccelSample, b: AccelSample) -> float:
-    """Angle in degrees between two directions, 0..180.
+    """
+    Angle in degrees between two directions, 0..180.
 
     No absolute value on the dot product: 180 degrees must read as 180, since
     that is exactly the number a palm flip produces. (The vertical elevation
@@ -170,7 +173,8 @@ def _separation_deg(a: AccelSample, b: AccelSample) -> float:
 
 
 def _elevation_deg(unit: AccelSample) -> float:
-    """Raw elevation of the hole axis above the horizontal plane, 0..90.
+    """
+    Raw elevation of the hole axis above the horizontal plane, 0..90.
 
     ``|component|`` of the unit gravity direction along the hole axis is
     ``sin(elevation)``; ``asin`` recovers the elevation, folded to 0..90
@@ -181,7 +185,8 @@ def _elevation_deg(unit: AccelSample) -> float:
 
 
 class StreamGestureDetector:
-    """Turn a stream of :class:`AccelSample` into :class:`GestureEvent`.
+    """
+    Turn a stream of :class:`AccelSample` into :class:`GestureEvent`.
 
     Feed it every sample of a session and it returns the ``hand_still``,
     ``hand_flip`` and ``raised_hand`` gestures the stream completes. It also
@@ -197,7 +202,8 @@ class StreamGestureDetector:
         raised_hold_s: float = DEFAULT_GESTURE_HOLD_RAISED_S,
         chop_hold_s: float = DEFAULT_GESTURE_HOLD_CHOP_S,
     ) -> None:
-        """Create a detector with per-gesture hold thresholds.
+        """
+        Create a detector with per-gesture hold thresholds.
 
         ``still_hold_s`` is how long a calm episode must last before
         ``hand_still`` fires; ``flip_hold_s`` is how long each of the two
@@ -271,7 +277,8 @@ class StreamGestureDetector:
         return 1.0 / self._dt_ema
 
     def rest_magnitude_g(self) -> float | None:
-        """Median raw magnitude of the buffered samples, as a decode sanity check.
+        """
+        Median raw magnitude of the buffered samples, as a decode sanity check.
 
         An accelerometer at rest reads about +1 g along its own up axis, so a
         median well away from that means the scale or bit-packing assumed in
@@ -281,9 +288,7 @@ class StreamGestureDetector:
         """
         if not self._samples:
             return None
-        return statistics.median(
-            [sample.magnitude_g for _, sample in self._samples]
-        )
+        return statistics.median([sample.magnitude_g for _, sample in self._samples])
 
     # -- main entry point -------------------------------------------------
 
@@ -293,7 +298,8 @@ class StreamGestureDetector:
         now: float | None = None,
         angle_deg: float | None = None,
     ) -> list[GestureEvent]:
-        """Feed one accelerometer sample; return any gestures it completed.
+        """
+        Feed one accelerometer sample; return any gestures it completed.
 
         ``now`` is a monotonic timestamp and defaults to the monotonic clock,
         which keeps offline replay honest when a capture provides its own.
@@ -337,16 +343,16 @@ class StreamGestureDetector:
             unit is not None
             and sample.minus(self._gravity).magnitude_g <= MOTION_STILL_ACCEL_G
         )
-        elevation = angle_deg if angle_deg is not None else (
-            _elevation_deg(unit) if unit is not None else None
+        elevation = (
+            angle_deg
+            if angle_deg is not None
+            else (_elevation_deg(unit) if unit is not None else None)
         )
 
         events: list[GestureEvent] = []
         events.extend(self._track_stillness(calm=calm, now=now))
         events.extend(self._track_pose(calm=calm, unit=unit, now=now))
-        events.extend(
-            self._track_raised_hand(calm=calm, elevation=elevation, now=now)
-        )
+        events.extend(self._track_raised_hand(calm=calm, elevation=elevation, now=now))
         events.extend(self._track_chop(calm=calm, elevation=elevation, now=now))
 
         self.events_seen += len(events)
@@ -372,7 +378,8 @@ class StreamGestureDetector:
     # -- internals --------------------------------------------------------
 
     def _elapsed(self, now: float) -> tuple[float, bool]:
-        """Seconds since the previous sample, and whether the stream gapped.
+        """
+        Seconds since the previous sample, and whether the stream gapped.
 
         The dt EMA (and with it the sample rate and the flip's transition
         window) only ever sees plausible sample intervals: a gap is not a
@@ -387,9 +394,7 @@ class StreamGestureDetector:
             return 0.0, False
         if dt > MOTION_SAMPLE_GAP_MAX_S:
             return 0.0, True
-        self._dt_ema = dt if self._dt_ema is None else (
-            0.2 * dt + 0.8 * self._dt_ema
-        )
+        self._dt_ema = dt if self._dt_ema is None else (0.2 * dt + 0.8 * self._dt_ema)
         return dt, False
 
     def _trim(self, now: float) -> None:
@@ -398,7 +403,8 @@ class StreamGestureDetector:
             self._samples.popleft()
 
     def _update_gravity(self, sample: AccelSample, dt: float) -> None:
-        """Complementary filter of the *raw* vector = gravity direction.
+        """
+        Complementary filter of the *raw* vector = gravity direction.
 
         Normally a slow average, so a movement cannot tilt the reference frame
         and every still sample would then be measured against a frame moving
@@ -424,10 +430,9 @@ class StreamGestureDetector:
             gravity.z + alpha * (sample.z - gravity.z),
         )
 
-    def _track_stillness(
-        self, *, calm: bool, now: float
-    ) -> list[GestureEvent]:
-        """One ``hand_still`` per calm episode, once it has lasted ``still_hold_s``.
+    def _track_stillness(self, *, calm: bool, now: float) -> list[GestureEvent]:
+        """
+        One ``hand_still`` per calm episode, once it has lasted ``still_hold_s``.
 
         Calm means the gravity-removed acceleration stays small: a held pose,
         however slightly unsteady, sits inside the threshold, while a walking
@@ -458,7 +463,8 @@ class StreamGestureDetector:
     def _track_raised_hand(
         self, *, calm: bool, elevation: float | None, now: float
     ) -> list[GestureEvent]:
-        """One ``raised_hand`` per raised-and-calm episode, once it lasts long enough.
+        """
+        One ``raised_hand`` per raised-and-calm episode, once it lasts long enough.
 
         The same episode logic as :meth:`_track_stillness`, gated additionally
         on the hole axis pointing high: either the hand moving or the hand
@@ -501,7 +507,8 @@ class StreamGestureDetector:
     def _track_chop(
         self, *, calm: bool, elevation: float | None, now: float
     ) -> list[GestureEvent]:
-        """One ``hand_chop`` per raised-then-flat move, once both halves hold.
+        """
+        One ``hand_chop`` per raised-then-flat move, once both halves hold.
 
         The raised half arms the gesture the way ``raised_hand`` works: calm
         with the hole axis above ``MOTION_CHOP_RAISED_MIN_DEG`` for
@@ -565,7 +572,8 @@ class StreamGestureDetector:
     def _track_pose(
         self, *, calm: bool, unit: AccelSample | None, now: float
     ) -> list[GestureEvent]:
-        """Advance the current pose hold; confirm and maybe fire a flip.
+        """
+        Advance the current pose hold; confirm and maybe fire a flip.
 
         A non-calm sample does not end a hold, it just stops it progressing:
         what ends it is the hand settling somewhere else, because the hold and
@@ -591,10 +599,9 @@ class StreamGestureDetector:
         self._hold = _PoseHold(direction=unit, start_time=now, last_calm_time=now)
         return []
 
-    def _confirm_hold(
-        self, hold: _PoseHold, now: float
-    ) -> list[GestureEvent]:
-        """A pose has been held long enough; compare it with the last one.
+    def _confirm_hold(self, hold: _PoseHold, now: float) -> list[GestureEvent]:
+        """
+        A pose has been held long enough; compare it with the last one.
 
         The flip is the whole gesture the user described: hold one palm pose,
         turn, hold the opposite one. Both halves are required before anything
@@ -624,7 +631,8 @@ class StreamGestureDetector:
         return events
 
     def _transition_window_s(self) -> float:
-        """Longest transition a flip may take, given the measured sample rate.
+        """
+        Longest transition a flip may take, given the measured sample rate.
 
         The floor (``MOTION_FLIP_TRANSITION_BASE_S``) is the user's "less than
         a second" and binds on fast streams. The dt term exists because a 1 Hz
@@ -640,7 +648,8 @@ class StreamGestureDetector:
 
 
 class VerticalAngleTracker:
-    """How far the ring's hole axis is deflected from the horizontal plane.
+    """
+    How far the ring's hole axis is deflected from the horizontal plane.
 
     A ring at rest reads gravity, so the sensor's own frame says where the hole
     axis (see ``MOTION_VERTICAL_AXIS``) points relative to "down". Per sample
@@ -675,7 +684,8 @@ class VerticalAngleTracker:
     """
 
     def __init__(self, flat_deg: float = 0.0, vertical_deg: float = 90.0) -> None:
-        """Start with no estimate, calibrated to the given anchors.
+        """
+        Start with no estimate, calibrated to the given anchors.
 
         ``flat_deg`` and ``vertical_deg`` are the *raw* elevations that mean flat
         and vertical; the reported angle rescales raw elevations linearly so
@@ -694,7 +704,8 @@ class VerticalAngleTracker:
         self._vertical_deg = vertical_deg
 
     def feed(self, sample: AccelSample, now: float | None = None) -> float | None:
-        """Feed one sample; return the current angle, or None until trusted.
+        """
+        Feed one sample; return the current angle, or None until trusted.
 
         Every sample of the session should be fed, whether or not its reading
         gets published: the low-pass needs the uninterrupted stream. ``now`` is
@@ -744,7 +755,8 @@ class VerticalAngleTracker:
     # -- internals --------------------------------------------------------
 
     def _elapsed(self, now: float) -> float:
-        """Seconds since the previous sample; 0 for the first, or after a gap.
+        """
+        Seconds since the previous sample; 0 for the first, or after a gap.
 
         A gap (a reconnect, or a ring that reports in bursts) is not a
         measurement of elapsed angle change, so the filter is held instead of
@@ -764,7 +776,8 @@ class VerticalAngleTracker:
         return abs(magnitude_g - 1.0) <= MOTION_VERTICAL_TRUST_G
 
     def _calibrate(self, raw_deg: float) -> float:
-        """Map a raw elevation onto the calibrated 0..90 scale.
+        """
+        Map a raw elevation onto the calibrated 0..90 scale.
 
         A strictly monotonic affine map anchored at ``flat_deg`` -> 0 and
         ``vertical_deg`` -> 90, clamped at both ends. Monotonicity is what makes

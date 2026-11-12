@@ -97,7 +97,8 @@ async def async_setup_entry(
 
 
 class YcbtRingMonitorIntervalNumber(ColmiRingEntity, NumberEntity):
-    """Yucheng background-monitoring interval, backed by the entry options.
+    """
+    Yucheng background-monitoring interval, backed by the entry options.
 
     The ring never reports its interval, so this entity is write-through:
     the value comes from the options the integration applies on every

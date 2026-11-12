@@ -43,7 +43,8 @@ YCBT_MONITOR_INTERVAL_MAX = 240
 
 
 def clamp_ycbt_monitor_interval(value: object) -> int:
-    """Coerce an option value to a valid Yucheng monitor interval (minutes).
+    """
+    Coerce an option value to a valid Yucheng monitor interval (minutes).
 
     Missing/garbage option values fall back to the default so a hand-edited
     or half-migrated entry never yields an out-of-range wire value.
@@ -92,6 +93,7 @@ def measurement_busy_message(running: str) -> str:
         "The ring can only take one measurement at a time:"
         f" {running} measurement in progress"
     )
+
 
 # Seconds the hand must stay still for the stillness gesture. Longer than the
 # flip hold on purpose: a resting hand should take its time announcing itself,
@@ -299,7 +301,8 @@ VERTICAL_UPRIGHT_ANCHOR_MIN_DEG = 70.0
 
 
 def resolve_vertical_anchors(flat: object, upright: object) -> tuple[float, float]:
-    """Coerce the two anchor options into a valid ``(flat, vertical)`` pair.
+    """
+    Coerce the two anchor options into a valid ``(flat, vertical)`` pair.
 
     Garbage, or an upright anchor outside the usable 70..90 range, falls back to
     the uncorrected default rather than to a plausible-looking map, because a
@@ -324,6 +327,7 @@ def resolve_vertical_anchors(flat: object, upright: object) -> tuple[float, floa
     if upright_deg <= flat_deg:
         return 0.0, 90.0
     return flat_deg, upright_deg
+
 
 # How long the RAW stream may stay silent before the session is considered
 # dead and closed. Generous because the stock firmware is known to report

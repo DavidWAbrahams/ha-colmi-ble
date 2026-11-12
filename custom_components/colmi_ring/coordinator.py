@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
@@ -77,9 +77,9 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # a connection of our own: the ring serves one central at a time, and
         # either of its two sessions (RAW stream, wave listener) owns that link.
         self.motion: MotionManager | None = None
-        # {"spo2": int | None, "spo2_timestamp": datetime | None} or None
+        # keys spo2 (int | None) and spo2_timestamp (datetime | None), or None
         self.spo2_reading: dict[str, Any] | None = None
-        # {"heart_rate": int | None, "heart_rate_timestamp": datetime | None}
+        # keys heart_rate (int | None) and heart_rate_timestamp (datetime)
         # A live real-time reading, kept only while it is fresher than the
         # ring's logged HR sample (see _async_update_data precedence).
         self.hr_live: dict[str, Any] | None = None
@@ -112,7 +112,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     @callback
     def async_note_ring_seen(self) -> None:
-        """Record that the ring was just heard from; push if the second moved.
+        """
+        Record that the ring was just heard from; push if the second moved.
 
         Called from HA's bluetooth advertisement callback and from the GATT
         notification handlers of both protocol clients. Cheap and idempotent
@@ -150,9 +151,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         self._busy_listeners.append(listener)
         return lambda: self._remove_busy_listener(listener)
 
-    def _remove_busy_listener(
-        self, listener: Callable[[str | None], None]
-    ) -> None:
+    def _remove_busy_listener(self, listener: Callable[[str | None], None]) -> None:
         if listener in self._busy_listeners:
             self._busy_listeners.remove(listener)
 
@@ -176,7 +175,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     @property
     def _ycbt_monitor_interval(self) -> int:
-        """The Yucheng sampling cadence this entry's options ask for.
+        """
+        The Yucheng sampling cadence this entry's options ask for.
 
         The family has no interval read opcode, so the option value is the
         source of truth: the number entity writes it, and the client's init
@@ -203,7 +203,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         return live_ts >= logged_ts
 
     async def _async_backfill_flags(self) -> tuple[bool, bool, bool]:
-        """(hr_enabled, steps_enabled, include_previous_day) for this poll.
+        """
+        (hr_enabled, steps_enabled, include_previous_day) for this poll.
 
         A single option now drives both metrics: when backfill is on, the
         ring's whole out-of-range backlog (heart rate and steps alike) is
@@ -216,22 +217,23 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         *below* the (today-based) watermark, so the watermark alone can
         never surface them.
         """
-        enabled = bool(
-            self.config_entry.options.get(CONF_BACKFILL_ON_RECONNECT, True)
-        )
+        enabled = bool(self.config_entry.options.get(CONF_BACKFILL_ON_RECONNECT, True))
         hr_enabled = steps_enabled = enabled
         include_previous_day = False
         if self.backfill is not None:
             prev_day = (
-                date_utils.start_of_day(date_utils.now()) - timedelta(days=1)
-            ).date().isoformat()
+                (date_utils.start_of_day(date_utils.now()) - timedelta(days=1))
+                .date()
+                .isoformat()
+            )
             include_previous_day = await self.backfill.async_needs_day(
                 prev_day, hr_enabled=hr_enabled, steps_enabled=steps_enabled
             )
         return hr_enabled, steps_enabled, include_previous_day
 
     async def _async_try_poll(self, *, include_previous_day: bool) -> Any:
-        """Poll once, retrying transient BLE failures inside this cycle.
+        """
+        Poll once, retrying transient BLE failures inside this cycle.
 
         Returns the data dict on success, ``_POLL_BUSY`` if the ring's single
         link is held by another session, or ``None`` if every attempt failed
@@ -286,9 +288,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             # the link, and its commands only queue briefly behind the link's
             # transaction lock.
             return self.data
-        hr_enabled, steps_enabled, include_previous_day = (
-            await self._async_backfill_flags()
-        )
+        (
+            hr_enabled,
+            steps_enabled,
+            include_previous_day,
+        ) = await self._async_backfill_flags()
         data = await self._async_try_poll(include_previous_day=include_previous_day)
         if data is _POLL_BUSY:
             # The link was busy for longer than the poll's short wait: the
@@ -363,7 +367,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             data.setdefault("spo2_timestamp", None)
 
     def _apply_live_heart_rate(self, data: dict[str, Any]) -> None:
-        """Overlay the on-demand live heart rate while it is the fresher sample.
+        """
+        Overlay the on-demand live heart rate while it is the fresher sample.
 
         Heart rate precedence: a live reading wins only while it is fresher
         than the ring's own logged sample, so the 5-min log poll naturally
@@ -378,7 +383,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             self.hr_live = None
 
     def _apply_hrv_reading(self, data: dict[str, Any]) -> None:
-        """Overlay the persisted on-demand HRV reading, if any.
+        """
+        Overlay the persisted on-demand HRV reading, if any.
 
         Yucheng polls already carry their own hrv keys (the client persists
         history-derived HRV itself), and the coordinator's ``hrv_reading``
@@ -399,7 +405,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     _YCBT_MIN_POLL_MINUTES = 1
 
     def _apply_poll_interval(self, data: dict[str, Any]) -> None:
-        """Match the poll cadence to the ring's sampling interval, capped.
+        """
+        Match the poll cadence to the ring's sampling interval, capped.
 
         The ring only records a new HR sample once per its configured
         sampling interval, so polling faster just re-reads an unchanged log
@@ -444,7 +451,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             self.update_interval = new_interval
 
     def _heart_rate_is_stale(self, data: dict[str, Any]) -> bool:
-        """True if the newest HR sample is older than the staleness threshold.
+        """
+        True if the newest HR sample is older than the staleness threshold.
 
         The threshold is ``stale_polls * poll_interval + ring sample interval +
         5 min slack`` so a *worn* ring (whose newest sample is naturally one
@@ -457,9 +465,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         if data.get("heart_rate") is None or not isinstance(timestamp, datetime):
             return False
         try:
-            stale_polls = int(
-                self.config_entry.options.get(CONF_HR_STALE_POLLS, 3)
-            )
+            stale_polls = int(self.config_entry.options.get(CONF_HR_STALE_POLLS, 3))
         except (TypeError, ValueError):
             stale_polls = 0
         poll_minutes = (
@@ -475,10 +481,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             # settings query fall back to a conservative typical interval.
             else (self._ycbt_monitor_interval if self._is_ycbt else 15)
         )
-        threshold = timedelta(
-            minutes=stale_polls * poll_minutes + interval_minutes + 5
-        )
-        return datetime.now(tz=timezone.utc) - timestamp > threshold
+        threshold = timedelta(minutes=stale_polls * poll_minutes + interval_minutes + 5)
+        return datetime.now(tz=UTC) - timestamp > threshold
 
     def apply_spo2(self, reading: dict[str, Any]) -> None:
         """Store a fresh SpO2 reading and push it to entities immediately."""
@@ -489,7 +493,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         self.async_set_updated_data(data)
 
     def apply_skin_temperature(self, reading: dict[str, Any]) -> None:
-        """Push a fresh skin-temperature reading to entities immediately.
+        """
+        Push a fresh skin-temperature reading to entities immediately.
 
         Unlike SpO2 the Yucheng client persists the reading itself (it is
         what every later poll re-publishes), so the coordinator only has
@@ -497,9 +502,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         """
         data = dict(self.data) if self.data else {}
         data["skin_temperature"] = reading.get("skin_temperature")
-        data["skin_temperature_timestamp"] = reading.get(
-            "skin_temperature_timestamp"
-        )
+        data["skin_temperature_timestamp"] = reading.get("skin_temperature_timestamp")
         self.async_set_updated_data(data)
 
     def apply_hrv(self, reading: dict[str, Any]) -> None:
@@ -519,7 +522,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         self.async_set_updated_data(data)
 
     def async_clear_heart_rate(self) -> None:
-        """Drop the published heart rate and push "unknown" to entities now.
+        """
+        Drop the published heart rate and push "unknown" to entities now.
 
         Called when the motion stream opens. Polling stops for the duration, so
         leaving the last value in place would present a frozen measurement as

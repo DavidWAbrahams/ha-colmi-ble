@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline check of ``_accel_probe.report_camera_gesture``.
+"""
+Offline check of ``_accel_probe.report_camera_gesture``.
 
 Running the probe needs a real ring, but deciding what a capture *means* is pure
 logic over a packet list. This feeds the reporter synthetic captures for each
@@ -24,7 +25,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_probe() -> Any:
-    """Import the probe by path so its ``bleak`` import is the only dependency.
+    """
+    Import the probe by path so its ``bleak`` import is the only dependency.
 
     Home Assistant is not needed, and the module is imported rather than copied
     so this check keeps testing the code the probe actually runs.
@@ -51,7 +53,8 @@ def _capture(
     alone_disabled: int = 0,
     with_raw_disabled: int = 0,
 ) -> Any:
-    """A capture whose gesture windows hold the given numbers of ``0x02`` packets.
+    """
+    A capture whose gesture windows hold the given numbers of ``0x02`` packets.
 
     ``with_raw=None`` means the run never got as far as arming the gesture the
     second time, which is how an interrupted session looks. Marks are written on a
@@ -66,9 +69,7 @@ def _capture(
         capture.marks.append((clock, label))
         for index in range(gestures or 0):
             capture.packets.append(
-                probe.Packet(
-                    t=clock + 0.5 + index * 0.1, data=GESTURE, char="6e400003"
-                )
+                probe.Packet(t=clock + 0.5 + index * 0.1, data=GESTURE, char="6e400003")
             )
         clock += seconds
 

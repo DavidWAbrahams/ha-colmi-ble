@@ -276,7 +276,8 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        """HRV is unavailable on Colmi firmware that reports no HRV support.
+        """
+        HRV is unavailable on Colmi firmware that reports no HRV support.
 
         Only a definite ``supports_hrv`` of ``False`` hides the sensor: Yucheng
         rings source HRV from their history stream and never report the
@@ -297,16 +298,12 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
             if self.entity_description.key == "battery_level":
                 charging = self.coordinator.data.get("battery_charging")
                 if charging is not None:
-                    self._attr_extra_state_attributes = {
-                        "charging": bool(charging)
-                    }
+                    self._attr_extra_state_attributes = {"charging": bool(charging)}
             elif self.entity_description.key == "spo2":
                 timestamp = self.coordinator.data.get("spo2_timestamp")
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
             elif self.entity_description.key == "skin_temperature":
-                timestamp = self.coordinator.data.get(
-                    "skin_temperature_timestamp"
-                )
+                timestamp = self.coordinator.data.get("skin_temperature_timestamp")
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
             elif self.entity_description.key == "hrv":
                 timestamp = self.coordinator.data.get("hrv_timestamp")
@@ -318,7 +315,8 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
 
 
 class ColmiRingLastSeenSensor(ColmiRingEntity, SensorEntity):
-    """When this ring was last heard from, to the second.
+    """
+    When this ring was last heard from, to the second.
 
     Pushed rather than polled: the coordinator notes every advertisement HA's
     scanner sees and every GATT notification the clients receive, throttled to
@@ -355,9 +353,7 @@ class ColmiRingLastSeenSensor(ColmiRingEntity, SensorEntity):
         # Subscribed here rather than in __init__: a seen event can fire from
         # the bluetooth scanner at any moment, and writing state before the
         # entity is registered would raise.
-        self.async_on_remove(
-            self.coordinator.add_seen_listener(self._async_on_seen)
-        )
+        self.async_on_remove(self.coordinator.add_seen_listener(self._async_on_seen))
 
     @property
     def native_value(self) -> datetime | None:
@@ -366,7 +362,8 @@ class ColmiRingLastSeenSensor(ColmiRingEntity, SensorEntity):
 
 
 class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):
-    """One axis (or the magnitude) of the ring's live RAW accelerometer stream.
+    """
+    One axis (or the magnitude) of the ring's live RAW accelerometer stream.
 
     Push-driven instead of polled: these values only exist while the connection
     is held open with the stream on, so the motion manager says "there is a new
@@ -424,7 +421,8 @@ class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):
 
 
 class ColmiRingVerticalAngleSensor(ColmiRingEntity, SensorEntity):
-    """How far the ring's hole axis is tilted from horizontal.
+    """
+    How far the ring's hole axis is tilted from horizontal.
 
     Push-driven like the axis sensors, but reading the vertical angle tracker's
     answer rather than a raw sample. The value is the elevation, in degrees, of
@@ -454,9 +452,7 @@ class ColmiRingVerticalAngleSensor(ColmiRingEntity, SensorEntity):
         """Initialize the vertical angle sensor."""
         super().__init__(coordinator)
         self.entity_description = description
-        self._attr_unique_id = (
-            f"{coordinator.config_entry.entry_id}_{description.key}"
-        )
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_{description.key}"
 
     @property
     def native_value(self) -> float | None:

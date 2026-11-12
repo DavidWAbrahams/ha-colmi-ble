@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline sanity checks for VerticalAngleTracker (temporary, not part of the package).
+"""
+Offline sanity checks for VerticalAngleTracker (temporary, not part of the package).
 
 Run: python scripts/_vertical_angle_check.py
 """
@@ -17,7 +18,8 @@ if str(REPO_ROOT) not in sys.path:  # pragma: no cover - script bootstrap
 
 
 def _bootstrap_package(name: str, path: Path) -> types.ModuleType:
-    """Register *name* as a package without executing its ``__init__``.
+    """
+    Register *name* as a package without executing its ``__init__``.
 
     Same trick as ``scripts/_motion_replay.py``: the integration's ``__init__``
     imports ``homeassistant``, which a plain dev checkout does not have, while
@@ -48,7 +50,8 @@ failures: list[str] = []
 
 
 def dirs(*, elev_deg: float, yaw_deg: float = 0.0, g: float = 1.0) -> AccelSample:
-    """Unit gravity direction for a Z axis elevated ``elev_deg`` above horizontal.
+    """
+    Unit gravity direction for a Z axis elevated ``elev_deg`` above horizontal.
 
     ``yaw_deg`` spins the axis around the vertical; it must not change what the
     tracker reports, because the tracker reads only the Z component.

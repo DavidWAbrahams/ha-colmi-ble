@@ -1,4 +1,5 @@
-"""Protocol constants for the Yucheng YCBT-SDK ring family (R20/R99).
+"""
+Protocol constants for the Yucheng YCBT-SDK ring family (R20/R99).
 
 The wire format was reverse-engineered from HCI snoops of the official
 companion app; this implementation is original to this integration.

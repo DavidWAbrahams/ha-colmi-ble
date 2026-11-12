@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -10,7 +11,6 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.device_registry import format_mac
-from homeassistant.helpers.service_info.bluetooth import BluetoothServiceInfo
 
 from .api import (
     ColmiRingApiClient,
@@ -52,6 +52,9 @@ from .const import (
 )
 from .ycbt_api import YcbtRingApiClient
 
+if TYPE_CHECKING:
+    from homeassistant.helpers.service_info.bluetooth import BluetoothServiceInfo
+
 # Advertisement-level hints for the two protocol families. These only pick
 # the default of the family picker; the authoritative decision is the
 # connect-time probe in _test_credentials, which fails the flow loudly if
@@ -70,7 +73,8 @@ _COLMI_NAME_RE = re.compile(r"^R\d\d_", re.IGNORECASE)
 
 
 def _family_hint_from_discovery(info: BluetoothServiceInfo) -> str:
-    """Best guess at the ring's protocol family from its advertisement.
+    """
+    Best guess at the ring's protocol family from its advertisement.
 
     Returns ``FAMILY_COLMI``/``FAMILY_YCBT`` or ``""`` when the
     advertisement looks like neither.
@@ -119,9 +123,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
         self._discovered_address = discovery_info.address
         self._discovered_name = discovery_info.name or None
-        self._discovered_family_hint = _family_hint_from_discovery(
-            discovery_info
-        )
+        self._discovered_family_hint = _family_hint_from_discovery(discovery_info)
         self.context["title_placeholders"] = {
             "name": discovery_info.name or discovery_info.address
         }
@@ -149,9 +151,7 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 LOGGER.exception(exception)
                 _errors["base"] = "unknown"
             else:
-                await self.async_set_unique_id(
-                    format_mac(user_input[CONF_ADDRESS])
-                )
+                await self.async_set_unique_id(format_mac(user_input[CONF_ADDRESS]))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=self._entry_title(user_input[CONF_ADDRESS]),
@@ -190,7 +190,8 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _entry_title(self, ring_address: str) -> str:
-        """Name the entry after the ring's advertisement name if we know it.
+        """
+        Name the entry after the ring's advertisement name if we know it.
 
         The entry title is what the integrations card and the device show
         as their default name, so a bare MAC makes every ring read like an
@@ -217,13 +218,14 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,  # noqa: ARG003
-    ) -> "ColmiRingOptionsFlowHandler":
+        _config_entry: config_entries.ConfigEntry,
+    ) -> ColmiRingOptionsFlowHandler:
         """Return the options flow handler."""
         return ColmiRingOptionsFlowHandler()
 
     async def _test_credentials(self, ring_address: str, family: str) -> None:
-        """Open a real connection and prove the ring speaks ``family``.
+        """
+        Open a real connection and prove the ring speaks ``family``.
 
         Both branches raise :class:`ColmiRingApiClientCommunicationError`
         (surfaced as the ``connection`` error) when the ring refuses the
@@ -266,9 +268,7 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                 {
                     vol.Optional(
                         CONF_HR_STALE_POLLS,
-                        default=self.config_entry.options.get(
-                            CONF_HR_STALE_POLLS, 3
-                        ),
+                        default=self.config_entry.options.get(CONF_HR_STALE_POLLS, 3),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(
                             min=0,

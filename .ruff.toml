@@ -8,12 +8,60 @@ select = [
 ]
 
 ignore = [
-    "ANN101", # Missing type annotation for `self` in method
     "ANN401", # Dynamically typed expressions (typing.Any) are disallowed
     "D203", # no-blank-line-before-class (incompatible with formatter)
     "D212", # multi-line-summary-first-line (incompatible with formatter)
     "COM812", # incompatible with formatter
     "ISC001", # incompatible with formatter
+
+    # Project-wide style decisions (this integration is not held to HA core's
+    # full docstring/copyright/exception-message rules):
+    "CPY001", # no per-file copyright headers; the repo carries a LICENSE
+    "D", # pydocstyle: our docstrings are prose, not mood/period-checked summaries
+    "EM101", "EM102", "TRY003", # keep human-readable messages inline at the raise
+    "FBT001", "FBT002", "FBT003", # boolean positional args are idiomatic here and in HA's APIs
+    "FIX002", "TD002", "TD003", # leave TODO comments as notes, not tracked issues
+    "PLR2004", # protocol code legitimately compares against raw protocol values
+    "PT018", # pytest-style rule; fires on runtime asserts, not tests
+    "S101", # assert is used as a development guard; HA never runs optimized
+]
+
+[lint.per-file-ignores]
+# scripts/ holds developer-facing probes, replays and offline selftests.
+# They print to the console, assert their expectations, use test-style
+# patterns and loose typing; none of them ship inside the integration.
+# The top-level colmi_codec modules are vendored (copied from the upstream
+# colmi_r02_client project, MIT). Keep them faithful to upstream so future
+# codec fixes stay easy to diff and cherry-pick. The ycbt/ subpackage is ours
+# and is NOT exempt.
+"custom_components/colmi_ring/colmi_codec/*.py" = [
+    "ANN", # upstream style: sparse annotations
+    "E501", # upstream wraps lines its own way
+    "ERA001", # upstream keeps commented-out reference notes
+    "G004", # upstream logging style
+    "N806", # upstream variable names
+    "RUF036", # upstream writes None first in some unions
+    "TD", # upstream TODO notes
+]
+"scripts/*" = [
+    "ANN", # annotations are optional in throwaway dev scripts
+    "ARG", # unused callback args keep probe signatures uniform
+    "ASYNC", # no event loop constraints for one-shot scripts
+    "DTZ", # naive datetimes are fine for local timing scaffolds
+    "E501", # long lines are readable in printed reports
+    "EM", "TRY", # exception message style is not worth it here
+    "FBT", # quick scripts take plain boolean flags
+    "ICN", # import aliases are personal taste in dev tools
+    "INP001", # scripts/ is intentionally not a package
+    "PLC", "PLR", "PLW", # complexity and repetition are acceptable in checks
+    "PT", # the selftests assert with plain asserts, not pytest fixtures
+    "RUF", # collection-sugar preferences are not worth churn here
+    "S", # bandit: hardcoded randomness and asserts are deliberate in probes
+    "S311", "S110", # (explicit for clarity; covered by S above)
+    "SIM", # simplification pressure would obscure probe intent
+    "SLF001", # probes poke at internals on purpose
+    "T", # console output is the entire point of these scripts
+    "TC", # type-checking blocks add ceremony without startup-cost benefit here
 ]
 
 [lint.flake8-pytest-style]

@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
-from typing import Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 
 def start_of_day(ts: datetime) -> datetime:
@@ -11,7 +11,7 @@ def end_of_day(ts: datetime) -> datetime:
 
 
 def dates_between(start: datetime, end: datetime) -> Iterator[datetime]:
-    """generator for all days between start and end. totally ignores the hours, minutes, seconds and timezones"""
+    """Generator for all days between start and end. totally ignores the hours, minutes, seconds and timezones"""
     td: timedelta = end - start
     if td.days < 0:
         raise ValueError("start is after end")
@@ -21,7 +21,7 @@ def dates_between(start: datetime, end: datetime) -> Iterator[datetime]:
 
 
 def now() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def minutes_so_far(dt: datetime) -> int:
@@ -45,4 +45,4 @@ def naive_to_aware(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
         raise ValueError("already tz aware datetime")
 
-    return dt.replace(tzinfo=timezone.utc)
+    return dt.replace(tzinfo=UTC)

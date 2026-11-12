@@ -1,4 +1,5 @@
-"""Yucheng YCBT ring API client (R20/R99 protocol family).
+"""
+Yucheng YCBT ring API client (R20/R99 protocol family).
 
 Sibling of :mod:`.api` for the second device family this integration serves.
 Like the Colmi client it owns its GATT transport through Home Assistant's
@@ -31,14 +32,12 @@ no ring-side HR logging settings) and ``hr_zero_reading`` is always ``False``
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from datetime import datetime, timedelta, timezone
-from types import TracebackType
-from typing import TYPE_CHECKING, Any, Callable
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Self
 
 from bleak import BleakClient
-from bleak.backends.characteristic import BleakGATTCharacteristic
-from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from homeassistant.helpers.storage import Store
@@ -63,6 +62,11 @@ from .const import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import TracebackType
+
+    from bleak.backends.characteristic import BleakGATTCharacteristic
+    from bleak.backends.device import BLEDevice
     from homeassistant.core import HomeAssistant
 
 # How long an on-demand measurement runs before we stop the ring and give up.
@@ -114,7 +118,7 @@ def _tz_offset_sec() -> int:
 
 
 def _ms_to_dt(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
 
 def _median(samples: list[int]) -> int:
@@ -128,7 +132,8 @@ async def _async_measure_window(
     completed: Callable[[], bool],
     poll: Callable[[], Any] | None = None,
 ) -> None:
-    """Watch a started measurement until its value settles or time is up.
+    """
+    Watch a started measurement until its value settles or time is up.
 
     Stops early once ``completed()`` reports the ring finished AND a sample
     arrived, or once ``MEASURE_SETTLE_S`` has passed since the first sample
@@ -159,7 +164,8 @@ def _measure_extra_samples(
     *,
     fallback: bool = False,
 ) -> list[int]:
-    """Measurement values carried by R99 frames other than the live push.
+    """
+    Measurement values carried by R99 frames other than the live push.
 
     The R99 answers a manual session with per-second ``0x060D`` progress
     frames (byte 21 is an elapsed-seconds counter; its value fields stay
@@ -189,9 +195,7 @@ def _measure_extra_samples(
     if opcode == yc.GET_REAL_BLOOD_OXYGEN:
         values = [
             byte
-            for byte in packet.payload.removeprefix(
-                yc.MAGIC_GET_REAL_BLOOD_OXYGEN
-            )
+            for byte in packet.payload.removeprefix(yc.MAGIC_GET_REAL_BLOOD_OXYGEN)
             if byte in plausible
         ]
         if values:
@@ -221,7 +225,8 @@ def _measure_extra_samples(
 
 
 def hrs_bpm(data: bytes) -> int | None:
-    """Decode a standard 0x2A37 Heart Rate Measurement value.
+    """
+    Decode a standard 0x2A37 Heart Rate Measurement value.
 
     Honours the sensor-contact bits: a frame that says "contact supported,
     not worn" is ignored rather than reported as a plausible-looking number.
@@ -237,7 +242,8 @@ def hrs_bpm(data: bytes) -> int | None:
 
 
 class _YcbtConnection:
-    """One GATT link to a YCBT ring, with the client-wide lock held for life.
+    """
+    One GATT link to a YCBT ring, with the client-wide lock held for life.
 
     Same one-central constraint as the Colmi rings: a second connection while
     one is live drops a link instead of queueing, so acquiring this object IS
@@ -248,7 +254,7 @@ class _YcbtConnection:
     _RESOLVE_POLL_S = 0.5
     _LOCK_POLL_S = 0.25
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one bundle of per-connection knobs
         self,
         hass: HomeAssistant,
         address: str,
@@ -289,7 +295,7 @@ class _YcbtConnection:
 
     # ------------------------------------------------------- lifecycle
 
-    async def __aenter__(self) -> _YcbtConnection:
+    async def __aenter__(self) -> Self:
         if self._lock is not None:
             await self._async_acquire_lock()
         try:
@@ -310,7 +316,8 @@ class _YcbtConnection:
             self._release_lock()
 
     async def _async_acquire_lock(self) -> None:
-        """Claim the ring's single-link lock within the caller's budget.
+        """
+        Claim the ring's single-link lock within the caller's budget.
 
         Polls ``locked()`` rather than cancelling ``acquire()``: a cancelled
         acquire can leave the lock held forever (see the Colmi client).
@@ -371,7 +378,7 @@ class _YcbtConnection:
         except ColmiRingApiClientError:
             await self._safe_disconnect()
             raise
-        except (BleakError, asyncio.TimeoutError, OSError) as err:
+        except (TimeoutError, BleakError, OSError) as err:
             await self._safe_disconnect()
             raise ColmiRingApiClientCommunicationError(
                 f"Could not connect to Yucheng ring {self._address}: {err}"
@@ -383,13 +390,14 @@ class _YcbtConnection:
             return
         try:
             await self._client.disconnect()
-        except (BleakError, asyncio.TimeoutError, OSError):
+        except (TimeoutError, BleakError, OSError):
             LOGGER.debug("Ignoring disconnect error for %s", self._address)
 
     # ------------------------------------------------------- GATT map
 
     def _pick_characteristics(self, client: BleakClient) -> None:
-        """Locate write/notify characteristics, tolerating the R99's FEE7 alias.
+        """
+        Locate write/notify characteristics, tolerating the R99's FEE7 alias.
 
         Some firmwares expose the documented ``be940000`` service; others
         (R99) alias the same characteristics under ``0000fee7``. Either way
@@ -444,7 +452,7 @@ class _YcbtConnection:
         if self._hrs_uuid is not None and self._client is not None:
             try:
                 await self._client.start_notify(self._hrs_uuid, self._handle_hrs)
-            except (BleakError, asyncio.TimeoutError, OSError):
+            except (TimeoutError, BleakError, OSError):
                 LOGGER.debug(
                     "Yucheng ring %s refused HRS subscribe; vendor pushes only",
                     self._address,
@@ -453,10 +461,8 @@ class _YcbtConnection:
 
     async def stop_hrs(self) -> None:
         if self._hrs_uuid is not None and self._client is not None:
-            try:
+            with contextlib.suppress(TimeoutError, BleakError, OSError):
                 await self._client.stop_notify(self._hrs_uuid)
-            except (BleakError, asyncio.TimeoutError, OSError):
-                pass
 
     # ------------------------------------------------------- dispatch
 
@@ -469,13 +475,9 @@ class _YcbtConnection:
         except Exception:  # noqa: BLE001
             LOGGER.exception("Yucheng ring on-seen callback raised")
 
-    def _handle_hrs(
-        self, _char: BleakGATTCharacteristic, data: bytearray
-    ) -> None:
+    def _handle_hrs(self, _char: BleakGATTCharacteristic, data: bytearray) -> None:
         self._note_seen()
-        LOGGER.debug(
-            "Yucheng ring %s HRS raw: %s", self._address, bytes(data).hex()
-        )
+        LOGGER.debug("Yucheng ring %s HRS raw: %s", self._address, bytes(data).hex())
         bpm = hrs_bpm(bytes(data))
         if bpm:
             for listener in list(self._hrs_listeners):
@@ -484,9 +486,7 @@ class _YcbtConnection:
                 except Exception:  # noqa: BLE001
                     LOGGER.exception("Yucheng ring HRS listener raised")
 
-    def _handle_notify(
-        self, _char: BleakGATTCharacteristic, data: bytearray
-    ) -> None:
+    def _handle_notify(self, _char: BleakGATTCharacteristic, data: bytearray) -> None:
         self._note_seen()
         raw = bytes(data)
         packet = yc_pkt.decode(raw)
@@ -556,20 +556,20 @@ class _YcbtConnection:
             await self._client.write_gatt_char(
                 self._write_char, packet.encode(), response=False
             )
-        except (BleakError, asyncio.TimeoutError, OSError) as err:
+        except (TimeoutError, BleakError, OSError) as err:
             raise ColmiRingApiClientCommunicationError(
                 f"Lost connection to Yucheng ring {self._address}"
                 " (out of range or disconnected)"
             ) from err
 
     async def get_reply(
-        self, opcode: int, timeout: float = REPLY_TIMEOUT
+        self, opcode: int, timeout_s: float = REPLY_TIMEOUT
     ) -> yc_pkt.YcbtPacket | None:
         """Next already-received or future frame with ``opcode``, or None."""
         queue = self._queues.setdefault(opcode, asyncio.Queue())
         try:
-            return await asyncio.wait_for(queue.get(), timeout=timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+            return await asyncio.wait_for(queue.get(), timeout=timeout_s)
+        except TimeoutError:
             return None
 
     def clear_replies(self) -> None:
@@ -579,7 +579,8 @@ class _YcbtConnection:
                 queue.get_nowait()
 
     async def async_init(self) -> tuple[set[int], set[int]]:
-        """Bind/time/enable burst mirroring the companion app's sync entry.
+        """
+        Bind/time/enable burst mirroring the companion app's sync entry.
 
         Returns ``(answered, refused)``: the opcodes the ring replied to,
         and the opcodes it answered with 0xFC, on the last burst. Field
@@ -652,7 +653,8 @@ class YcbtRingApiClient:
         monitor_interval_minutes: int = DEFAULT_YCBT_MONITOR_INTERVAL,
         on_seen: Callable[[], None] | None = None,
     ) -> None:
-        """Store the HA instance and ring address (no connection yet).
+        """
+        Store the HA instance and ring address (no connection yet).
 
         ``on_seen`` reaches every inbound notification of every connection
         (see the Colmi client's _RingConnection for the contract); the setup
@@ -709,9 +711,7 @@ class YcbtRingApiClient:
             return
         if isinstance(stored, dict):
             self._hwm = {
-                str(k): int(v)
-                for k, v in stored.items()
-                if isinstance(v, (int, float))
+                str(k): int(v) for k, v in stored.items() if isinstance(v, (int, float))
             }
 
     def _hwm_for(self, stream_key: str) -> int:
@@ -744,7 +744,8 @@ class YcbtRingApiClient:
         parse: Callable[..., list],
         stream_key: str,
     ) -> list[Any]:
-        """Drain one history stream, ACKing only blocks with new records.
+        """
+        Drain one history stream, ACKing only blocks with new records.
 
         The firmware re-sends its oldest unACKed block on each request/ACK,
         so ACKing a block whose records are all at-or-before our watermark
@@ -760,7 +761,7 @@ class YcbtRingApiClient:
 
         await conn.send(yc_pkt.health_history(request_opcode))
         for _ in range(DRAIN_MAX_BLOCKS):
-            packet = await conn.get_reply(stream, timeout=DRAIN_BLOCK_TIMEOUT_S)
+            packet = await conn.get_reply(stream, timeout_s=DRAIN_BLOCK_TIMEOUT_S)
             if packet is None:
                 break
             rows = parse(packet.payload, tz_offset_sec=tz)
@@ -770,7 +771,8 @@ class YcbtRingApiClient:
                 parked = True
                 break
             fresh_rows.extend(fresh)
-            hwm = max(hwm, max(r.timestamp_ms for r in rows))
+            block_hwm = max(r.timestamp_ms for r in rows)
+            hwm = max(hwm, block_hwm)
             await conn.send(yc_pkt.history_ack(stream, len(packet.payload) + 6))
             # A ring with a big backlog answers back-to-back; the tiny gap
             # keeps the single write characteristic from queueing.
@@ -790,7 +792,8 @@ class YcbtRingApiClient:
     async def async_get_data(
         self, include_previous_day: bool = False
     ) -> dict[str, Any]:
-        """Return the ring's latest readings, dict-identical to the Colmi API.
+        """
+        Return the ring's latest readings, dict-identical to the Colmi API.
 
         Live values (``heart_rate``/``steps``) come from the ring's *now*
         commands and today's records; the backfill series (``hr_entries`` /
@@ -846,9 +849,7 @@ class YcbtRingApiClient:
                 latest_temp = max(temp_rows, key=lambda record: record.timestamp_ms)
                 self._skin_reading = {
                     "skin_temperature": latest_temp.temperature,
-                    "skin_temperature_timestamp": _ms_to_dt(
-                        latest_temp.timestamp_ms
-                    ),
+                    "skin_temperature_timestamp": _ms_to_dt(latest_temp.timestamp_ms),
                 }
 
             # HRV (ms, per the Yucheng SDK) rides in the same records, at
@@ -951,7 +952,8 @@ class YcbtRingApiClient:
             }
 
     async def async_set_time(self, value: datetime) -> None:
-        """Sync the ring clock.
+        """
+        Sync the ring clock.
 
         The firmware stores wall-clock-as-UTC and stamps its records in the
         same local wall clock, so the ring must be set to *local* time (the
@@ -962,7 +964,8 @@ class YcbtRingApiClient:
             await conn.send(yc_pkt.setting_time(local))
 
     async def async_set_monitor_interval(self, minutes: int) -> int:
-        """Set the ring's background monitoring interval.
+        """
+        Set the ring's background monitoring interval.
 
         Applies the interval to all four all-day monitors (heart rate,
         blood pressure, temperature, blood oxygen) so they share one
@@ -999,7 +1002,8 @@ class YcbtRingApiClient:
         return minutes
 
     async def async_take_spo2(self) -> dict[str, Any]:
-        """Take an on-demand SpO2 measurement and return the median sample.
+        """
+        Take an on-demand SpO2 measurement and return the median sample.
 
         Returns a dict with ``spo2`` (int %) and ``spo2_timestamp`` (aware
         datetime), or ``spo2`` = None if the ring produced no valid reading.
@@ -1012,7 +1016,8 @@ class YcbtRingApiClient:
         return {"spo2": _median(samples), "spo2_timestamp": date_utils.now()}
 
     async def async_take_heart_rate(self) -> dict[str, Any]:
-        """Take an on-demand real-time heart-rate measurement.
+        """
+        Take an on-demand real-time heart-rate measurement.
 
         Live values arrive on the vendor ``0x0601`` push, the standard
         ``0x2A37`` HRS characteristic, or both, depending on firmware; both
@@ -1029,7 +1034,8 @@ class YcbtRingApiClient:
         }
 
     async def async_take_temperature(self) -> dict[str, Any]:
-        """Take an on-demand skin-temperature measurement.
+        """
+        Take an on-demand skin-temperature measurement.
 
         The R99's live temperature push opcode is undocumented, so the
         session collects any frame byte in the plausible whole-degC range
@@ -1059,7 +1065,8 @@ class YcbtRingApiClient:
         type_name: str,
         push_opcode: int,
     ) -> list[int]:
-        """Prime + start a manual measurement and collect its live pushes.
+        """
+        Prime + start a manual measurement and collect its live pushes.
 
         Runs the same flow as the Phase-0 probe: enable sensors (init
         burst), ``0x030C`` prime, ``0x032F`` start, watch the metric's
@@ -1104,8 +1111,7 @@ class YcbtRingApiClient:
                     yc.MEASUREMENT_STATUS,
                 ):
                     LOGGER.debug(
-                        "Yucheng ring %s measurement %s event 0x%04X:"
-                        " payload=%s",
+                        "Yucheng ring %s measurement %s event 0x%04X: payload=%s",
                         self._ring_address,
                         type_name,
                         opcode,
@@ -1191,7 +1197,8 @@ class YcbtRingApiClient:
         return samples
 
     async def async_probe_family(self) -> None:
-        """Config-flow verification: connect once and prove it answers us.
+        """
+        Config-flow verification: connect once and prove it answers us.
 
         The ring is this family when it answers *any* init command. A few
         per-command 0xFC refusals on features a variant lacks are normal

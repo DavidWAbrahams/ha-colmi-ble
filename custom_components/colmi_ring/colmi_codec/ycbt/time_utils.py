@@ -1,4 +1,5 @@
-"""Timestamp helpers for the YCBT protocol.
+"""
+Timestamp helpers for the YCBT protocol.
 
 Yucheng firmware stores timestamps as *seconds since 2000-01-01*, in
 wall-clock local time that the firmware interprets as UTC (this is exactly

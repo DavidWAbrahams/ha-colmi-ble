@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Phase 0 discovery probe for Yucheng YCBT-SDK rings (R20 family / R99).
+"""
+Phase 0 discovery probe for Yucheng YCBT-SDK rings (R20 family / R99).
 
 Dev-only tool; not part of the integration. It talks to the ring with plain
 ``bleak`` from this workstation, speaking the frame format implemented in
@@ -42,10 +43,11 @@ import json
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from bleak import BleakClient
 
@@ -272,7 +274,7 @@ class FrameBus:
         self.waiters.append(entry)
         try:
             return await asyncio.wait_for(future, timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             return None
         finally:
             self.waiters.remove(entry)
@@ -290,7 +292,8 @@ async def wait(capture: Capture, seconds: float, why: str = "") -> None:
 async def init_burst(
     client: BleakClient, link: Link, bus: FrameBus, capture: Capture
 ) -> bool:
-    """Send the companion-app init sequence; re-send once on total refusal.
+    """
+    Send the companion-app init sequence; re-send once on total refusal.
 
     Returns True if the burst was accepted. A 0xFC is a per-command refusal
     (variants decline the opcodes they lack), so anything answered counts
@@ -348,7 +351,8 @@ async def drain(
     parse: Callable[[bytes, int], list],
     seconds: int,
 ) -> int:
-    """Drain one history stream with HWM-conditional ACKs.
+    """
+    Drain one history stream with HWM-conditional ACKs.
 
     Mirrors the sync policy of the reference implementation: a block is ACKed
     (advancing the firmware's stream) only when it carries records newer than
@@ -381,9 +385,7 @@ async def drain(
             f" {len(rows)} records ({len(fresh)} new)"
         )
         for row in fresh[:5]:
-            stamp = datetime.fromtimestamp(
-                row.timestamp_ms / 1000, tz=timezone.utc
-            ).astimezone()
+            stamp = datetime.fromtimestamp(row.timestamp_ms / 1000, tz=UTC).astimezone()
             print(f"       {stamp:%Y-%m-%d %H:%M} {row}")
         if not fresh:
             print("  .. block carried nothing new; stopping ACK (stream parks)")
@@ -434,11 +436,11 @@ def report(capture: Capture) -> None:
     print("=" * 60)
     counts: Counter[int | None] = Counter(f.opcode for f in capture.frames)
     total = len(capture.frames)
-    crc_bad = sum(
-        1 for f in capture.frames if f.opcode is not None and not f.crc_valid
-    )
+    crc_bad = sum(1 for f in capture.frames if f.opcode is not None and not f.crc_valid)
     print(f"frames: {total}  undecodable: {counts[None]}  crc-mismatched: {crc_bad}")
-    print(f"0xFC rejections: {capture.rejections}  0x2A37 HRS samples: {capture.hrs_beats}")
+    print(
+        f"0xFC rejections: {capture.rejections}  0x2A37 HRS samples: {capture.hrs_beats}"
+    )
     if capture.refused:
         refused_text = ", ".join(
             f"0x{o:04X} {opcode_name(o)}" for o in sorted(capture.refused)

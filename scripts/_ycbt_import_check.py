@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Dev-only: import-check ycbt_api without a full Home Assistant install.
+"""
+Dev-only: import-check ycbt_api without a full Home Assistant install.
 
 Only stubs the single HA symbol the module imports at load time
 (``homeassistant.helpers.storage.Store``); everything else in the import
@@ -16,6 +17,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
+
 
 class _AutoMeta(type):
     """Metaclass so dummy classes tolerate any attribute access / subclassing."""
@@ -37,7 +39,7 @@ def _make(name):
     )
 
 
-class _StubLoader(importlib.abc.Loader):  # noqa: D101 - stub
+class _StubLoader(importlib.abc.Loader):
     def create_module(self, spec):
         mod = types.ModuleType(spec.name)
         mod.__path__ = []  # make it a package so submodules resolve here too
@@ -49,7 +51,7 @@ class _StubLoader(importlib.abc.Loader):  # noqa: D101 - stub
         return None
 
 
-class _StubFinder(importlib.abc.MetaPathFinder):  # noqa: D101 - stub
+class _StubFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         root = fullname.split(".", 1)[0]
         if root not in ("homeassistant", "bleak_retry_connector"):
@@ -60,7 +62,7 @@ class _StubFinder(importlib.abc.MetaPathFinder):  # noqa: D101 - stub
 sys.meta_path.insert(0, _StubFinder())
 
 
-class Store:  # noqa: D101 - stub with the attributes this check inspects
+class Store:
     def __init__(self, hass, version, key, **kwargs):
         self.hass = hass
         self.version = version

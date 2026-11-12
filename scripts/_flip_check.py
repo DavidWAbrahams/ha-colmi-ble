@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline sanity checks for StreamGestureDetector (temporary, dev-only).
+"""
+Offline sanity checks for StreamGestureDetector (temporary, dev-only).
 
 Run: python scripts/_flip_check.py
 
@@ -31,7 +32,8 @@ if str(REPO_ROOT) not in sys.path:  # pragma: no cover - script bootstrap
 
 
 def _bootstrap_package(name: str, path: Path) -> types.ModuleType:
-    """Register *name* as a package without executing its ``__init__``.
+    """
+    Register *name* as a package without executing its ``__init__``.
 
     Same trick as ``scripts/_motion_replay.py``: the integration's ``__init__``
     imports ``homeassistant``, which a plain dev checkout does not have, while
@@ -88,8 +90,7 @@ def held(pose: AccelSample, seconds: float, rate: float) -> list[AccelSample]:
 def waving(seconds: float, rate: float) -> list[AccelSample]:
     """``seconds`` of shaking: alternating vectors that never settle down."""
     return [
-        WAVE_A if index % 2 == 0 else WAVE_B
-        for index in range(round(seconds * rate))
+        WAVE_A if index % 2 == 0 else WAVE_B for index in range(round(seconds * rate))
     ]
 
 
@@ -108,9 +109,7 @@ def stream(
     return fired
 
 
-def times_of(
-    fired: list[tuple[GestureEvent, float]], gesture: str
-) -> list[float]:
+def times_of(fired: list[tuple[GestureEvent, float]], gesture: str) -> list[float]:
     return [now for event, now in fired if event.gesture == gesture]
 
 

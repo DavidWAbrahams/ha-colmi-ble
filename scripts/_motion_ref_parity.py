@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check our motion codec against the known-good reference web app.
+"""
+Check our motion codec against the known-good reference web app.
 
 The reference is ``mrfloydst/smartringmidi`` ``bluetooth.html`` (a Web MIDI demo
 that turns a Colmi R02 into a MIDI controller), whose axis bit-shifting is
@@ -47,7 +48,8 @@ if str(REPO_ROOT) not in sys.path:  # pragma: no cover - script bootstrap
 
 
 def _bootstrap_package(name: str, path: Path) -> types.ModuleType:
-    """Register *name* as a package without executing its ``__init__``.
+    """
+    Register *name* as a package without executing its ``__init__``.
 
     Same trick as :mod:`scripts._motion_replay`: the real integration
     ``__init__.py`` imports ``homeassistant``, which a plain dev checkout does
@@ -125,9 +127,7 @@ def check_framing(rep: Reporter, rng: random.Random) -> None:
 
 def js_command(hex_string: str) -> bytes:
     """What the demo writes for ``<button data-v="A10404">``, as 16 bytes."""
-    data = [
-        int(hex_string[i : i + 2], 16) for i in range(0, len(hex_string), 2)
-    ]
+    data = [int(hex_string[i : i + 2], 16) for i in range(0, len(hex_string), 2)]
     out = [0] * 16
     for i, byte in enumerate(data):
         out[i] = byte & 0xFF
@@ -139,9 +139,9 @@ def js_decode(value: list[int]) -> tuple[float, float, float] | None:
     """The notification handler's body: ``(Ax, Ay, Az)`` in g, or ``None``."""
     if value[1] != 3:
         return None
-    raw_y = js_int12((((value[2] << 4) | (value[3] & 0xF)) & 0xFFF))
-    raw_z = js_int12((((value[4] << 4) | (value[5] & 0xF)) & 0xFFF))
-    raw_x = js_int12((((value[6] << 4) | (value[7] & 0xF)) & 0xFFF))
+    raw_y = js_int12(((value[2] << 4) | (value[3] & 0xF)) & 0xFFF)
+    raw_z = js_int12(((value[4] << 4) | (value[5] & 0xF)) & 0xFFF)
+    raw_x = js_int12(((value[6] << 4) | (value[7] & 0xF)) & 0xFFF)
     return (
         js_convert_raw_to_g(raw_x),
         js_convert_raw_to_g(raw_y),
@@ -253,7 +253,12 @@ def check_decode(rep: Reporter, fuzz: int) -> None:
         )
         theirs = js_decode(list(packet))
         ours = motion.parse_accel_packet(packet)
-        if ours is None or ours.x != theirs[0] or ours.y != theirs[1] or ours.z != theirs[2]:
+        if (
+            ours is None
+            or ours.x != theirs[0]
+            or ours.y != theirs[1]
+            or ours.z != theirs[2]
+        ):
             mismatches += 1
             print(f"     mismatch on {packet[:8].hex()}: ours={ours} ref={theirs}")
             break
@@ -277,7 +282,7 @@ def check_guards(rep: Reporter) -> None:
 
 def show_reference_angles(rep: Reporter, rest_up_axis: tuple[int, int, int]) -> None:
     """Print what the demo *displays*, to make the difference from raw g concrete."""
-    print("\n== what the reference shows as \"Rotational data\" ==")
+    print('\n== what the reference shows as "Rotational data" ==')
     print("     (angles scaled to 0..127 MIDI CC, NOT raw acceleration)")
     print(f"     {'raw Y/Z/X':>22} | {'g (x, y, z)':>26} | |g| | CC (X, Y, Z)")
     for axes in (rest_up_axis, (0, 1024, 0), (-2048, 0, 0), (1450, 1450, 0)):
@@ -285,7 +290,7 @@ def show_reference_angles(rep: Reporter, rest_up_axis: tuple[int, int, int]) -> 
         sample = motion.parse_accel_packet(position_packet(raw_y, raw_z, raw_x))
         assert sample is not None
         print(
-            f"     {str(axes):>22} | "
+            f"     {axes!s:>22} | "
             f"({sample.x:+.3f}, {sample.y:+.3f}, {sample.z:+.3f})"
             f" | {sample.magnitude_g:4.2f} | {js_rotate_cc(sample)}",
         )
@@ -332,7 +337,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     if rep.failures:
-        print(f"{rep.failures} mismatch(es) against the reference - do not ship this decode.")
+        print(
+            f"{rep.failures} mismatch(es) against the reference - do not ship this decode."
+        )
         return 1
     print("Full parity with the reference app for everything it defines.")
     print(

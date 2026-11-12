@@ -1,4 +1,5 @@
-"""Build and parse YCBT wire frames (R20 protocol family).
+"""
+Build and parse YCBT wire frames (R20 protocol family).
 
 The wire format and its magic prefixes were discovered via HCI snoop of
 the official companion app; deviating from them makes the firmware
@@ -15,9 +16,12 @@ with ``len = payload + 6``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from typing import TYPE_CHECKING
 
 from . import constants as yc
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,8 @@ def crc16(data: bytes) -> int:
 
 
 def decode(data: bytes) -> YcbtPacket | None:
-    """Parse an inbound frame from a notification; ``None`` if malformed.
+    """
+    Parse an inbound frame from a notification; ``None`` if malformed.
 
     Deliberately does *not* verify the CRC: some firmwares push frames whose
     CRC we have not reproduced, and the Java reference decodes unverified too.
@@ -89,7 +94,8 @@ def is_rejection(packet: YcbtPacket) -> bool:
 
 
 def setting_time(now: datetime) -> YcbtPacket:
-    """Set the ring clock. ``now`` must be a wall-clock LOCAL time.
+    """
+    Set the ring clock. ``now`` must be a wall-clock LOCAL time.
 
     Payload: ``[year_lo, year_hi, month, day, h, m, s, dow]`` with
     day-of-week Mon=0..Sun=6 (matches ``TimeUtil.makeBleTime`` in the
@@ -114,7 +120,8 @@ def setting_time(now: datetime) -> YcbtPacket:
 
 
 def _monitor(opcode: int, minutes: int, *, on: bool = True) -> YcbtPacket:
-    """One background-monitor command: payload ``[enable, interval]``.
+    """
+    One background-monitor command: payload ``[enable, interval]``.
 
     The Setting-group monitors (heart rate ``0x010C``, blood pressure
     ``0x011C``, temperature ``0x0120``, blood oxygen ``0x0126``) all take
@@ -129,7 +136,8 @@ def _monitor(opcode: int, minutes: int, *, on: bool = True) -> YcbtPacket:
 
 
 def set_monitor_interval(minutes: int, *, on: bool = True) -> YcbtPacket:
-    """Background heart-rate monitor toggle + sampling interval.
+    """
+    Background heart-rate monitor toggle + sampling interval.
 
     Older builds of this integration sent a lone minute byte here, which
     the ring ACKed (every Setting command gets a generic 1-byte status)
@@ -140,7 +148,8 @@ def set_monitor_interval(minutes: int, *, on: bool = True) -> YcbtPacket:
 
 
 def set_blood_pressure_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
-    """Background blood-pressure monitor toggle + interval.
+    """
+    Background blood-pressure monitor toggle + interval.
 
     The OEM app drives this monitor alongside the heart-rate one; sending
     it keeps BP records on the same schedule we control.
@@ -149,7 +158,8 @@ def set_blood_pressure_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
 
 
 def set_temperature_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
-    """Background skin-temperature monitor toggle + interval.
+    """
+    Background skin-temperature monitor toggle + interval.
 
     Without this write the ring never samples temperature between syncs,
     which is why the skin-temperature history was sparse.
@@ -163,7 +173,8 @@ def set_blood_oxygen_monitor(minutes: int, *, on: bool = True) -> YcbtPacket:
 
 
 def set_user_bind(bind: int = 0x01) -> YcbtPacket:
-    """Write the SDK's user-bind ("pairing state") frame ``0x0109``.
+    """
+    Write the SDK's user-bind ("pairing state") frame ``0x0109``.
 
     The companion app sends this on every connect, and the SDK treats it
     as declaring the link bound. Field rings have shown the single-byte
@@ -175,7 +186,8 @@ def set_user_bind(bind: int = 0x01) -> YcbtPacket:
 
 
 def enable_health_sensors(on: bool = True) -> YcbtPacket:
-    """Enable the PPG / health-sensor hardware.
+    """
+    Enable the PPG / health-sensor hardware.
 
     Must precede any measurement: without it the firmware silently accepts
     start commands but never fires the PPG LEDs.
@@ -208,7 +220,8 @@ def get_real_blood_oxygen() -> YcbtPacket:
 
 
 def start_measurement(type_name: str, start: bool = True) -> YcbtPacket:
-    """Start/stop a manual measurement session (PPG warmup ~10-20 s).
+    """
+    Start/stop a manual measurement session (PPG warmup ~10-20 s).
 
     ``type_name`` is a key of :data:`.constants.MEASURE_TYPES`. Payload is
     exactly ``[action, type]`` - verified by HCI snoop of the companion
@@ -219,8 +232,10 @@ def start_measurement(type_name: str, start: bool = True) -> YcbtPacket:
 
 
 def prime_sensors() -> YcbtPacket:
-    """Pre-measurement sensor-mode toggle (0x030C ``[0x01, 0x01]``) observed
-    in the companion app immediately before a start command."""
+    """
+    Pre-measurement sensor-mode toggle (0x030C ``[0x01, 0x01]``) observed
+    in the companion app immediately before a start command.
+    """
     return YcbtPacket(yc.APP_PRIME_SENSORS, bytes([0x01, 0x01]))
 
 
@@ -230,7 +245,8 @@ def health_history(request_opcode: int) -> YcbtPacket:
 
 
 def history_ack(stream_data_type: int, block_len: int) -> YcbtPacket:
-    """ACK one received history block; firmware streams the next chunk.
+    """
+    ACK one received history block; firmware streams the next chunk.
 
     Payload: ``[stream_hi, stream_lo, block_len_lo, block_len_hi]``.
     """

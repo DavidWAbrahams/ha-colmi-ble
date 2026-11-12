@@ -57,7 +57,8 @@ async def async_migrate_entry(
     hass: HomeAssistant,
     entry: ColmiRingConfigEntry,
 ) -> bool:
-    """Migrate an old config entry to the current version.
+    """
+    Migrate an old config entry to the current version.
 
     Version 2 renamed the clap gesture to wave, including the persisted
     auto-off option key; move the stored value so the user's setting
@@ -179,9 +180,7 @@ async def async_setup_entry(
         if getattr(service_info, "address", "").upper() == ring_address_upper:
             coordinator.async_note_ring_seen()
 
-    entry.async_on_unload(
-        async_register_callback(hass, _async_ring_advertised)
-    )
+    entry.async_on_unload(async_register_callback(hass, _async_ring_advertised))
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
     # is a Colmi command): YCBT rings have no equivalent, so the family gate
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
@@ -203,8 +202,8 @@ async def async_setup_entry(
     )
 
     # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
-    # TODO: When code is stable, this could become coordinator.async_refresh() which ignores errors
-    # from the first refresh.
+    # TODO: When code is stable, this could become coordinator.async_refresh()
+    # which ignores errors from the first refresh.
     await coordinator.async_config_entry_first_refresh()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -237,7 +236,8 @@ async def async_reload_entry(
     hass: HomeAssistant,
     entry: ColmiRingConfigEntry,
 ) -> None:
-    """Reload config entry.
+    """
+    Reload config entry.
 
     Must NOT manually unload-then-setup: that runs async_setup_entry while
     the entry state is NOT_LOADED, so the coordinator's

@@ -1,4 +1,5 @@
-"""Owns the ring's two long-lived sessions and publishes what they report.
+"""
+Owns the ring's two long-lived sessions and publishes what they report.
 
 The manager is the only place that knows a session is open, which matters
 because the ring serves a single central: while the RAW motion stream holds the
@@ -33,37 +34,36 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
-from .api import WaveSession, ColmiRingApiClient, MotionSession
 from .colmi_codec.motion import (
     AccelSample,
     parse_accel_packet,
     parse_gesture_packet,
 )
 from .const import (
-    WAVE_BUSY_MESSAGE,
-    WAVE_REPORT_COOLDOWN_S,
     CONF_GESTURE_HOLD_CHOP_S,
     CONF_GESTURE_HOLD_FLIP_S,
     CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
-    CONF_VERTICAL_FLAT_DEG,
-    CONF_VERTICAL_UPRIGHT_DEG,
-    CONF_WAVE_TIMEOUT,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
+    CONF_VERTICAL_FLAT_DEG,
+    CONF_VERTICAL_UPRIGHT_DEG,
+    CONF_WAVE_TIMEOUT,
     DEFAULT_GESTURE_HOLD_CHOP_S,
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
+    DEFAULT_MOTION_SENSOR_UPDATE_S,
+    DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
-    DEFAULT_MOTION_SENSOR_UPDATE_S,
-    DEFAULT_MOTION_STREAM_TIMEOUT,
     GESTURE_EVENT_TYPE,
     LOGGER,
     STREAM_BUSY_MESSAGE,
+    WAVE_BUSY_MESSAGE,
+    WAVE_REPORT_COOLDOWN_S,
     resolve_vertical_anchors,
 )
 from .gestures import (
@@ -79,6 +79,7 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
+    from .api import ColmiRingApiClient, MotionSession, WaveSession
     from .coordinator import ColmiRingDataUpdateCoordinator
     from .data import ColmiRingConfigEntry
 
@@ -180,15 +181,11 @@ class MotionManager:
             self._option_seconds(
                 CONF_GESTURE_HOLD_STILL_S, DEFAULT_GESTURE_HOLD_STILL_S
             ),
-            self._option_seconds(
-                CONF_GESTURE_HOLD_FLIP_S, DEFAULT_GESTURE_HOLD_FLIP_S
-            ),
+            self._option_seconds(CONF_GESTURE_HOLD_FLIP_S, DEFAULT_GESTURE_HOLD_FLIP_S),
             self._option_seconds(
                 CONF_GESTURE_HOLD_RAISED_S, DEFAULT_GESTURE_HOLD_RAISED_S
             ),
-            self._option_seconds(
-                CONF_GESTURE_HOLD_CHOP_S, DEFAULT_GESTURE_HOLD_CHOP_S
-            ),
+            self._option_seconds(CONF_GESTURE_HOLD_CHOP_S, DEFAULT_GESTURE_HOLD_CHOP_S),
         )
 
     def _option_seconds(self, key: str, fallback: float) -> float:
@@ -201,7 +198,8 @@ class MotionManager:
         return value if value > 0 else float(fallback)
 
     def _sensor_update_interval(self) -> float:
-        """Seconds between accelerometer sensor updates; 0 means every sample.
+        """
+        Seconds between accelerometer sensor updates; 0 means every sample.
 
         The stream rate is a firmware property, so the useful throttle is too:
         stock firmware reports at 1 Hz and cannot be throttled below that, while
@@ -237,7 +235,8 @@ class MotionManager:
         return value if value > 0 else 0.0
 
     def _vertical_anchors(self) -> tuple[float, float]:
-        """Raw elevations the angle sensor should treat as flat and vertical.
+        """
+        Raw elevations the angle sensor should treat as flat and vertical.
 
         Read once at construction: changing either option reloads the entry (see
         ``async_reload_entry``), which rebuilds the manager, so the tracker never
@@ -264,7 +263,8 @@ class MotionManager:
             self._event_listeners.remove(listener)
 
     def add_sample_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
-        """Learn that a new accelerometer sample is ready to be read.
+        """
+        Learn that a new accelerometer sample is ready to be read.
 
         The listener takes no arguments and reads :attr:`last_sample` itself, so
         the same callback also works when the sample goes away with the stream.
@@ -282,7 +282,9 @@ class MotionManager:
         if listener in self._sample_listeners:
             self._sample_listeners.remove(listener)
 
-    def add_state_listener(self, listener: Callable[[bool], None]) -> Callable[[], None]:
+    def add_state_listener(
+        self, listener: Callable[[bool], None]
+    ) -> Callable[[], None]:
         """Learn when the stream actually turns on or off (for the switch)."""
         self._state_listeners.append(listener)
         return lambda: self._remove_state_listener(listener)
@@ -305,7 +307,8 @@ class MotionManager:
     # -- start / stop -------------------------------------------------------
 
     async def async_start(self) -> None:
-        """Open the stream. Safe to call when it is already running.
+        """
+        Open the stream. Safe to call when it is already running.
 
         Raises :class:`HomeAssistantError` while wave detection is on. This is a
         firmware mode conflict, not a link conflict: RAW mode takes over the
@@ -408,7 +411,8 @@ class MotionManager:
     # -- wave detection -----------------------------------------------------
 
     async def async_start_waves(self) -> None:
-        """Hold a shared lease so the ring's own wave detector can reach us.
+        """
+        Hold a shared lease so the ring's own wave detector can reach us.
 
         Unlike the stream this coexists with polling and the ring's buttons:
         wave reports arrive as notifications, and the occasional command only
@@ -524,9 +528,7 @@ class MotionManager:
             session.request_stop("user")
             return
         self._session = session
-        LOGGER.info(
-            "Colmi ring motion stream open; waiting for accelerometer data"
-        )
+        LOGGER.info("Colmi ring motion stream open; waiting for accelerometer data")
         self._detector.reset()
         self._angle.reset()
         self._unknown_kinds.clear()
@@ -548,7 +550,8 @@ class MotionManager:
         self._schedule_wave_auto_off()
 
     def _async_check_rate(self, _now: Any) -> None:
-        """Report once per session what the stream actually looks like.
+        """
+        Report once per session what the stream actually looks like.
 
         This is the only place the measured sample rate reaches the log, and the
         natural place to sanity-check the decode: an accelerometer at rest reads
@@ -590,7 +593,8 @@ class MotionManager:
             )
 
     def _on_packet(self, packet: bytearray) -> None:
-        """Feed one notification from the stream into the detector.
+        """
+        Feed one notification from the stream into the detector.
 
         A wave is not reported from here. Waves come from the ring's own
         detector, via the Wave Detection switch, which is a separate session
@@ -612,9 +616,7 @@ class MotionManager:
             self._log_unknown_packet(packet)
             return
         if self._log_samples and LOGGER.isEnabledFor(logging.DEBUG):
-            LOGGER.debug(
-                "colmi motion %.3f %.3f %.3f g", sample.x, sample.y, sample.z
-            )
+            LOGGER.debug("colmi motion %.3f %.3f %.3f g", sample.x, sample.y, sample.z)
         # The vertical angle tracker sees every sample, like the detector: its
         # low-pass needs the uninterrupted stream, while the published angle is
         # rate-limited with the sample itself. The detector gets the current
@@ -628,7 +630,8 @@ class MotionManager:
             self._publish(event)
 
     def _log_unknown_packet(self, packet: bytearray) -> None:
-        """Name each kind of genuinely surprising undecodable frame once.
+        """
+        Name each kind of genuinely surprising undecodable frame once.
 
         A ring that answers the RAW command but never yields a decodable sample
         is the failure that looks like a silent ring: the session stays open, the
@@ -663,7 +666,8 @@ class MotionManager:
         return f" (received {kinds} instead)"
 
     def _publish_sample(self, sample: AccelSample) -> None:
-        """Hand the newest sample to the sensors, no faster than the option says.
+        """
+        Hand the newest sample to the sensors, no faster than the option says.
 
         The detector still sees every sample; only the published state is
         rate-limited, because a state change per sample writes a recorder row per
@@ -691,7 +695,8 @@ class MotionManager:
                 LOGGER.exception("Colmi ring sample listener raised")
 
     def _on_wave_packet(self, packet: bytearray) -> None:
-        """Publish one wave from the ring's own detector, deduplicated.
+        """
+        Publish one wave from the ring's own detector, deduplicated.
 
         Anything on the link that is not a gesture report is dropped silently:
         the session's own tally in ``api.py`` already counts and describes every
@@ -721,7 +726,8 @@ class MotionManager:
         )
 
     def _publish(self, event: GestureEvent) -> None:
-        """Announce a stream gesture, and restart the stream's auto-off timer.
+        """
+        Announce a stream gesture, and restart the stream's auto-off timer.
 
         The restart is what makes that option mean "turn off after N minutes of
         *no gestures*" rather than "N minutes of use". A wave deliberately does
@@ -780,7 +786,8 @@ class MotionManager:
             self._stream_timer = None
 
     def _schedule_wave_auto_off(self) -> None:
-        """Arm the wave listener's auto-off timer, once, when it opens.
+        """
+        Arm the wave listener's auto-off timer, once, when it opens.
 
         Never rearmed by a wave. That is the deliberate difference from the
         stream above: a listener restarted by every wave would let someone who
@@ -824,7 +831,8 @@ class MotionManager:
 
     @property
     def holds_link(self) -> bool:
-        """True while the RAW stream exclusively owns the ring's GATT link.
+        """
+        True while the RAW stream exclusively owns the ring's GATT link.
 
         This is what the coordinator and the ring's buttons are gated on. Wave
         detection no longer appears here: it shares the link, and its reports
@@ -883,7 +891,8 @@ class MotionManager:
                 LOGGER.exception("Colmi ring wave state listener raised")
 
     def _request_refresh(self) -> None:
-        """Kick the coordinator now that the ring is free again.
+        """
+        Kick the coordinator now that the ring is free again.
 
         Both call sites are synchronous, so the refresh coroutine has to be
         handed to the event loop instead of merely created (which would warn

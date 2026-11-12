@@ -27,5 +27,4 @@ def checksum(packet: bytearray) -> int:
 
     Add all the bytes together modulus 255
     """
-
     return sum(packet) & 255

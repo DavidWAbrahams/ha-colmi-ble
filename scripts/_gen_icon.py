@@ -1,4 +1,5 @@
-"""Generate the brand icon/logo for colmi_ring (a simple gold ring).
+"""
+Generate the brand icon/logo for colmi_ring (a simple gold ring).
 
 Run from the repo root: ``python scripts/_gen_icon.py``
 

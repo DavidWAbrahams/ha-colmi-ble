@@ -180,7 +180,8 @@ class ColmiRingSpo2Button(ColmiRingEntity, ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Greyed out while the stream owns the ring or a measurement runs.
+        """
+        Greyed out while the stream owns the ring or a measurement runs.
 
         The optical sensor lights different LEDs per reading type, so only one
         on-demand measurement can run at a time; a second press while one is
@@ -289,7 +290,8 @@ class ColmiRingHrvButton(ColmiRingEntity, ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Greyed out while the stream owns the ring or a measurement runs.
+        """
+        Greyed out while the stream owns the ring or a measurement runs.
 
         Also greyed out when the ring's capability reply says it has no HRV
         (seen on R02 firmware): pressing then only burns battery, lights the

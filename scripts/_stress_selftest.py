@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""_stress_selftest.py
+"""
+_stress_selftest.py
 
 Throwaway validation for colmi_codec.stress: feeds golden 0x37 bursts
 through StressLogParser and checks slot mapping, termination and empty

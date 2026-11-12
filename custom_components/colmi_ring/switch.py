@@ -1,4 +1,5 @@
-"""Switch platform for colmi_ring: the two things that hold the ring's link.
+"""
+Switch platform for colmi_ring: the two things that hold the ring's link.
 
 ``Motion Stream`` takes the ring's shared Bluetooth link for itself and streams
 raw accelerometer data, which is what makes gesture detection possible and is
@@ -52,7 +53,8 @@ async def async_setup_entry(
     entry: ColmiRingConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the link-holding switches.
+    """
+    Set up the link-holding switches.
 
     Both switches are offered to every Colmi setup: neither needs an opt-in
     option, and each only costs battery while it is actually on. Yucheng rings
@@ -101,7 +103,7 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
         self.async_on_remove(self.coordinator.add_busy_listener(self._repaint))
 
     @callback
-    def _on_stream_state(self, streaming: bool) -> None:
+    def _on_stream_state(self, _streaming: bool) -> None:
         """The stream turned on or off (also how auto-off reaches the UI)."""
         self.async_write_ha_state()
 
@@ -113,7 +115,8 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Unavailable while a Read measurement owns the ring's sensor.
+        """
+        Unavailable while a Read measurement owns the ring's sensor.
 
         Starting the RAW stream mid-measurement would hijack the very sensor
         the measurement is reading, corrupting both; the greyed-out switch is
@@ -125,8 +128,9 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
             and self.coordinator.ring_busy is None
         )
 
-    async def async_turn_on(self, **kwargs: object) -> None:
-        """Start streaming.
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """
+        Start streaming.
 
         A failure to connect is not raised from here: the client reports an
         unopenable stream by returning, the manager then clears the flag, and
@@ -134,9 +138,7 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
         """
         motion = self._motion_manager()
         if motion is None:  # pragma: no cover - guarded by available
-            raise HomeAssistantError(
-                "Motion streaming is not enabled for this ring"
-            )
+            raise HomeAssistantError("Motion streaming is not enabled for this ring")
         if self.coordinator.ring_busy is not None:
             raise HomeAssistantError(
                 "Cannot start the motion stream: "
@@ -145,7 +147,7 @@ class ColmiRingMotionStreamSwitch(ColmiRingEntity, SwitchEntity):
         await motion.async_start()
         self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs: object) -> None:
+    async def async_turn_off(self, **_kwargs: object) -> None:
         """Stop streaming and let normal polling resume."""
         motion = self._motion_manager()
         if motion is None:  # pragma: no cover - guarded by available
@@ -183,7 +185,7 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
         self.async_on_remove(self._unsubscribe)
 
     @callback
-    def _on_wave_state(self, listening: bool) -> None:
+    def _on_wave_state(self, _listening: bool) -> None:
         """The listener turned on or off (also how auto-off reaches the UI)."""
         self.async_write_ha_state()
 
@@ -198,8 +200,9 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
         """Available whenever the manager exists and HA is connected to it."""
         return super().available and self._motion_manager() is not None
 
-    async def async_turn_on(self, **kwargs: object) -> None:
-        """Start listening for wave reports.
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """
+        Start listening for wave reports.
 
         Raises :class:`HomeAssistantError` if the motion stream is running: the
         ring serves one central, so the listener cannot have a link the stream
@@ -213,7 +216,7 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
         await motion.async_start_waves()
         self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs: object) -> None:
+    async def async_turn_off(self, **_kwargs: object) -> None:
         """Disarm the detector, give the link back and let polling resume."""
         motion = self._motion_manager()
         if motion is None:  # pragma: no cover - guarded by available

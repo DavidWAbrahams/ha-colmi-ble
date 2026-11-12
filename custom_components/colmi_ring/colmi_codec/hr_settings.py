@@ -6,14 +6,16 @@ An odd packet set up as it's either a query for the current settings or trying t
 I don't know what byte 1 in the response is.
 """
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 
 from .packet import make_packet
 
 CMD_HEART_RATE_LOG_SETTINGS = 22  # 0x16
 
-READ_HEART_RATE_LOG_SETTINGS_PACKET = make_packet(CMD_HEART_RATE_LOG_SETTINGS, bytearray(b"\x01"))
+READ_HEART_RATE_LOG_SETTINGS_PACKET = make_packet(
+    CMD_HEART_RATE_LOG_SETTINGS, bytearray(b"\x01")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,9 @@ def parse_heart_rate_log_settings(packet: bytearray) -> HeartRateLogSettings:
     elif raw_enabled == 2:
         enabled = False
     else:
-        logger.warning(f"Unexpected value in enabled byte {raw_enabled}, defaulting to false")
+        logger.warning(
+            f"Unexpected value in enabled byte {raw_enabled}, defaulting to false"
+        )
         enabled = False
 
     return HeartRateLogSettings(enabled=enabled, interval=packet[3])

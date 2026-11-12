@@ -1,12 +1,12 @@
 """This is called the DailyHeartRate in Java."""
 
-from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass
 import logging
 import struct
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-from .packet import make_packet
 from . import date_utils
+from .packet import make_packet
 
 CMD_READ_HEART_RATE = 21  # 0x15
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def read_heart_rate_packet(target: datetime) -> bytearray:
-    """target datetime should be at midnight for the day of interest"""
+    """Target datetime should be at midnight for the day of interest"""
     data = bytearray(struct.pack("<L", int(target.timestamp())))
 
     return make_packet(CMD_READ_HEART_RATE, data)
@@ -68,7 +68,7 @@ class HeartRateLogParser:
 
     def parse(self, packet: bytearray) -> HeartRateLog | NoData | None:
         r"""
-        first byte of packet should always be CMD_READ_HEART_RATE (21)
+        First byte of packet should always be CMD_READ_HEART_RATE (21)
         second byte is the sub_type
 
         sub_type 0 contains the lengths of things
@@ -76,7 +76,6 @@ class HeartRateLogParser:
 
         example: bytearray(b'\x15\x00\x18\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x002')
         """
-
         sub_type = packet[1]
         if sub_type == 255:
             logger.info("error response from heart rate log request")
@@ -99,32 +98,30 @@ class HeartRateLogParser:
             self.range = packet[3]
             self._raw_heart_rates = [-1] * (self.size * 13)
             return None
-        elif sub_type == 1:
+        if sub_type == 1:
             # next 4 bytes are a timestamp
             ts = struct.unpack_from("<l", packet, offset=2)[0]
-            self.timestamp = datetime.fromtimestamp(ts, timezone.utc)
+            self.timestamp = datetime.fromtimestamp(ts, UTC)
             # TODO timezone?
 
             # remaining 16 - type - subtype - 4 - crc = 9
             self._raw_heart_rates[0:9] = list(packet[6:-1])
             self.index += 9
             return None
-        else:
-            self._raw_heart_rates[self.index : self.index + 13] = list(packet[2:15])
-            self.index += 13
-            if sub_type == self.size - 1:
-                assert self.timestamp
-                result = HeartRateLog(
-                    heart_rates=self.heart_rates,
-                    timestamp=self.timestamp,
-                    size=self.size,
-                    range=self.range,
-                    index=self.index,
-                )
-                self.reset()
-                return result
-            else:
-                return None
+        self._raw_heart_rates[self.index : self.index + 13] = list(packet[2:15])
+        self.index += 13
+        if sub_type == self.size - 1:
+            assert self.timestamp
+            result = HeartRateLog(
+                heart_rates=self.heart_rates,
+                timestamp=self.timestamp,
+                size=self.size,
+                range=self.range,
+                index=self.index,
+            )
+            self.reset()
+            return result
+        return None
 
     @property
     def heart_rates(self) -> list[int]:
@@ -136,7 +133,6 @@ class HeartRateLogParser:
         and if there's bad values in time slots that shouldn't exist yet because those
         slots are in the future.
         """
-
         hr = self._raw_heart_rates.copy()
 
         if len(self._raw_heart_rates) > 288:
@@ -148,7 +144,7 @@ class HeartRateLogParser:
         # need a good reason why parsing should depend on the day
         # index might be good enough to indicate how much "valid" data we've gotten
         if self.is_today():
-            m = date_utils.minutes_so_far(datetime.now(tz=timezone.utc)) // 5
+            m = date_utils.minutes_so_far(datetime.now(tz=UTC)) // 5
             hr[m:] = [0] * len(hr[m:])
 
         return hr

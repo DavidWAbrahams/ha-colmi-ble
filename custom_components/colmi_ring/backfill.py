@@ -1,4 +1,5 @@
-"""Import ring-recorded history into the HA recorder.
+"""
+Import ring-recorded history into the HA recorder.
 
 The ring keeps logging heart rate (5-min slots) and activity (15-min bins)
 while it is out of Bluetooth range. HA cannot attach historical timestamps to
@@ -21,7 +22,7 @@ backfill is gated behind an experimental option (see plans/hr-backfill-plan.md).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.helpers import entity_registry as er
@@ -80,8 +81,8 @@ _REPAIR_WINDOW_S = 2 * 86400
 # is locked`` (SQLITE_BUSY) or ``database table is locked``, MariaDB reports a
 # deadlock, PostgreSQL a serialization failure. SQLAlchemy wraps the DB-API
 # error, so the text is matched across the whole exception chain instead of by
-# exception class: importing ``sqlalchemy.exc`` here would couple this module to
-# the recorder's engine at import time.
+# exception class: pulling in the SQLAlchemy engine module here would couple
+# this module to the recorder at import time.
 _DB_BUSY_MARKERS = (
     "database is locked",
     "database table is locked",
@@ -110,7 +111,8 @@ def _db_is_busy(err: BaseException) -> bool:
 def _cumulative_sport_series(
     bins: list[tuple[datetime, int, int, float]], index: int
 ) -> list[tuple[datetime, int]]:
-    """Convert per-bin activity data into a cumulative day-total time series.
+    """
+    Convert per-bin activity data into a cumulative day-total time series.
 
     Matches the live sensors' ``TOTAL_INCREASING`` day-total semantics (calories
     rounded to whole kcal like the live sensor). Bins that do not change the
@@ -249,8 +251,8 @@ class BackfillManager:
                     self._scanned.add(retry_day)
                     # Bound growth: only recent days can ever be re-asked.
                     cutoff = (
-                        datetime.now(tz=timezone.utc) - timedelta(days=8)
-                    ).date().isoformat()
+                        (datetime.now(tz=UTC) - timedelta(days=8)).date().isoformat()
+                    )
                     self._scanned = {d for d in self._scanned if d >= cutoff}
                     changed = True
             if changed:
@@ -264,7 +266,8 @@ class BackfillManager:
     async def async_needs_day(
         self, day: str, *, hr_enabled: bool, steps_enabled: bool
     ) -> bool:
-        """True until ``day``'s ring log has been fetched and imported once.
+        """
+        True until ``day``'s ring log has been fetched and imported once.
 
         The coordinator uses this to ask the API client for the previous
         UTC-day ring log: the ring keys its logs to UTC days, so a western
@@ -301,7 +304,8 @@ class BackfillManager:
         series: list[tuple[datetime, Any]],
         retry_day: str | None = None,
     ) -> tuple[bool, bool]:
-        """Import one sensor's backlog.
+        """
+        Import one sensor's backlog.
 
         Returns ``(imported, had_retry_day_rows)``: whether any rows were
         inserted, and whether the raw series carried rows for the freshly
@@ -398,7 +402,8 @@ class BackfillManager:
         entity_id: str,
         rows: list[tuple[datetime, datetime, str]],
     ) -> int:
-        """Bulk-insert ``states`` rows for one entity, in the recorder thread.
+        """
+        Bulk-insert ``states`` rows for one entity, in the recorder thread.
 
         Runs entirely inside the recorder's own executor with its own session,
         mirroring how the recorder commits states itself: resolve (or create)
@@ -406,12 +411,11 @@ class BackfillManager:
         state recorded before the backlog, then insert the imported rows in
         chronological order. Returns the number of rows inserted.
         """
-        from sqlalchemy import select, update  # noqa: PLC0415
-
         from homeassistant.components.recorder.db_schema import (  # noqa: PLC0415
             States,
             StatesMeta,
         )
+        from sqlalchemy import select, update  # noqa: PLC0415
 
         def _import() -> int:
             def _ts(value: datetime) -> float:
@@ -453,8 +457,7 @@ class BackfillManager:
                     # SQLite write lock, which is exactly what loses the race
                     # with the recorder's own writer.
                     repair_cutoff = _ts(
-                        datetime.now(tz=timezone.utc)
-                        - timedelta(seconds=_REPAIR_WINDOW_S)
+                        datetime.now(tz=UTC) - timedelta(seconds=_REPAIR_WINDOW_S)
                     )
                     session.execute(
                         update(States)
@@ -509,7 +512,7 @@ class BackfillManager:
             attempts_left -= 1
             try:
                 return await recorder.async_add_executor_job(_import)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 if not attempts_left or not _db_is_busy(err):
                     raise
                 await asyncio.sleep(
@@ -519,9 +522,5 @@ class BackfillManager:
     def _async_entity_id(self, kind: str) -> str | None:
         """Resolve the sensor entity id registered for one backfill kind."""
         suffix = _KIND_UNIQUE_SUFFIX[kind]
-        unique_id = (
-            self._entry_id if suffix is None else f"{self._entry_id}_{suffix}"
-        )
-        return er.async_get(self._hass).async_get_entity_id(
-            "sensor", DOMAIN, unique_id
-        )
+        unique_id = self._entry_id if suffix is None else f"{self._entry_id}_{suffix}"
+        return er.async_get(self._hass).async_get_entity_id("sensor", DOMAIN, unique_id)

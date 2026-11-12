@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Self-test for the pure YCBT codec (no BLE, no Home Assistant).
+"""
+Self-test for the pure YCBT codec (no BLE, no Home Assistant).
 
 Checks the codec against golden wire-format expectations captured via HCI
 snoop of the official companion app, plus round-trip and record-parser
@@ -9,7 +10,7 @@ smokes. Run: ``python scripts/_ycbt_codec_selftest.py``.
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -101,15 +102,14 @@ def check_time_payload() -> None:
 
 
 def check_records() -> None:
-    from datetime import timezone
 
     from colmi_codec.ycbt.constants import EPOCH_2000_UNIX_SECONDS
 
     tz = -8 * 3600  # America/Los_Angeles (PST) as a fixed offset
     # ts2k for a wall-clock 2026-11-01T15:00 (local-as-UTC), computed
     # independent of the host timezone.
-    utc_ref = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    wall = datetime(2026, 11, 1, 15, 0, 0, tzinfo=timezone.utc)
+    utc_ref = datetime(2000, 1, 1, tzinfo=UTC)
+    wall = datetime(2026, 11, 1, 15, 0, 0, tzinfo=UTC)
     ts2k_val = int((wall - utc_ref).total_seconds())
     assert ts2k_val == int(wall.timestamp()) - EPOCH_2000_UNIX_SECONDS
 

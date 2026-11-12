@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .packet import make_packet
 
@@ -42,7 +42,7 @@ class SportDetail:
             day=self.day,
             hour=self.time_index // 4,
             minute=self.time_index % 4 * 15,
-            tzinfo=timezone.utc,
+            tzinfo=UTC,
         )
 
 
@@ -110,9 +110,8 @@ class SportDetailParser:
             x = self.details
             self.reset()
             return x
-        else:
-            self.index += 1
-            return None
+        self.index += 1
+        return None
 
 
 def bcd_to_decimal(b: int) -> int:
