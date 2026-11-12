@@ -6,9 +6,7 @@ These can be distiguished because they use QRing as their phone app.
 It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
 It also supports gestures!
 
-There is also partial support for some clones that are sold interchangeably on AliExpress, i.e. the YCBT R20 and R99 which use "Smarthealth" app. I've been burned by sellers mislabeling their product and wanted something to work for you in that case.
-This does not include gesture support.
-Yucheng rings answer "not bound" while another central still holds their pairing: if pairing in Home Assistant fails with that message, remove the ring from every phone/PC Bluetooth paired-devices list (including the Smarthealth app's phone), power-cycle the ring, and retry. There is no factory reset on these rings; an OS-level "forget device" plus a power cycle is the reset.
+There is also partial support for some clones that are sold interchangeably on AliExpress, i.e. the Yucheng (YCBT) R20, R88, and R99 which use "Smarthealth" app. I've been burned by sellers mislabeling their product and wanted something to work for you in that case. They do not include gesture support.
 
 # How?
 
