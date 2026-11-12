@@ -20,8 +20,12 @@ Protocol specifics this client encodes (implemented in ``colmi_codec.ycbt``):
   newer than our per-stream high-water mark, which parks the backlog at our
   position without ever deleting from the ring (delete opcodes are never
   sent, so the OEM companion app keeps working).
-* Record timestamps are "local wall clock stored as UTC", so parsing needs
-  the host tz offset; the ring clock is therefore synced to *local* time.
+* Record timestamps are "local wall clock stored as UTC" (the ring clock is
+  synced to *local* time). All clock math - watermarks included - therefore
+  stays in that ring-clock domain, which is host-tz independent; records
+  are converted to real instants only at the point of use, using the host
+  zone's DST rules, so a transition cannot re-date old records or disturb
+  the dedup state.
 
 The dict returned by :meth:`YcbtRingApiClient.async_get_data` has exactly the
 keys of the Colmi client's. ``hr_settings`` is always ``None`` (the family has
@@ -41,6 +45,7 @@ from bleak import BleakClient
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .api import (
     POLL_LOCK_WAIT_S,
@@ -100,11 +105,18 @@ DRAIN_BLOCK_TIMEOUT_S = 12.0
 # Hard block cap per stream per poll, so a firmware that keeps replaying the
 # same block cannot spin a poll forever.
 DRAIN_MAX_BLOCKS = 400
-# A high-water mark further ahead than this is clock corruption (ring or
-# host), not the future: reset it so history can flow again.
+# A high-water mark further ahead of the *ring's* clock than this is clock
+# corruption (ring or host), not the future: reset it so history can flow
+# again. Watermarks live in the ring-clock domain (local wall clock read as
+# UTC, ms), so this compares ring clock against ring clock and no host DST
+# transition can fake a "future" watermark.
 HWM_FUTURE_SKEW_S = 5 * 60
 
-_HWM_STORE_VERSION = 1
+# v2: watermarks moved from real-unix-ms to the ring-clock domain (see
+# _async_drain); the key name changed with the version so the old-domain
+# file is simply never loaded (one full re-drain on upgrade; the recorder
+# backfill dedupes, so nothing double-imports).
+_HWM_STORE_VERSION = 2
 
 
 def _now_local() -> datetime:
@@ -112,13 +124,31 @@ def _now_local() -> datetime:
     return datetime.now().astimezone()
 
 
-def _tz_offset_sec() -> int:
-    offset = _now_local().utcoffset()
-    return int(offset.total_seconds()) if offset else 0
+def _ring_now_ms() -> int:
+    """The ring's clock *now*, in the ring's own ms domain."""
+    return int(_now_local().replace(tzinfo=UTC).timestamp() * 1000)
 
 
-def _ms_to_dt(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000, tz=UTC)
+def _ring_ms_to_dt(ring_ms: int) -> datetime:
+    """
+    Aware real instant for a stamp kept in the ring's clock domain.
+
+    Ring stamps are "local wall clock read as UTC" - DST-blind by
+    construction - so recovering the real instant means interpreting the
+    wall-clock fields with full DST rules, not subtracting the host's
+    present offset, which shifts every pre-transition record by the
+    transition amount. HA's default zone (a zoneinfo object derived from
+    the system zone, not astimezone()'s fixed-offset snapshot) picks the
+    offset that was in effect *then*; ambiguous fall-back times resolve to
+    the first (daylight) occurrence, matching how the ring's clock saw them.
+    """
+    wall = datetime.fromtimestamp(ring_ms / 1000, tz=UTC).replace(tzinfo=None)
+    return wall.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+
+
+def _hwm_is_future(hwm_ms: int) -> bool:
+    """True when a ring-domain watermark claims a >5-min ring-future time."""
+    return hwm_ms > _ring_now_ms() + HWM_FUTURE_SKEW_S * 1000
 
 
 def _median(samples: list[int]) -> int:
@@ -667,8 +697,9 @@ class YcbtRingApiClient:
         self._monitor_interval = clamp_ycbt_monitor_interval(monitor_interval_minutes)
         # Every session to this ring goes through here (one central).
         self._lock = asyncio.Lock()
-        # Per-history-stream high-water marks (unix ms), persisted so a
-        # restart does not re-download (and re-ACK-forward) old backlog.
+        # Per-history-stream high-water marks in the ring-clock domain
+        # (local wall clock read as UTC, ms), persisted so a restart does
+        # not re-download (and re-ACK-forward) old backlog.
         self._hwm: dict[str, int] = {}
         self._hwm_loaded = False
         # Last known skin temperature: {"skin_temperature": float,
@@ -683,7 +714,7 @@ class YcbtRingApiClient:
         self._store = Store(
             hass,
             _HWM_STORE_VERSION,
-            f"colmi_ring_ycbt_hwm_{ring_address.lower()}",
+            f"colmi_ring_ycbt_hwm2_{ring_address.lower()}",
         )
 
     def _connection(self, purpose: str, lock_wait_s: float) -> _YcbtConnection:
@@ -715,10 +746,9 @@ class YcbtRingApiClient:
             }
 
     def _hwm_for(self, stream_key: str) -> int:
-        """Stored watermark, reset if it claims a >5-min future timestamp."""
+        """Stored watermark, reset if it claims a >5-min ring-future time."""
         hwm = int(self._hwm.get(stream_key, 0))
-        future_limit_ms = int(time.time() * 1000) + HWM_FUTURE_SKEW_S * 1000
-        if hwm > future_limit_ms:
+        if _hwm_is_future(hwm):
             LOGGER.info(
                 "Yucheng ring %s %s watermark %s is in the future; resetting",
                 self._ring_address,
@@ -752,9 +782,16 @@ class YcbtRingApiClient:
         would advance the ring's cursor past data we may still want. Instead
         the first stale block stops the ACKs and the stream parks in place;
         nothing is ever deleted from the ring.
+
+        Records are parsed with a zero tz offset so their ``timestamp_ms``
+        (and every comparison below, including the persisted watermark)
+        stays in the ring-clock domain: those raw stamps are host-tz
+        invariant, so no DST transition can make an already-synced record
+        look new (re-ACKing and re-importing it) or push the watermark into
+        the future guard's crosshairs. Callers turn the returned rows'
+        stamps into real instants with ``_ring_ms_to_dt``.
         """
         stream = yc.STREAM_FOR_REQUEST[request_opcode]
-        tz = _tz_offset_sec()
         hwm = self._hwm_for(stream_key)
         fresh_rows: list[Any] = []
         parked = False
@@ -764,7 +801,7 @@ class YcbtRingApiClient:
             packet = await conn.get_reply(stream, timeout_s=DRAIN_BLOCK_TIMEOUT_S)
             if packet is None:
                 break
-            rows = parse(packet.payload, tz_offset_sec=tz)
+            rows = parse(packet.payload, tz_offset_sec=0)
             fresh = [r for r in rows if r.timestamp_ms > hwm]
             if not fresh:
                 # Fully-synced tail block: stop without ACKing.
@@ -849,7 +886,9 @@ class YcbtRingApiClient:
                 latest_temp = max(temp_rows, key=lambda record: record.timestamp_ms)
                 self._skin_reading = {
                     "skin_temperature": latest_temp.temperature,
-                    "skin_temperature_timestamp": _ms_to_dt(latest_temp.timestamp_ms),
+                    "skin_temperature_timestamp": _ring_ms_to_dt(
+                        latest_temp.timestamp_ms
+                    ),
                 }
 
             # HRV (ms, per the Yucheng SDK) rides in the same records, at
@@ -859,15 +898,15 @@ class YcbtRingApiClient:
                 latest_hrv = max(hrv_rows, key=lambda record: record.timestamp_ms)
                 self._hrv_reading = {
                     "hrv": latest_hrv.hrv,
-                    "hrv_timestamp": _ms_to_dt(latest_hrv.timestamp_ms),
+                    "hrv_timestamp": _ring_ms_to_dt(latest_hrv.timestamp_ms),
                 }
 
             by_ts: dict[datetime, int] = {}
             for record in all_fresh:
                 if record.hr:
-                    by_ts[_ms_to_dt(record.timestamp_ms)] = record.hr
+                    by_ts[_ring_ms_to_dt(record.timestamp_ms)] = record.hr
             for record in hr_fresh:
-                by_ts[_ms_to_dt(record.timestamp_ms)] = record.bpm
+                by_ts[_ring_ms_to_dt(record.timestamp_ms)] = record.bpm
             hr_entries = sorted(by_ts.items(), key=lambda row: row[0])
 
             today_entries = [
@@ -885,7 +924,7 @@ class YcbtRingApiClient:
             sport_bins = sorted(
                 (
                     (
-                        _ms_to_dt(record.start_time_ms),
+                        _ring_ms_to_dt(record.start_time_ms),
                         record.steps,
                         record.distance_meters,
                         float(record.calorie_kcal),
