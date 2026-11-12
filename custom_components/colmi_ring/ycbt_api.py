@@ -257,9 +257,13 @@ class _YcbtConnection:
         lock_wait_s: float = POLL_LOCK_WAIT_S,
         purpose: str = "poll",
         monitor_interval_minutes: int = DEFAULT_YCBT_MONITOR_INTERVAL,
+        on_seen: Callable[[], None] | None = None,
     ) -> None:
         self._hass = hass
         self._address = address
+        # Invoked on every inbound notification (see the Colmi client's
+        # _RingConnection for the contract); feeds last-seen tracking.
+        self._on_seen = on_seen
         self._lock = lock
         self._lock_wait_s = lock_wait_s
         self._purpose = purpose
@@ -456,9 +460,19 @@ class _YcbtConnection:
 
     # ------------------------------------------------------- dispatch
 
+    def _note_seen(self) -> None:
+        """Any inbound notification proves the ring is present."""
+        if self._on_seen is None:
+            return
+        try:
+            self._on_seen()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Yucheng ring on-seen callback raised")
+
     def _handle_hrs(
         self, _char: BleakGATTCharacteristic, data: bytearray
     ) -> None:
+        self._note_seen()
         LOGGER.debug(
             "Yucheng ring %s HRS raw: %s", self._address, bytes(data).hex()
         )
@@ -473,6 +487,7 @@ class _YcbtConnection:
     def _handle_notify(
         self, _char: BleakGATTCharacteristic, data: bytearray
     ) -> None:
+        self._note_seen()
         raw = bytes(data)
         packet = yc_pkt.decode(raw)
         if packet is None:
@@ -635,10 +650,17 @@ class YcbtRingApiClient:
         hass: HomeAssistant,
         ring_address: str,
         monitor_interval_minutes: int = DEFAULT_YCBT_MONITOR_INTERVAL,
+        on_seen: Callable[[], None] | None = None,
     ) -> None:
-        """Store the HA instance and ring address (no connection yet)."""
+        """Store the HA instance and ring address (no connection yet).
+
+        ``on_seen`` reaches every inbound notification of every connection
+        (see the Colmi client's _RingConnection for the contract); the setup
+        passes the coordinator's throttled last-seen tracker.
+        """
         self._hass = hass
         self._ring_address = ring_address
+        self._on_seen = on_seen
         # The number entity's current value, re-applied on every connect.
         self._monitor_interval = clamp_ycbt_monitor_interval(monitor_interval_minutes)
         # Every session to this ring goes through here (one central).
@@ -671,6 +693,7 @@ class YcbtRingApiClient:
             lock_wait_s=lock_wait_s,
             purpose=purpose,
             monitor_interval_minutes=self._monitor_interval,
+            on_seen=self._on_seen,
         )
 
     # ------------------------------------------------------- watermarks

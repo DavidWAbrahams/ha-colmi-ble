@@ -189,10 +189,21 @@ class _RingConnection:
     between the users of one long-lived link.
     """
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
-        """Store the resolved HA instance and the ring MAC address."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        on_seen: Callable[[], None] | None = None,
+    ) -> None:
+        """Store the resolved HA instance and the ring MAC address.
+
+        ``on_seen`` (if given) is invoked on every inbound GATT notification,
+        feeding the coordinator's last-seen tracker. Synchronous and cheap by
+        contract: it runs inside bleak's notification callback.
+        """
         self._hass = hass
         self._address = address
+        self._on_seen = on_seen
         # What the link is being used for right now, for log lines only; the
         # shared link restamps it as each user takes the transaction lock.
         self.purpose = "link"
@@ -389,6 +400,14 @@ class _RingConnection:
 
     def _handle_tx(self, _: BleakGATTCharacteristic, packet: bytearray) -> None:
         """Bleak notification callback: dispatch a 16-byte packet to its parser."""
+        if self._on_seen is not None:
+            # Any inbound notification is proof the ring is alive and in
+            # range, whether or not the packet itself is usable. The
+            # coordinator's throttle absorbs a stream's per-second flood.
+            try:
+                self._on_seen()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring on-seen callback raised")
         if len(packet) != 16:
             LOGGER.debug("Ignoring packet of unexpected length: %s", packet)
             return
@@ -724,9 +743,17 @@ class SharedLink:
     # lock held forever.
     _LOCK_POLL_S = 0.25
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        on_seen: Callable[[], None] | None = None,
+    ) -> None:
         self._hass = hass
         self._address = address
+        # Forwarded to every connection this link opens, so each inbound
+        # notification can feed the coordinator's last-seen tracker.
+        self._on_seen = on_seen
         self._conn: _RingConnection | None = None
         # Guards connect/disconnect/idle-disconnect so two callers never open
         # two links to a one-central ring.
@@ -754,7 +781,7 @@ class SharedLink:
                 await conn.close()
                 conn = None
             if conn is None:
-                conn = _RingConnection(self._hass, self._address)
+                conn = _RingConnection(self._hass, self._address, self._on_seen)
                 await conn.connect()
                 self._conn = conn
             conn.purpose = purpose
@@ -1061,15 +1088,25 @@ class _SessionKind(Generic[_SessionT]):
 class ColmiRingApiClient:
     """High level client for a Colmi ring, using HA-managed BLE connections."""
 
-    def __init__(self, hass: HomeAssistant, ring_address: str) -> None:
-        """Store the HA instance and ring address (no connection yet)."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        ring_address: str,
+        on_seen: Callable[[], None] | None = None,
+    ) -> None:
+        """Store the HA instance and ring address (no connection yet).
+
+        ``on_seen`` reaches every inbound notification (see
+        :class:`_RingConnection`); the setup passes the coordinator's
+        throttled last-seen tracker.
+        """
         self._hass = hass
         self._ring_address = ring_address
         # Every session to this ring goes through here. The firmware serves one
         # central, so this client keeps one shared connection and serialises
         # command exchanges on it (see :class:`SharedLink`); long-lived
         # sessions hold it as a lease instead of owning it outright.
-        self._link = SharedLink(hass, ring_address)
+        self._link = SharedLink(hass, ring_address, on_seen=on_seen)
         # Name of the on-demand measurement in progress, or None. The
         # optical sensor lights different LEDs per reading type, so the ring
         # cannot take two at once; refuse the second press immediately rather

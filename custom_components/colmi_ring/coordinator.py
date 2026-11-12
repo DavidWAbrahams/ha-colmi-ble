@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
@@ -36,12 +37,33 @@ if TYPE_CHECKING:
     from .data import ColmiRingConfigEntry
     from .motion_manager import MotionManager
 
+# Returned by _async_try_poll when the ring refused the poll because another
+# session holds its single link. Distinct from None (every attempt failed):
+# a busy refusal is not a connection fault and must not count towards the
+# consecutive-failure budget.
+_POLL_BUSY = object()
+
 
 # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
 class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
 
     config_entry: ColmiRingConfigEntry
+
+    # Communication failures inside one poll cycle: attempts and backoff.
+    # The link is opened on demand for each poll (see SharedLink), so a
+    # failure is usually transient: HA's scanner missed a few of the ring's
+    # ~1 s advertisements, or one GATT connect hiccup. Each of those clears
+    # within seconds, while the next scheduled poll is 5-30 minutes away -
+    # so re-failing straight to UpdateFailed would strand the entities as
+    # Unavailable for minutes over a glitch that lasts a second.
+    _POLL_ATTEMPTS = 3
+    _POLL_RETRY_BACKOFF_S = (2.0, 5.0)
+    # Whole failed poll cycles tolerated, on top of the in-cycle retries,
+    # before the entities are allowed to go Unavailable. This keeps a brief
+    # walk out of range invisible while a genuinely gone ring still reports
+    # as unavailable (rather than silently freezing) within a few intervals.
+    _TOLERATED_FAILED_CYCLES = 2
 
     def __init__(
         self, *args: Any, backfill: BackfillManager | None = None, **kwargs: Any
@@ -72,6 +94,54 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # is set (see ColmiRingEntity._watch_ring_busy).
         self.ring_busy: str | None = None
         self._busy_listeners: list[Callable[[str | None], None]] = []
+        # Consecutive poll cycles in which every attempt failed; see
+        # _TOLERATED_FAILED_CYCLES.
+        self._failed_cycles = 0
+        # Wall-clock UTC time of the most recent sign of life from the ring:
+        # an advertisement seen by HA's scanner, or any GATT notification we
+        # received. Pushed (not polled): see async_note_ring_seen.
+        self.last_seen: datetime | None = None
+        self._seen_listeners: list[Callable[[datetime], None]] = []
+
+    # Throttle for the seen signal: the timestamp is floored to whole
+    # seconds, so every advertisement/notification within the same second is
+    # a no-op. The ring advertises about once per second and a live stream
+    # notifies faster, so this bounds state writes (and thus recorder rows
+    # for the entity) to roughly one per second without any timer.
+    _SEEN_THROTTLE_S = 1.0
+
+    @callback
+    def async_note_ring_seen(self) -> None:
+        """Record that the ring was just heard from; push if the second moved.
+
+        Called from HA's bluetooth advertisement callback and from the GATT
+        notification handlers of both protocol clients. Cheap and idempotent
+        within one second: the floored timestamp doubles as the throttle, so
+        a burst of notifications re-notifies the listeners at most once per
+        second.
+        """
+        seen = datetime.now(tz=UTC).replace(microsecond=0)
+        if self.last_seen is not None and (
+            seen - self.last_seen < timedelta(seconds=self._SEEN_THROTTLE_S)
+        ):
+            return
+        self.last_seen = seen
+        for listener in list(self._seen_listeners):
+            try:
+                listener(seen)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring seen-listener failed")
+
+    def add_seen_listener(
+        self, listener: Callable[[datetime], None]
+    ) -> Callable[[], None]:
+        """Learn each (throttled) moment the ring is heard from; unsub returned."""
+        self._seen_listeners.append(listener)
+        return lambda: self._remove_seen_listener(listener)
+
+    def _remove_seen_listener(self, listener: Callable[[datetime], None]) -> None:
+        if listener in self._seen_listeners:
+            self._seen_listeners.remove(listener)
 
     def add_busy_listener(
         self, listener: Callable[[str | None], None]
@@ -160,6 +230,50 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             )
         return hr_enabled, steps_enabled, include_previous_day
 
+    async def _async_try_poll(self, *, include_previous_day: bool) -> Any:
+        """Poll once, retrying transient BLE failures inside this cycle.
+
+        Returns the data dict on success, ``_POLL_BUSY`` if the ring's single
+        link is held by another session, or ``None`` if every attempt failed
+        with a communication error (the caller decides how many failed cycles
+        to tolerate before reporting the device unavailable).
+
+        The retry lives here rather than in the client because only the
+        coordinator knows the cost of failing: the entities go Unavailable
+        for a whole poll interval, so anything recoverable in a few seconds
+        is worth retrying now instead of at the next scheduled refresh.
+        """
+        for attempt in range(self._POLL_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(
+                    self._POLL_RETRY_BACKOFF_S[
+                        min(attempt - 1, len(self._POLL_RETRY_BACKOFF_S) - 1)
+                    ]
+                )
+            try:
+                return await self.config_entry.runtime_data.client.async_get_data(
+                    include_previous_day=include_previous_day
+                )
+            except ColmiRingApiClientBusyError:
+                return _POLL_BUSY
+            except ColmiRingApiClientAuthenticationError as exception:
+                raise ConfigEntryAuthFailed(exception) from exception
+            except ColmiRingApiClientError as exception:
+                LOGGER.debug(
+                    "Colmi ring poll attempt %s/%s failed: %s",
+                    attempt + 1,
+                    self._POLL_ATTEMPTS,
+                    exception,
+                )
+            except Exception as exception:
+                # A bug, not radio noise: do not retry it, and keep the
+                # traceback in the log for diagnosis.
+                LOGGER.exception("Unexpected error updating Colmi ring")
+                raise UpdateFailed(exception) from exception
+        # Every attempt failed; the caller decides whether this cycle is the
+        # one that finally reports the device unavailable.
+        return None
+
     async def _async_update_data(self) -> Any:
         """Update data via library (merging persisted on-demand readings)."""
         if self.motion is not None and self.motion.holds_link:
@@ -175,13 +289,8 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         hr_enabled, steps_enabled, include_previous_day = (
             await self._async_backfill_flags()
         )
-        try:
-            data = (
-                await self.config_entry.runtime_data.client.async_get_data(
-                    include_previous_day=include_previous_day
-                )
-            )
-        except ColmiRingApiClientBusyError:
+        data = await self._async_try_poll(include_previous_day=include_previous_day)
+        if data is _POLL_BUSY:
             # The link was busy for longer than the poll's short wait: the
             # motion stream claimed it between the gate above and here
             # (toggling it on races a poll already in flight), or a wave
@@ -192,13 +301,29 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 "Colmi ring poll skipped: the ring is busy with another session"
             )
             return self.data
-        except ColmiRingApiClientAuthenticationError as exception:
-            raise ConfigEntryAuthFailed(exception) from exception
-        except ColmiRingApiClientError as exception:
-            raise UpdateFailed(exception) from exception
-        except Exception as exception:  # noqa: BLE001
-            LOGGER.exception("Unexpected error updating Colmi ring")
-            raise UpdateFailed(exception) from exception
+        if data is None:
+            # Every attempt in this cycle failed with a communication error.
+            # Tolerate a few consecutive failed cycles (the ring briefly out
+            # of range) before letting the entities go Unavailable, so a
+            # second-or-two of BLE noise does not blank minutes of history.
+            self._failed_cycles += 1
+            # No successful poll yet (first refresh during setup): keep the
+            # original behaviour of failing loudly so HA retries the config
+            # entry instead of setting it up with no data.
+            if self.data is None or self._failed_cycles > self._TOLERATED_FAILED_CYCLES:
+                msg = (
+                    "Colmi ring unreachable for"
+                    f" {self._failed_cycles} consecutive poll cycles"
+                )
+                raise UpdateFailed(msg)
+            LOGGER.debug(
+                "Colmi ring poll cycle failed (%s/%s tolerated before"
+                " reporting unavailable)",
+                self._failed_cycles,
+                self._TOLERATED_FAILED_CYCLES,
+            )
+            return self.data
+        self._failed_cycles = 0
         self._apply_spo2_reading(data)
         self._apply_live_heart_rate(data)
         self._apply_hrv_reading(data)

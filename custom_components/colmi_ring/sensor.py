@@ -29,6 +29,7 @@ from .entity import ColmiRingEntity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -223,6 +224,7 @@ async def async_setup_entry(
         )
         for entity_description in descriptions
     )
+    async_add_entities([ColmiRingLastSeenSensor(coordinator=coordinator)])
     # The accelerometer sensors only have data while the RAW stream is on, which
     # is up to the user to switch on. Yucheng rings have no motion manager at
     # all, so they are gated out.
@@ -313,6 +315,54 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
                 timestamp = self.coordinator.data.get("stress_timestamp")
                 self._attr_extra_state_attributes = {"timestamp": timestamp}
         super()._handle_coordinator_update()
+
+
+class ColmiRingLastSeenSensor(ColmiRingEntity, SensorEntity):
+    """When this ring was last heard from, to the second.
+
+    Pushed rather than polled: the coordinator notes every advertisement HA's
+    scanner sees and every GATT notification the clients receive, throttled to
+    one update per second (the timestamp is floored to whole seconds, so
+    repeats within a second are no-ops). Deliberately not tied to the
+    coordinator's data refresh: the ring is visible long between polls, and a
+    poll failure must not make the ring look unseen.
+
+    Disabled by default: even throttled, this entity can write a recorder row
+    every second whenever the ring is in range, which is far more history than
+    most users want to pay for. Enable it per-install if second-granular
+    presence history is wanted; its availability and recent value are useful
+    even while disabled, via the entity's diagnostics.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Name and unique-id the sensor (the seen signal comes in added)."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_last_seen"
+        self._attr_name = "Last Seen"
+
+    @callback
+    def _async_on_seen(self, _seen: datetime) -> None:
+        """The ring was just heard from; repaint now, not at the next poll."""
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the (throttled) seen signal once fully added."""
+        await super().async_added_to_hass()
+        # Subscribed here rather than in __init__: a seen event can fire from
+        # the bluetooth scanner at any moment, and writing state before the
+        # entity is registered would raise.
+        self.async_on_remove(
+            self.coordinator.add_seen_listener(self._async_on_seen)
+        )
+
+    @property
+    def native_value(self) -> datetime | None:
+        """The last (second-floored) time any traffic from the ring arrived."""
+        return self.coordinator.last_seen
 
 
 class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):

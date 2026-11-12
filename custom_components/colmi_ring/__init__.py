@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from homeassistant.components.bluetooth import async_register_callback
 from homeassistant.const import CONF_ADDRESS, Platform
+from homeassistant.core import callback
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
@@ -153,9 +155,33 @@ async def async_setup_entry(
             monitor_interval_minutes=clamp_ycbt_monitor_interval(
                 entry.options.get(CONF_YCBT_MONITOR_INTERVAL)
             ),
+            on_seen=coordinator.async_note_ring_seen,
         )
     else:
-        client = ColmiRingApiClient(hass=hass, ring_address=ring_address)
+        client = ColmiRingApiClient(
+            hass=hass,
+            ring_address=ring_address,
+            on_seen=coordinator.async_note_ring_seen,
+        )
+
+    # Passive presence: HA's bluetooth stack scans continuously (this
+    # integration's manifest registers matchers, which keeps active scanning
+    # on), so every advertisement from the ring lands here even while no GATT
+    # link is open. Together with the clients' on-seen notifications (inbound
+    # traffic during a link) this drives the last-seen sensor. The callback
+    # fires for every device HA sees, so it filters by address itself - the
+    # address-filtered registration variant is newer than the cores this
+    # integration supports.
+    ring_address_upper = ring_address.upper()
+
+    @callback
+    def _async_ring_advertised(service_info: object, _change: object) -> None:
+        if getattr(service_info, "address", "").upper() == ring_address_upper:
+            coordinator.async_note_ring_seen()
+
+    entry.async_on_unload(
+        async_register_callback(hass, _async_ring_advertised)
+    )
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
     # is a Colmi command): YCBT rings have no equivalent, so the family gate
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
