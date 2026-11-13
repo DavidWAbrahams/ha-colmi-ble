@@ -16,7 +16,6 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import callback
-from homeassistant.exceptions import InvalidMacFormat
 from homeassistant.helpers.device_registry import format_mac
 from homeassistant.loader import async_get_loaded_integration
 
@@ -186,7 +185,7 @@ async def async_setup_entry(
     # stored address is normalised the same way.
     try:
         ring_address_key = format_mac(ring_address).upper()
-    except InvalidMacFormat:
+    except ValueError:
         ring_address_key = ring_address.upper()
 
     @callback
