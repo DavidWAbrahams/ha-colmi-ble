@@ -132,20 +132,25 @@ def _latest_sample_is_zero(
     entries: list[tuple[int, datetime]],
     filled: int,
     interval_minutes: int,
+    range_minutes: int,
 ) -> bool:
     """
     True if the ring's newest *sample* read 0 bpm (off-finger evidence).
 
-    Slots between samples are also 0 ("no sample taken yet"), so a zero in the
-    newest slot only counts when the newest filled slot is clearly newer than
-    the newest non-zero sample. A *worn* ring can legitimately show a gap of
-    one logging interval plus one 5-min slot: the ring's log index advances
-    slot-by-slot (every 5 min) while samples land only once per interval, so
-    right after the index steps past a sample the newest filled slot sits
-    exactly interval + 5 minutes ahead. Only a gap *beyond* that means the
-    ring actually recorded a zero (and then kept advancing), i.e. it saw no
-    pulse. Requiring ``> interval + 5`` instead of ``>= interval`` fixes the
-    intermittent false "Away" seen at interval boundaries.
+    ``range_minutes`` is the log's slot grid: R02-class firmware logs on a
+    fixed 5-minute grid (samples sparser, zero slots between them), while
+    the R08 grids the day by its sampling interval (one slot per sample,
+    grid == interval). Slots between samples are also 0 ("no sample taken
+    yet"), so a zero in the newest slot only counts when the newest filled
+    slot is clearly newer than the newest non-zero sample. A *worn* ring can
+    legitimately show a gap of one logging interval plus one slot: the
+    ring's log index advances slot-by-slot while samples land only once per
+    interval, so right after the index steps past a sample the newest filled
+    slot sits exactly interval + range minutes ahead. Only a gap *beyond*
+    that means the ring actually recorded a zero (and then kept advancing),
+    i.e. it saw no pulse. Requiring ``> interval + range`` instead of
+    ``>= interval`` fixes the intermittent false "Away" seen at interval
+    boundaries.
     """
     if filled <= 0:
         return False
@@ -155,7 +160,9 @@ def _latest_sample_is_zero(
         return True
     newest_slot_ts = all_slots[filled - 1][1]
     latest_sample_ts = max(ts for _, ts in entries)
-    return newest_slot_ts - latest_sample_ts > timedelta(minutes=interval_minutes + 5)
+    return newest_slot_ts - latest_sample_ts > timedelta(
+        minutes=interval_minutes + range_minutes
+    )
 
 
 class ColmiRingApiClientError(Exception):
@@ -1348,8 +1355,9 @@ class ColmiRingApiClient:
                     date_utils.start_of_day(date_utils.now()).isoformat(),
                 )
             else:
-                # Heart rate is sampled at the ring's logging interval but logged
-                # in 5-min slots, so most slots are 0 and must be filtered out
+                # Heart rate is logged on the ring's own slot grid (5-min
+                # slots on R02-class firmware; the sampling interval itself
+                # on the R08), so many slots are 0 and must be filtered out
                 # before picking the latest.
                 all_slots = log.heart_rates_with_times()
                 entries = [r for r in all_slots if r[0] > 0]
@@ -1362,14 +1370,18 @@ class ColmiRingApiClient:
                 # of slots and the parser's is-today cleanup zeroes (but does
                 # not shrink) the future ones.
                 interval = settings.interval if settings else 15
-                # Slots started so far today (slot k covers minutes 5k..5k+4).
-                # minutes_so_far() is "minutes + 1", so subtract it back before
-                # dividing: otherwise the clamp can admit a not-yet-started
-                # slot, inflating the zero-evidence gap by a spurious 5 min.
-                slots_now = (date_utils.minutes_so_far(date_utils.now()) - 1) // 5 + 1
+                slot_range = log.range
+                # Slots started so far today (slot k covers minutes
+                # range*k..range*(k+1)-1). minutes_so_far() is "minutes + 1",
+                # so subtract it back before dividing: otherwise the clamp can
+                # admit a not-yet-started slot, inflating the zero-evidence
+                # gap by a spurious slot.
+                slots_now = (
+                    date_utils.minutes_so_far(date_utils.now()) - 1
+                ) // slot_range + 1
                 filled = min(max(log.index, 0), len(all_slots), slots_now)
                 hr_zero_reading = _latest_sample_is_zero(
-                    all_slots, entries, filled, interval
+                    all_slots, entries, filled, interval, slot_range
                 )
                 if not entries:
                     LOGGER.info(
