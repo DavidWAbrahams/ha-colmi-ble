@@ -41,12 +41,24 @@ debug_packet_probe:
     frames:
       name: Raw frames to send (hex)
       description: >-
-        Optional list of raw packets to write to the ring, each as plain hex
-        (spaces optional), sent in order at the start of the capture. The
-        ring's 16-byte protocol expects a checksum in byte 15; it is your
-        responsibility.
+        Optional list of raw packets to write to the ring's UART
+        characteristic, each as plain hex (spaces optional), sent in order at
+        the start of the capture. The ring's 16-byte protocol expects a
+        checksum in byte 15; it is your responsibility.
       required: false
       example: '["3B 02 01 05 00 00 00 00 00 00 00 00 00 00 00 43"]'
+      selector:
+        object:
+    writes:
+      name: Raw writes to any characteristic
+      description: >-
+        Optional list of "UUID = hex bytes" entries sent after frames, to
+        drive paths the UART codec does not know about (e.g. a Bluetooth HID
+        Control Point). The UUID may be a 4-digit Bluetooth SIG assigned
+        number or a full 128-bit UUID; the write style (with or without
+        response) is taken from the characteristic's advertised properties.
+      required: false
+      example: '["2a4c = 00", "2a4d = 01 02"]'
       selector:
         object:
     subscribe_all:

@@ -39,6 +39,7 @@ import time
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
+from bleak.exc import BleakError
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.exceptions import ServiceValidationError
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     from bleak.backends.characteristic import BleakGATTCharacteristic
     from homeassistant.core import HomeAssistant, ServiceCall
 
+    from .api import _RingConnection
     from .data import ColmiRingConfigEntry
 
 SERVICE_DEBUG_PACKET_PROBE = "debug_packet_probe"
@@ -69,6 +71,14 @@ _PROBES: dict[str, asyncio.Task[str]] = {}
 # accidental 15-minute probe over a 10 Hz stream cannot flood the log.
 _MAX_PACKET_LINES = 400
 
+# How many static descriptors to dump, and how many bytes of each. A Report
+# Map fits well inside these; a runaway descriptor must not spam the log.
+_MAX_READ_CHARS = 12
+_MAX_READ_BYTES = 300
+
+# How much of a raw write to echo into the log before truncating it.
+_MAX_WRITE_LOG_BYTES = 32
+
 SERVICE_SCHEMA = vol.Schema(
     {
         vol.Optional("entry_id"): str,
@@ -78,6 +88,10 @@ SERVICE_SCHEMA = vol.Schema(
         ),
         # Each frame is plain hex, e.g. "3b 02 01 00 ..." (spaces optional).
         vol.Optional("frames", default=list): [str],
+        # Raw writes to any characteristic: "UUID = hex bytes", where UUID may
+        # be a Bluetooth SIG 16-bit assigned number ("2a4c") or a full 128-bit
+        # UUID. Needed to drive paths the UART codec does not know about.
+        vol.Optional("writes", default=list): [str],
         vol.Optional("subscribe_all", default=True): bool,
     }
 )
@@ -135,6 +149,7 @@ async def _async_handle_service(hass: HomeAssistant, call: ServiceCall) -> None:
         )
     try:
         frames = _parse_frames(call.data["frames"])
+        writes = _parse_writes(call.data["writes"])
     except ValueError as err:
         raise ServiceValidationError(str(err)) from err
     _PROBES[entry_id] = hass.async_create_task(
@@ -142,6 +157,7 @@ async def _async_handle_service(hass: HomeAssistant, call: ServiceCall) -> None:
             entry,
             duration_s=float(call.data["duration_s"]),
             frames=frames,
+            writes=writes,
             subscribe_all=bool(call.data["subscribe_all"]),
         ),
         name=f"colmi_ring debug probe {entry_id}",
@@ -202,11 +218,86 @@ def _parse_frames(frames: list[str]) -> list[bytearray]:
     return parsed
 
 
+def _parse_writes(writes: list[str]) -> list[tuple[str, bytearray]]:
+    """
+    Parse ``"UUID = hex bytes"`` write requests.
+
+    A 4-digit UUID is a Bluetooth SIG assigned number and is expanded to the
+    standard base UUID, because typing the whole 128-bit form for ``2a4c`` is
+    the kind of friction that stops a probe from being run.
+    """
+    parsed: list[tuple[str, bytearray]] = []
+    for index, item in enumerate(writes):
+        uuid_part, _, hex_part = item.partition("=")
+        uuid = uuid_part.strip().lower()
+        if not uuid or not hex_part.strip():
+            raise ValueError(f"Write {index} needs 'UUID = hex bytes': {item!r}")
+        if len(uuid) == 4:
+            uuid = f"0000{uuid}-0000-1000-8000-00805f9b34fb"
+        cleaned = hex_part.replace(" ", "").replace(":", "").replace(",", "")
+        try:
+            raw = bytearray.fromhex(cleaned)
+        except ValueError as err:
+            raise ValueError(f"Write {index} is not hex: {item!r}") from err
+        if not 1 <= len(raw) <= 512:
+            raise ValueError(
+                f"Write {index} is {len(raw)} bytes (expected 1..512): {item!r}"
+            )
+        parsed.append((uuid, raw))
+    return parsed
+
+
+async def _send_writes(
+    conn: _RingConnection,
+    address: str,
+    writes: list[tuple[str, bytearray]],
+) -> None:
+    """Send each ``UUID = bytes`` write, logging it and tolerating refusals."""
+    for uuid, payload in writes:
+        shown = payload[:_MAX_WRITE_LOG_BYTES]
+        suffix = f" ... ({len(payload)} bytes)" if len(payload) > len(shown) else ""
+        LOGGER.warning(
+            "PROBE %s TX[%s] %s%s",
+            address,
+            uuid[:8],
+            shown.hex(" "),
+            suffix,
+        )
+        try:
+            await conn.debug_write(uuid, payload)
+        except (TimeoutError, BleakError, OSError) as err:
+            LOGGER.warning("PROBE %s TX[%s] failed: %s", address, uuid[:8], err)
+        await asyncio.sleep(0.2)
+
+
+async def _dump_readable_chars(conn: _RingConnection, address: str) -> None:
+    """
+    Log every readable characteristic's value.
+
+    Static descriptors answer questions traffic cannot: the Bluetooth HID
+    Report Map (``2a4b``) states how a ring's input reports are laid out,
+    and the HID Information (``2a4a``) whether it implements HID over GATT
+    at all - i.e. whether touch events can reach a BLE host. Reads are
+    capped so an unexpectedly huge descriptor cannot spam the log, and each
+    is guarded because some firmwares reject individual reads.
+    """
+    for uuid in conn.debug_readable_chars()[:_MAX_READ_CHARS]:
+        try:
+            value = await conn.debug_read(uuid)
+        except (TimeoutError, BleakError, OSError) as err:
+            LOGGER.warning("PROBE %s READ %s failed: %s", address, uuid, err)
+            continue
+        shown = value[:_MAX_READ_BYTES]
+        suffix = f" ... ({len(value)} bytes total)" if len(value) > len(shown) else ""
+        LOGGER.warning("PROBE %s READ %s = %s%s", address, uuid, shown.hex(" "), suffix)
+
+
 async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
     entry: ColmiRingConfigEntry,
     *,
     duration_s: float,
     frames: list[bytearray],
+    writes: list[tuple[str, bytearray]],
     subscribe_all: bool,
 ) -> str:
     address = str(entry.data[CONF_ADDRESS])
@@ -293,6 +384,7 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
                     )
                     for line in conn.debug_gatt_table():
                         LOGGER.warning("PROBE %s GATT %s", address, line)
+                    await _dump_readable_chars(conn, address)
                     if subscribe_all:
                         extra_uuids = await conn.debug_subscribe_extras(on_extra)
                         LOGGER.warning(
@@ -306,6 +398,7 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
                         LOGGER.warning("PROBE %s TX %s", address, frame.hex(" "))
                         await conn.debug_send(frame)
                         await asyncio.sleep(0.2)
+                    await _send_writes(conn, address, writes)
                     # End early if the ring drops the link; the probe is
                     # worthless once there is nothing to capture from.
                     sleeper = asyncio.ensure_future(asyncio.sleep(duration_s))

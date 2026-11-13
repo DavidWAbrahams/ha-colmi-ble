@@ -463,6 +463,54 @@ class _RingConnection:
         """Send one raw caller-built frame (the probe supplies the checksum)."""
         await self._send(frame)
 
+    async def debug_write(self, uuid: str, data: bytearray) -> None:
+        """
+        Write one arbitrary characteristic by UUID, for the dev probe.
+
+        Two write styles exist in the wild and picking wrong is an instant
+        failure: the ring's UART RX characteristic is write-without-response,
+        while a Bluetooth HID Control Point (``2a4c``) is too, but other
+        characteristics insist on a response. Bleak does not reliably infer it
+        here, so the choice comes straight from the characteristic's own
+        advertised properties.
+        """
+        if self._client is None:
+            raise ColmiRingApiClientError("not connected")
+        char = self._client.services.get_characteristic(uuid)
+        if char is None:
+            raise ColmiRingApiClientError(f"no characteristic {uuid}")
+        props = set(char.properties)
+        if "write-without-response" in props:
+            response = False
+        elif "write" in props:
+            response = True
+        else:
+            raise ColmiRingApiClientError(f"{uuid} is not writable ({char.properties})")
+        await self._client.write_gatt_char(char, data, response=response)
+
+    async def debug_read(self, uuid: str) -> bytes:
+        """
+        Read one characteristic by UUID, for the dev probe.
+
+        Some answers are descriptors of the protocol rather than traffic: the
+        Bluetooth HID Report Map (``2a4b``) says exactly how this ring's input
+        reports are laid out, which no amount of packet sniffing will tell you
+        if the device stays quiet during the capture.
+        """
+        assert self._client is not None
+        return bytes(await self._client.read_gatt_char(uuid))
+
+    def debug_readable_chars(self) -> list[str]:
+        """UUIDs of every readable characteristic, for the dev probe's dump."""
+        if self._client is None:
+            return []
+        return [
+            char.uuid
+            for service in self._client.services
+            for char in service.characteristics
+            if "read" in char.properties
+        ]
+
     async def close(self) -> None:
         """Disconnect the GATT link; safe to call twice or on a dead link."""
         if self._client is None:
