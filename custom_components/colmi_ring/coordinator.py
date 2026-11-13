@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import TYPE_CHECKING, Any
@@ -26,17 +26,20 @@ from .const import (
     CONF_DEVICE_FAMILY,
     CONF_HR_STALE_POLLS,
     CONF_POLL_MAX_INTERVAL,
+    CONF_PROXIMITY_SAMPLES_N,
+    CONF_PROXIMITY_TOP_K,
+    CONF_PROXIMITY_VOTE_MARGIN,
     CONF_YCBT_MONITOR_INTERVAL,
     DEFAULT_POLL_MAX_INTERVAL,
     DEFAULT_YCBT_MONITOR_INTERVAL,
     FAMILY_YCBT,
     LOGGER,
-    PROXIMITY_COUNT_RATIO,
-    PROXIMITY_MIN_SAMPLES,
+    PROXIMITY_MAX_AGE_S,
     PROXIMITY_RSSI_CEIL_DB,
     PROXIMITY_RSSI_FLOOR_DB,
-    PROXIMITY_RSSI_MARGIN_DB,
-    PROXIMITY_WINDOW_S,
+    clamp_proximity_samples_n,
+    clamp_proximity_top_k,
+    clamp_proximity_vote_margin,
     clamp_ycbt_monitor_interval,
 )
 
@@ -54,19 +57,20 @@ if TYPE_CHECKING:
 _POLL_BUSY = object()
 
 
-@dataclass
-class _ProxySamples:
+@dataclass(frozen=True, slots=True)
+class _Sighting:
     """
-    One proxy's recent sightings of the ring, pruned to the proximity window.
+    One advertisement of the ring, as heard by one proxy.
 
-    ``stamps`` (monotonic seconds) and ``signals`` (RSSI dBm, None when the
-    sample carried no usable RSSI) stay index-aligned: samples leave both
-    deques together from the left. A sighting without RSSI still counts -
-    reception frequency is scored even when the level is not.
+    ``signal`` is the hearing proxy's own RSSI measurement (dBm), or None
+    when the sample carried no usable level; a level-less sighting still
+    joins the pool and can still win the vote on count, it just never
+    ranks among the strongest.
     """
 
-    stamps: deque[float] = field(default_factory=deque)
-    signals: deque[int | None] = field(default_factory=deque)
+    when: float  # monotonic seconds
+    source: str  # MAC of the proxy that heard it
+    signal: int | None
 
 
 # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -127,18 +131,18 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # received. Pushed (not polled): see async_note_ring_seen.
         self.last_seen: datetime | None = None
         # Source (adapter MAC) of the proxy credited with hearing the ring:
-        # decided by proximity scoring over a rolling window, not by which
-        # advertisement arrived last (see _async_credit_proxy). GATT
-        # notifications carry no source, so between polls the credit is
-        # simply retained.
+        # decided by the top-K proximity vote, not by which advertisement
+        # arrived last (see _async_credit_proxy). GATT notifications carry no
+        # source, so between polls the credit is simply retained.
         self.last_seen_source: str | None = None
-        # Window median RSSI (dBm) of the credited proxy, the smoothed number
-        # the Signal Strength sensor reports; None while the credited proxy
-        # has no usable RSSI samples.
+        # Median RSSI (dBm) among the winner's samples in the current top-K
+        # selection, the smoothed number the Signal Strength sensor reports;
+        # None while no winning sample carried a usable level.
         self.last_seen_rssi: int | None = None
-        # Per proxy: when and how strongly it heard the ring, as parallel
-        # deques pruned to the proximity window on every sighting.
-        self._proxy_stats: dict[str, _ProxySamples] = {}
+        # Every recent sighting of the ring (any proxy), oldest first, pruned
+        # to the proximity pool on each advertisement (see _async_credit_proxy
+        # for the age/size limits).
+        self._sightings: deque[_Sighting] = deque()
         self._seen_listeners: list[Callable[[datetime], None]] = []
 
     # Throttle for the seen signal: the timestamp is floored to whole
@@ -159,21 +163,23 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         hearing scanner's source and that advertisement's RSSI) and from the
         GATT notification handlers of both protocol clients (no source: the
         ring was heard over an open link, not scanned). Advertisement
-        sightings are added to the per-proxy window and re-run the proximity
-        credit; the push itself stays throttled to about once per second
-        (the floored timestamp doubles as the throttle), except on a credit
-        handover, which is worth reporting immediately.
+        sightings join the proximity pool and re-run the top-K vote; the
+        push itself stays throttled to about once per second (the floored
+        timestamp doubles as the throttle), except on a credit handover,
+        which is worth reporting immediately.
         """
         mono = time.monotonic()
         credited_now = False
         if source:
-            stats = self._proxy_stats.setdefault(source, _ProxySamples())
-            stats.stamps.append(mono)
-            stats.signals.append(
-                rssi
-                if rssi is not None
-                and PROXIMITY_RSSI_FLOOR_DB < rssi <= PROXIMITY_RSSI_CEIL_DB
-                else None
+            self._sightings.append(
+                _Sighting(
+                    when=mono,
+                    source=source,
+                    signal=rssi
+                    if rssi is not None
+                    and PROXIMITY_RSSI_FLOOR_DB < rssi <= PROXIMITY_RSSI_CEIL_DB
+                    else None,
+                ),
             )
             winner, score = self._async_credit_proxy(mono)
             credited_now = winner != self.last_seen_source
@@ -198,92 +204,95 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         """
         Which proxy to credit with the ring, and its smoothed signal level.
 
-        Scoring over the rolling PROXIMITY_WINDOW_S window, among proxies that
-        heard the ring at least PROXIMITY_MIN_SAMPLES times: best median RSSI
-        wins; a challenger takes the credit from the current holder only if it
-        beats the holder's median by PROXIMITY_RSSI_MARGIN_DB, or the medians
-        are within that margin and it has heard the ring PROXIMITY_COUNT_RATIO
-        times more often (a persistent reception-rate edge, i.e. a genuinely
-        better link). Because the decision compares whole-window statistics
-        with a margin, per-advertisement RSSI noise - the usual flip-flop
-        driver when several proxies hear the same ring - cannot move the
-        credit at all: two same-room proxies fail both handover conditions
-        indefinitely. When the ring is heard by nobody strongly (it is out of
-        range of everything) the current credit is retained; presence is the
-        Last Seen sensor's job, not this one's.
+        The top-K vote over the sighting pool: keep the pool's K strongest
+        samples (by the hearing proxy's own RSSI; level-less sightings rank
+        below any measured one), and the source holding the most of those K
+        slots is the winner. Deep fades sort themselves out of the top, and
+        a proxy earns slots in proportion to how strongly - not merely how
+        often - it hears the ring, so sparse but honest capture (WiFi-
+        time-shared ESP32 proxies) is represented by its true share of the
+        strong evidence. The incumbent keeps the credit unless a challenger
+        beats its slot count by the configured vote margin, which is what
+        makes a single lucky sample, or a window of ordinary multipath
+        noise, unable to move the ring to another room. When the pool is
+        empty (nothing heard within the age limit) the current credit is
+        retained; presence is the Last Seen sensor's job, not this one's.
+
+        The reported level is the median RSSI of the winner's samples that
+        made the top-K selection: the winner's own view from the pool's
+        strong end, robust to one jittery reading in either direction.
+
+        N, K and the margin are options, clamped on every read so a bad
+        stored value (or a K larger than N) can never wedge the vote.
         """
-        stats = self._proxy_stats
-        # Prune each proxy's window (O(1) amortised from the left) and drop
-        # proxies whose window is now empty, so a day of proxy restarts
-        # cannot grow the dict.
-        for src in list(stats):
-            sample = stats[src]
-            while sample.stamps and now - sample.stamps[0] > PROXIMITY_WINDOW_S:
-                sample.stamps.popleft()
-                sample.signals.popleft()
-            if not sample.stamps:
-                del stats[src]
+        options = self.config_entry.options
+        pool_size = clamp_proximity_samples_n(options.get(CONF_PROXIMITY_SAMPLES_N))
+        top_k = clamp_proximity_top_k(options.get(CONF_PROXIMITY_TOP_K), pool_size)
+        vote_margin = clamp_proximity_vote_margin(
+            options.get(CONF_PROXIMITY_VOTE_MARGIN)
+        )
 
-        qualified = {
-            src: sample
-            for src, sample in stats.items()
-            if len(sample.stamps) >= PROXIMITY_MIN_SAMPLES
-        }
-        current = self.last_seen_source
-        if not qualified:
-            return current, self.last_seen_rssi
+        # Prune from the left (chronological): expired samples first, then
+        # over-capacity ones, so the pool is both bounded and fresh.
+        pool = self._sightings
+        while pool and (
+            now - pool[0].when > PROXIMITY_MAX_AGE_S or len(pool) > pool_size
+        ):
+            pool.popleft()
+        if not pool:
+            return self.last_seen_source, self.last_seen_rssi
 
-        def signal_of(sample: _ProxySamples) -> float | None:
-            valid = [val for val in sample.signals if val is not None]
-            return median(valid) if valid else None
+        top = sorted(
+            pool,
+            key=lambda s: (
+                s.signal is not None,
+                s.signal if s.signal is not None else 0,
+            ),
+            reverse=True,
+        )[:top_k]
+        votes = Counter(sighting.source for sighting in top)
 
-        incumbent = qualified.get(current)
-        if incumbent is None:
-            # No credit yet, or the holder has fallen out of the qualified
-            # set (moved out of range / proxy restarted): hand the ring to
-            # the strongest qualified proxy. A proxy without usable RSSI
-            # scores below any measured one; equal signals go to the higher
-            # sample count.
-            best_src = max(
-                qualified,
-                key=lambda src: (
-                    signal_of(qualified[src]) is not None,
-                    signal_of(qualified[src]) or float("-inf"),
-                    len(qualified[src].stamps),
-                ),
-            )
-            best = qualified[best_src]
-            score = signal_of(best)
-            return best_src, round(score) if score is not None else None
-
-        inc_signal = signal_of(incumbent)
-        inc_count = len(incumbent.stamps)
-        challenger: str | None = None
-        challenger_sample: _ProxySamples | None = None
-        for src, sample in qualified.items():
-            if src == current:
+        # Per-source view of the selection: strongest sample (challenger and
+        # tie-break comparisons) and all samples (the winner's reported
+        # median level).
+        best: dict[str, int] = {}
+        signals: dict[str, list[int]] = {}
+        for sighting in top:
+            if sighting.signal is None:
                 continue
-            count = len(sample.stamps)
-            signal = signal_of(sample)
-            if inc_signal is None or signal is None:
-                # A median we cannot compute must never look like a signal
-                # advantage: fall back to the count rule alone.
-                beats = count >= inc_count * PROXIMITY_COUNT_RATIO
-            else:
-                beats = signal >= inc_signal + PROXIMITY_RSSI_MARGIN_DB or (
-                    abs(signal - inc_signal) < PROXIMITY_RSSI_MARGIN_DB
-                    and count >= inc_count * PROXIMITY_COUNT_RATIO
-                )
-            if beats and (
-                challenger_sample is None
-                or (signal or float("-inf"))
-                > (signal_of(challenger_sample) or float("-inf"))
-            ):
-                challenger, challenger_sample = src, sample
-        if challenger is None or challenger_sample is None:
-            return current, (round(inc_signal) if inc_signal is not None else None)
-        score = signal_of(challenger_sample)
-        return challenger, round(score) if score is not None else None
+            stored = best.get(sighting.source)
+            if stored is None or sighting.signal > stored:
+                best[sighting.source] = sighting.signal
+            signals.setdefault(sighting.source, []).append(sighting.signal)
+
+        def score_of(source: str) -> int | None:
+            source_signals = signals.get(source)
+            return round(median(source_signals)) if source_signals else None
+
+        current = self.last_seen_source
+        if current in votes:
+            incumbent_votes = votes[current]
+            contenders = [
+                (src, count)
+                for src, count in votes.items()
+                if src != current and count >= incumbent_votes + vote_margin
+            ]
+            if not contenders:
+                return current, score_of(current)
+            # Among eligible challengers, most slots wins; equal slots goes
+            # to the one with the single strongest reading.
+            winner, _ = max(
+                contenders,
+                key=lambda sc: (sc[1], best.get(sc[0], PROXIMITY_RSSI_FLOOR_DB)),
+            )
+        else:
+            # No credit yet, or the holder heard nothing lately: plain
+            # plurality, ties broken by the strongest single reading.
+            winner = max(
+                votes,
+                key=lambda src: (votes[src], best.get(src, PROXIMITY_RSSI_FLOOR_DB)),
+            )
+        return winner, score_of(winner)
 
     def add_seen_listener(
         self, listener: Callable[[datetime], None]

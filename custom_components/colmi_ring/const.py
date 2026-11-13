@@ -59,40 +59,106 @@ def clamp_ycbt_monitor_interval(value: object) -> int:
 
 # --- Proximity ("Seen by") ---------------------------------------------------
 #
-# Which bluetooth proxy hears the ring is decided by scoring, over a rolling
-# window, each proxy that has heard it: the proxy with the best median RSSI
-# wins, and where signal strength is a wash, the one that reliably receives
-# more advertisements wins. The ring advertises about once per second and
-# every in-range proxy hears (nearly) every advertisement, so mean RSSI is
-# the distance signal while the count is a packet-loss/reliability signal -
-# a proxy at the edge of coverage persistently misses advertisements.
+# Option keys (the tunables appear in the integration's options UI):
+CONF_PROXIMITY_SAMPLES_N = "proximity_samples_n"
+CONF_PROXIMITY_TOP_K = "proximity_top_k"
+CONF_PROXIMITY_VOTE_MARGIN = "proximity_vote_margin"
 #
-# Window length (seconds) each proxy's samples are scored over: ~30 expected
-# samples, enough to shrink per-advertisement RSSI jitter (body shadowing
-# swings single readings by several dB) to a usable median.
-PROXIMITY_WINDOW_S = 30.0
-# How much better (in dB) a challenger's median must be to dethrone the
-# current proxy. Two proxies in the same room have medians that straddle each
-# other by a dB or two from noise alone; this margin is comfortably above
-# that, so noise cannot hand the credit back and forth.
-PROXIMITY_RSSI_MARGIN_DB = 6
-# When two proxies' medians are within the margin of each other, a challenger
-# still wins if it has heard the ring this factor more times in the window:
-# a persistent ~25% reception-rate advantage means a genuinely better link,
-# while a single lucky extra sample moves the counts far less than this.
-PROXIMITY_COUNT_RATIO = 1.25
-# A proxy must have heard the ring at least this many times in the window to
-# compete at all: keeps a distant proxy that only rarely overhears the ring
-# out of the decision, and delays the very first credit until there is a
-# sample base worth scoring.
-PROXIMITY_MIN_SAMPLES = 3
-# Sane RSSI bounds (dBm) for accepting a sample. Bleak types rssi as
-# "int | None"; ESP32 controllers report 127 (0x7F) as "no measurement" and
-# some stacks hand over 0 or positive junk. A ring on a wrist realistically
-# never reads stronger than -20 dBm, so anything outside the bounds below is
-# dropped from scoring (the sighting still counts; only its RSSI is ignored).
+# Which bluetooth proxy hears the ring is decided by a top-K vote over a
+# rolling pool of the ring's recent advertisements: keep the K strongest
+# (by the hearing proxy's own RSSI measurement) and report whichever source
+# holds the most of those K slots. Strongest-signal-first is what makes
+# this behave in a real house: deep fades from body shadowing and walls
+# only ever push RSSI down, so the top of the pool is the best distance
+# estimator, and fades trim themselves out instead of needing a filter.
+#
+# This also sidesteps the trap the earlier per-proxy count scoring fell
+# into: ESPHome proxies time-share one radio between BLE and WiFi, so
+# which proxy catches a given advertisement is strongly determined by
+# that proxy's WiFi duty cycle, not by distance. A proxy that hears less
+# simply earns fewer slots in the ranking - an honest share of evidence -
+# rather than losing a tiebreak engineered for dense ~1/s capture.
+#
+# Pool size N: how many recent advertisements are kept and re-voted on
+# every sighting. Sized for the sparse capture proxies actually get
+# (~1 per proxy per 10 s in a typical multi-proxy house): 45 samples is a
+# couple of minutes of evidence from each in-range proxy, enough that a
+# distant proxy needs many anomalously strong readings - not one lucky
+# spike - to take the credit.
+DEFAULT_PROXIMITY_SAMPLES_N = 45
+# How many of the pool's strongest samples get a vote. About a quarter of
+# the pool: clearly past the noise floor, small enough that the proxy in
+# the ring's own room dominates the slots.
+DEFAULT_PROXIMITY_TOP_K = 12
+# Incumbent advantage: a challenger must beat the current winner's vote
+# count by this many slots. Votes and near-ties otherwise go to the
+# incumbent, so a single sample can never hand the ring to another room.
+DEFAULT_PROXIMITY_VOTE_MARGIN = 2
+# A sample older than this is dropped even if the pool has room: a ring
+# that left the house must not keep its last room credited forever.
+PROXIMITY_MAX_AGE_S = 300.0
+# Sane RSSI bounds (dBm) for trusting a sample's level. Bleak types rssi
+# as "int | None"; ESP32 controllers report 127 (0x7F) as "no
+# measurement" and some stacks hand over 0 or positive junk. A ring on a
+# wrist realistically never reads stronger than -20 dBm. A sighting with an
+# out-of-band level still joins the pool (it can still vote), it just
+# never ranks among the strongest.
 PROXIMITY_RSSI_FLOOR_DB = -127
 PROXIMITY_RSSI_CEIL_DB = -20
+
+PROXIMITY_SAMPLES_N_MIN = 10
+PROXIMITY_SAMPLES_N_MAX = 300
+PROXIMITY_TOP_K_MIN = 3
+PROXIMITY_TOP_K_MAX = 100
+PROXIMITY_VOTE_MARGIN_MIN = 0
+PROXIMITY_VOTE_MARGIN_MAX = 20
+
+
+def _clamp_int(value: object, *, low: int, high: int, fallback: int) -> int:
+    """Coerce an option to an int in [low, high], falling back when unusable."""
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return max(low, min(high, number))
+
+
+def clamp_proximity_samples_n(value: object) -> int:
+    """Clamp the pool size option."""
+    return _clamp_int(
+        value,
+        low=PROXIMITY_SAMPLES_N_MIN,
+        high=PROXIMITY_SAMPLES_N_MAX,
+        fallback=DEFAULT_PROXIMITY_SAMPLES_N,
+    )
+
+
+def clamp_proximity_top_k(value: object, samples_n: int) -> int:
+    """
+    Clamp the vote-size option.
+
+    Also capped by the pool size: voting on more samples than the pool
+    holds would silently let faded samples into the ranking and defeat
+    the strongest-first selection.
+    """
+    k = _clamp_int(
+        value,
+        low=PROXIMITY_TOP_K_MIN,
+        high=PROXIMITY_TOP_K_MAX,
+        fallback=DEFAULT_PROXIMITY_TOP_K,
+    )
+    return min(k, max(PROXIMITY_TOP_K_MIN, samples_n))
+
+
+def clamp_proximity_vote_margin(value: object) -> int:
+    """Clamp the incumbent-advantage option."""
+    return _clamp_int(
+        value,
+        low=PROXIMITY_VOTE_MARGIN_MIN,
+        high=PROXIMITY_VOTE_MARGIN_MAX,
+        fallback=DEFAULT_PROXIMITY_VOTE_MARGIN,
+    )
+
 
 # Import samples recorded on the ring while out of BLE range into HA history
 # (direct recorder states insert). Heart rate is a plain MEASUREMENT and

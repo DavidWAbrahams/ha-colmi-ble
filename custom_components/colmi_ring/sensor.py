@@ -381,14 +381,15 @@ class ColmiRingLastSeenBySensor(ColmiRingEntity, SensorEntity):
     device, if it has one, is exposed as an attribute, which makes
     whole-area zoning templates trivial.
 
-    Which proxy is credited is decided by proximity scoring over a rolling
-    30 s window (see ColmiRingDataUpdateCoordinator._async_credit_proxy):
-    the proxy with the best median RSSI wins, and where the medians are
-    within noise of each other, the one with a clearly higher reception
-    count wins. Comparing window statistics with a handover margin means
-    overlapping coverage - several proxies hearing every advertisement -
-    never oscillates the state, so history records room changes rather than
-    radio noise.
+    Which proxy is credited is decided by a top-K vote over the ring's
+    recent advertisements (see
+    ColmiRingDataUpdateCoordinator._async_credit_proxy): of the strongest
+    K samples in the pool, the proxy holding the most of them wins, and
+    the current one keeps the credit unless a challenger beats its slot
+    count by a configurable margin. Voting on signal strength rather than
+    raw counts, with that handover margin, means overlapping coverage and
+    uneven proxy capture rates never oscillate the state, so history
+    records room changes rather than radio noise.
 
     Push-driven like the Last Seen sensor, but state changes only when the
     credit moves, so history stays sparse. Deliberately enabled by default:
@@ -400,7 +401,7 @@ class ColmiRingLastSeenBySensor(ColmiRingEntity, SensorEntity):
 
     _attr_has_entity_name = True
     # "Seen by", not "Last seen by": the value is the proxy credited by the
-    # rolling-window proximity score, not literally the last advertiser.
+    # top-K proximity vote, not literally the last advertiser.
     _attr_name = "Seen by"
     _attr_icon = "mdi:bluetooth-audio"
 
@@ -476,11 +477,11 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
 
     HA's bluetooth stack carries the hearing adapter's own ``rssi`` (dBm)
     alongside every advertisement, so this is free - no extra scanning. The
-    value is the window *median* of the credited proxy's own samples (the
-    same proxy the Seen by sensor names), not another proxy's stronger
-    reading and not a single jittery sample: mixing or unsmoothing would
-    make the number jump whenever coverage credit moved or one advertisement
-    bounced off a wall.
+    value is the median of the credited proxy's own samples that made the
+    vote's top-K selection (the same proxy the Seen by sensor names), not
+    another proxy's stronger reading and not a single jittery sample:
+    mixing or unsmoothing would make the number jump whenever coverage
+    credit moved or one advertisement bounced off a wall.
 
     Disabled by default: RSSI jitters by several dB between consecutive
     advertisements, so while enabled every (once-per-second, throttled) seen
@@ -523,7 +524,7 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """dBm of the credited proxy's last hearing of the ring."""
+        """dBm: median of the credited proxy's strongest recent samples."""
         return self.coordinator.last_seen_rssi
 
 

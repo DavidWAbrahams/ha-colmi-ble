@@ -31,6 +31,9 @@ from .const import (
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
+    CONF_PROXIMITY_SAMPLES_N,
+    CONF_PROXIMITY_TOP_K,
+    CONF_PROXIMITY_VOTE_MARGIN,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
@@ -42,6 +45,9 @@ from .const import (
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
+    DEFAULT_PROXIMITY_SAMPLES_N,
+    DEFAULT_PROXIMITY_TOP_K,
+    DEFAULT_PROXIMITY_VOTE_MARGIN,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
@@ -299,6 +305,51 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             CONF_BACKFILL_ON_RECONNECT, True
                         ),
                     ): selector.BooleanSelector(),
+                    # --- Proximity ("Seen by") vote tunables -----------------
+                    # See const.py for the semantics; the coordinator reads
+                    # and clamps these live, so changes apply on reload.
+                    vol.Optional(
+                        CONF_PROXIMITY_SAMPLES_N,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_SAMPLES_N,
+                            DEFAULT_PROXIMITY_SAMPLES_N,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=10,
+                            max=300,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_PROXIMITY_TOP_K,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_TOP_K,
+                            DEFAULT_PROXIMITY_TOP_K,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=3,
+                            max=100,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_PROXIMITY_VOTE_MARGIN,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_VOTE_MARGIN,
+                            DEFAULT_PROXIMITY_VOTE_MARGIN,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=20,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
                     vol.Optional(
                         CONF_GESTURE_HOLD_STILL_S,
                         default=self.config_entry.options.get(
