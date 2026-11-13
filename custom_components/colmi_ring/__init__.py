@@ -194,7 +194,7 @@ async def async_setup_entry(
         # advertisement: the HA host's own adapter, or an ESPHome proxy.
         # ``rssi`` is that adapter's own measurement of this advertisement
         # in dBm. The coordinator keeps both as the ring's last known
-        # observer and its signal level (driving the Last Seen By and
+        # observer and its signal level (driving the Seen by and
         # Signal Strength sensors used for zoning).
         coordinator.async_note_ring_seen(
             getattr(service_info, "source", None),

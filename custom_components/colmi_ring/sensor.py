@@ -399,7 +399,9 @@ class ColmiRingLastSeenBySensor(ColmiRingEntity, SensorEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Last Seen By"
+    # "Seen by", not "Last seen by": the value is the proxy credited by the
+    # rolling-window proximity score, not literally the last advertiser.
+    _attr_name = "Seen by"
     _attr_icon = "mdi:bluetooth-audio"
 
     def __init__(
@@ -475,7 +477,7 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
     HA's bluetooth stack carries the hearing adapter's own ``rssi`` (dBm)
     alongside every advertisement, so this is free - no extra scanning. The
     value is the window *median* of the credited proxy's own samples (the
-    same proxy the Last Seen By sensor names), not another proxy's stronger
+    same proxy the Seen by sensor names), not another proxy's stronger
     reading and not a single jittery sample: mixing or unsmoothing would
     make the number jump whenever coverage credit moved or one advertisement
     bounced off a wall.
@@ -490,7 +492,7 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
 
     RSSI is a rough distance proxy at best: body shadowing, orientation and
     antenna pattern move it more than a metre of distance does. Fine as a
-    "roughly here vs roughly gone" signal next to the zonal Last Seen By
+    "roughly here vs roughly gone" signal next to the zonal Seen by
     value; not a ranging measurement.
     """
 

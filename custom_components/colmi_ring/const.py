@@ -57,7 +57,7 @@ def clamp_ycbt_monitor_interval(value: object) -> int:
     return max(YCBT_MONITOR_INTERVAL_MIN, min(YCBT_MONITOR_INTERVAL_MAX, minutes))
 
 
-# --- Proximity ("Last Seen By") ---------------------------------------------
+# --- Proximity ("Seen by") ---------------------------------------------------
 #
 # Which bluetooth proxy hears the ring is decided by scoring, over a rolling
 # window, each proxy that has heard it: the proxy with the best median RSSI
