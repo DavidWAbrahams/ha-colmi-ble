@@ -10,7 +10,10 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from homeassistant.components.bluetooth import async_register_callback
+from homeassistant.components.bluetooth import (
+    BluetoothScanningMode,
+    async_register_callback,
+)
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import callback
 from homeassistant.loader import async_get_loaded_integration
@@ -170,9 +173,9 @@ async def async_setup_entry(
     # on), so every advertisement from the ring lands here even while no GATT
     # link is open. Together with the clients' on-seen notifications (inbound
     # traffic during a link) this drives the last-seen sensor. The callback
-    # fires for every device HA sees, so it filters by address itself - the
-    # address-filtered registration variant is newer than the cores this
-    # integration supports.
+    # fires for every device HA sees (match_dict=None), so it filters by
+    # address itself; ACTIVE mirrors the scanning the manifest matchers
+    # already force on.
     ring_address_upper = ring_address.upper()
 
     @callback
@@ -180,7 +183,14 @@ async def async_setup_entry(
         if getattr(service_info, "address", "").upper() == ring_address_upper:
             coordinator.async_note_ring_seen()
 
-    entry.async_on_unload(async_register_callback(hass, _async_ring_advertised))
+    entry.async_on_unload(
+        async_register_callback(
+            hass,
+            _async_ring_advertised,
+            None,
+            BluetoothScanningMode.ACTIVE,
+        ),
+    )
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
     # is a Colmi command): YCBT rings have no equivalent, so the family gate
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
