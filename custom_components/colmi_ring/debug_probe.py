@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import time
 from typing import TYPE_CHECKING
 
@@ -86,12 +87,16 @@ SERVICE_SCHEMA = vol.Schema(
         vol.Optional("duration_s", default=60.0): vol.All(
             vol.Coerce(float), vol.Range(min=5.0, max=900.0)
         ),
+        # Frames and writes are lists of strings, but HA's field validation can
+        # hand us a mapping or a JSON string instead of a list depending on how
+        # the call was authored, so the schema is permissive here and
+        # ``_as_items`` does the normalising (and reports bad shapes itself).
         # Each frame is plain hex, e.g. "3b 02 01 00 ..." (spaces optional).
-        vol.Optional("frames", default=list): [str],
+        vol.Optional("frames"): vol.Any(None, str, {str: object}, [object]),
         # Raw writes to any characteristic: "UUID = hex bytes", where UUID may
         # be a Bluetooth SIG 16-bit assigned number ("2a4c") or a full 128-bit
         # UUID. Needed to drive paths the UART codec does not know about.
-        vol.Optional("writes", default=list): [str],
+        vol.Optional("writes"): vol.Any(None, str, {str: object}, [object]),
         vol.Optional("subscribe_all", default=True): bool,
     }
 )
@@ -148,9 +153,9 @@ async def _async_handle_service(hass: HomeAssistant, call: ServiceCall) -> None:
             " log for its PROBE lines (it ends on its own after duration_s)"
         )
     try:
-        frames = _parse_frames(call.data["frames"])
-        writes = _parse_writes(call.data["writes"])
-    except ValueError as err:
+        frames = _parse_frames(call.data.get("frames"))
+        writes = _parse_writes(call.data.get("writes"))
+    except (TypeError, ValueError) as err:
         raise ServiceValidationError(str(err)) from err
     _PROBES[entry_id] = hass.async_create_task(
         _async_run_probe(
@@ -202,9 +207,40 @@ def _resolve_entry(
     return found
 
 
-def _parse_frames(frames: list[str]) -> list[bytearray]:
+def _as_items(value: object, field: str) -> list[str]:
+    """
+    Coerce a service field into a list of strings.
+
+    Home Assistant validates service data against a field's selector before the
+    handler runs, and the shapes that survive differ by how the call was
+    authored: a YAML list arrives as a list, a UI form built from an object
+    selector arrives as a mapping, and a pasted JSON array arrives as a string.
+    Accept all three so a developer is never told their probe arguments are
+    malformed for reasons that have nothing to do with the protocol.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith(("[", "{")):
+            with contextlib.suppress(json.JSONDecodeError):
+                value = json.loads(text)
+        else:
+            return [line for line in text.splitlines() if line.strip()]
+    if isinstance(value, dict):
+        items: list[object] = list(value.values())
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise TypeError(f"{field} must be a list of strings, got {value!r}")
+    return [str(item) for item in items if str(item).strip()]
+
+
+def _parse_frames(frames: object) -> list[bytearray]:
     parsed: list[bytearray] = []
-    for index, frame in enumerate(frames):
+    for index, frame in enumerate(_as_items(frames, "frames")):
         cleaned = frame.replace(" ", "").replace(":", "").replace(",", "")
         try:
             raw = bytearray.fromhex(cleaned)
@@ -218,7 +254,7 @@ def _parse_frames(frames: list[str]) -> list[bytearray]:
     return parsed
 
 
-def _parse_writes(writes: list[str]) -> list[tuple[str, bytearray]]:
+def _parse_writes(writes: object) -> list[tuple[str, bytearray]]:
     """
     Parse ``"UUID = hex bytes"`` write requests.
 
@@ -227,7 +263,7 @@ def _parse_writes(writes: list[str]) -> list[tuple[str, bytearray]]:
     the kind of friction that stops a probe from being run.
     """
     parsed: list[tuple[str, bytearray]] = []
-    for index, item in enumerate(writes):
+    for index, item in enumerate(_as_items(writes, "writes")):
         uuid_part, _, hex_part = item.partition("=")
         uuid = uuid_part.strip().lower()
         if not uuid or not hex_part.strip():
