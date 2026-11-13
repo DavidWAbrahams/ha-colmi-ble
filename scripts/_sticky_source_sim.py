@@ -13,7 +13,6 @@ Run: python scripts/_sticky_source_sim.py
 import random
 from collections import Counter, deque
 from dataclasses import dataclass
-from statistics import median
 
 # Mirrors const.py
 DEFAULT_SAMPLES_N = 45
@@ -112,18 +111,18 @@ class Credit:
         votes = Counter(sighting.source for sighting in top)
 
         best: dict[str, int] = {}
-        signals: dict[str, list[int]] = {}
         for sighting in top:
             if sighting.signal is None:
                 continue
             stored = best.get(sighting.source)
             if stored is None or sighting.signal > stored:
                 best[sighting.source] = sighting.signal
-            signals.setdefault(sighting.source, []).append(sighting.signal)
 
-        def score_of(source: str) -> int | None:
-            source_signals = signals.get(source)
-            return round(median(source_signals)) if source_signals else None
+        def fresh_signal_of(source: str) -> int | None:
+            for sighting in reversed(pool):
+                if sighting.source == source and sighting.signal is not None:
+                    return sighting.signal
+            return None
 
         current = self.source
         if current in votes:
@@ -134,7 +133,7 @@ class Credit:
                 if src != current and count >= incumbent_votes + margin
             ]
             if not contenders:
-                return current, score_of(current)
+                return current, fresh_signal_of(current)
             winner = max(
                 contenders,
                 key=lambda sc: (sc[1], best.get(sc[0], RSSI_FLOOR_DB)),
@@ -144,7 +143,7 @@ class Credit:
                 votes,
                 key=lambda src: (votes[src], best.get(src, RSSI_FLOOR_DB)),
             )
-        return winner, score_of(winner)
+        return winner, fresh_signal_of(winner)
 
 
 def run(
@@ -273,7 +272,20 @@ assert c._credit(400.0) == (before, rssi_before), "credit lost when pool aged ou
 assert not c.pool, "aged-out pool was not pruned"
 print(f"PASS retained when gone: credit stays {before!r} ({rssi_before} dBm)")
 
-# 8. Tight pool with K > N: clamping must still resolve a dominant B cleanly.
+# 8. Reported level: the most recent usable RSSI the winner heard - not the
+#    strongest, not the median. A goes quiet-ish, its newest reading wins.
+c = Credit()
+for i in range(30):  # seed A as the clear winner, last sample -70
+    c.note("A", -50 if i < 29 else -70, i * 1.0)
+    c.note("B", -85, i * 1.0 + 0.5)
+assert c.source == "A"
+c.note("A", -66, 31.0)  # newest, and weaker than everything above it
+assert c.rssi == -66, f"score must follow the newest reading, got {c.rssi}"
+c.note("A", None, 32.0)  # a level-less sighting must not clear the score
+assert c.rssi == -66, f"score lost to a level-less sighting: {c.rssi}"
+print("PASS reported level: winner's most recent RSSI")
+
+# 9. Tight pool with K > N: clamping must still resolve a dominant B cleanly.
 rng = random.Random(5)
 feed = captures(rng, "A", -80, 2.0, 300.0) + captures(rng, "B", -55, 2.0, 300.0)
 run("K clamped to tiny pool", feed, "B", Credit(samples_n=10, top_k=100, vote_margin=0))

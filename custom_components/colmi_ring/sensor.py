@@ -477,11 +477,10 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
 
     HA's bluetooth stack carries the hearing adapter's own ``rssi`` (dBm)
     alongside every advertisement, so this is free - no extra scanning. The
-    value is the median of the credited proxy's own samples that made the
-    vote's top-K selection (the same proxy the Seen by sensor names), not
-    another proxy's stronger reading and not a single jittery sample:
-    mixing or unsmoothing would make the number jump whenever coverage
-    credit moved or one advertisement bounced off a wall.
+    value is the RSSI of the most recent advertisement the credited proxy
+    heard (the same proxy the Seen by sensor names) - that proxy's live
+    view of the ring, never another proxy's stronger reading. It jitters
+    like raw RSSI does; staleness is the Last Seen sensor's job.
 
     Disabled by default: RSSI jitters by several dB between consecutive
     advertisements, so while enabled every (once-per-second, throttled) seen
@@ -524,7 +523,7 @@ class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """dBm: median of the credited proxy's strongest recent samples."""
+        """dBm of the credited proxy's most recent hearing of the ring."""
         return self.coordinator.last_seen_rssi
 
 

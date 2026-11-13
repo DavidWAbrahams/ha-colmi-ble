@@ -7,7 +7,6 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from statistics import median
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
@@ -135,9 +134,9 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # arrived last (see _async_credit_proxy). GATT notifications carry no
         # source, so between polls the credit is simply retained.
         self.last_seen_source: str | None = None
-        # Median RSSI (dBm) among the winner's samples in the current top-K
-        # selection, the smoothed number the Signal Strength sensor reports;
-        # None while no winning sample carried a usable level.
+        # RSSI (dBm) of the most recent advertisement the credited proxy
+        # heard with a usable level - what the Signal Strength sensor
+        # reports; None while no recent hearing by the winner carried one.
         self.last_seen_rssi: int | None = None
         # Every recent sighting of the ring (any proxy), oldest first, pruned
         # to the proximity pool on each advertisement (see _async_credit_proxy
@@ -218,9 +217,10 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         empty (nothing heard within the age limit) the current credit is
         retained; presence is the Last Seen sensor's job, not this one's.
 
-        The reported level is the median RSSI of the winner's samples that
-        made the top-K selection: the winner's own view from the pool's
-        strong end, robust to one jittery reading in either direction.
+        The reported level is simply the most recent usable RSSI the
+        winner measured: the sensor answers "how strongly does *that
+        proxy* hear the ring *right now*", and staleness is already
+        covered by the Last Seen sensor.
 
         N, K and the margin are options, clamped on every read so a bad
         stored value (or a K larger than N) can never wedge the vote.
@@ -252,22 +252,22 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         )[:top_k]
         votes = Counter(sighting.source for sighting in top)
 
-        # Per-source view of the selection: strongest sample (challenger and
-        # tie-break comparisons) and all samples (the winner's reported
-        # median level).
+        # Strongest sample per source within the selection, for challenger
+        # and tie-break comparisons only; the reported level is separate.
         best: dict[str, int] = {}
-        signals: dict[str, list[int]] = {}
         for sighting in top:
             if sighting.signal is None:
                 continue
             stored = best.get(sighting.source)
             if stored is None or sighting.signal > stored:
                 best[sighting.source] = sighting.signal
-            signals.setdefault(sighting.source, []).append(sighting.signal)
 
-        def score_of(source: str) -> int | None:
-            source_signals = signals.get(source)
-            return round(median(source_signals)) if source_signals else None
+        def fresh_signal_of(source: str) -> int | None:
+            """Latest usable level the source measured, newest first."""
+            for sighting in reversed(pool):
+                if sighting.source == source and sighting.signal is not None:
+                    return sighting.signal
+            return None
 
         current = self.last_seen_source
         if current in votes:
@@ -278,7 +278,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 if src != current and count >= incumbent_votes + vote_margin
             ]
             if not contenders:
-                return current, score_of(current)
+                return current, fresh_signal_of(current)
             # Among eligible challengers, most slots wins; equal slots goes
             # to the one with the single strongest reading.
             winner, _ = max(
@@ -292,7 +292,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 votes,
                 key=lambda src: (votes[src], best.get(src, PROXIMITY_RSSI_FLOOR_DB)),
             )
-        return winner, score_of(winner)
+        return winner, fresh_signal_of(winner)
 
     def add_seen_listener(
         self, listener: Callable[[datetime], None]
