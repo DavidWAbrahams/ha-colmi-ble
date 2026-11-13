@@ -12,11 +12,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.components.bluetooth import (
-    BluetoothScanningMode,
-    async_register_callback,
+    async_register_advertisement_callback,
 )
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import callback
+from homeassistant.exceptions import InvalidMacFormat
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
@@ -170,36 +171,42 @@ async def async_setup_entry(
             on_seen=coordinator.async_note_ring_seen,
         )
 
-    # Passive presence: HA's bluetooth stack scans continuously (this
-    # integration's manifest registers matchers, which keeps active scanning
-    # on), so every advertisement from the ring lands here even while no GATT
-    # link is open. Together with the clients' on-seen notifications (inbound
-    # traffic during a link) this drives the last-seen sensor. The callback
-    # fires for every device HA sees (match_dict=None), so it filters by
-    # address itself; ACTIVE mirrors the scanning the manifest matchers
-    # already force on.
-    ring_address_upper = ring_address.upper()
+    # Passive presence: every raw advertisement the ring emits lands here
+    # even while no GATT link is open, driving the last-seen / last-seen-by /
+    # signal-strength sensors together with the clients' on-seen GATT
+    # notifications. This must be async_register_advertisement_callback
+    # (per-packet), NOT the change-driven async_register_callback: rings
+    # advertise a static payload, and the change-driven path deduplicates
+    # identical advertisements, so its callback would (in practice) never
+    # fire. The per-packet path fires for every advertisement from the
+    # subscribed address, once per scanner that heard it, even when the
+    # payload is unchanged -- exactly what per-proxy zoning needs. The
+    # subscription key is matched exactly against ``service_info.address``,
+    # which is always the upper-case colon MAC (BlueZ / ESPHome), so the
+    # stored address is normalised the same way.
+    try:
+        ring_address_key = format_mac(ring_address).upper()
+    except InvalidMacFormat:
+        ring_address_key = ring_address.upper()
 
     @callback
-    def _async_ring_advertised(service_info: object, _change: object) -> None:
-        if getattr(service_info, "address", "").upper() == ring_address_upper:
-            # ``source`` is the MAC of the adapter that heard this particular
-            # advertisement: the HA host's own adapter, or an ESPHome proxy.
-            # ``rssi`` is that adapter's own measurement of this advertisement
-            # in dBm. The coordinator keeps both as the ring's last known
-            # observer and its signal level (driving the Last Seen By and
-            # Signal Strength sensors used for zoning).
-            coordinator.async_note_ring_seen(
-                getattr(service_info, "source", None),
-                getattr(service_info, "rssi", None),
-            )
+    def _async_ring_advertised(service_info: object) -> None:
+        # ``source`` is the MAC of the adapter that heard this particular
+        # advertisement: the HA host's own adapter, or an ESPHome proxy.
+        # ``rssi`` is that adapter's own measurement of this advertisement
+        # in dBm. The coordinator keeps both as the ring's last known
+        # observer and its signal level (driving the Last Seen By and
+        # Signal Strength sensors used for zoning).
+        coordinator.async_note_ring_seen(
+            getattr(service_info, "source", None),
+            getattr(service_info, "rssi", None),
+        )
 
     entry.async_on_unload(
-        async_register_callback(
+        async_register_advertisement_callback(
             hass,
             _async_ring_advertised,
-            None,
-            BluetoothScanningMode.ACTIVE,
+            ring_address_key,
         ),
     )
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
