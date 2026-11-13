@@ -44,6 +44,7 @@ from .const import (
     CONF_GESTURE_HOLD_FLIP_S,
     CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
+    CONF_MOTION_HOLE_AXIS,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
@@ -54,6 +55,7 @@ from .const import (
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
+    DEFAULT_MOTION_HOLE_AXIS,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
@@ -64,6 +66,7 @@ from .const import (
     STREAM_BUSY_MESSAGE,
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
+    resolve_hole_axis,
     resolve_vertical_anchors,
 )
 from .gestures import (
@@ -119,6 +122,14 @@ class MotionManager:
         self._client = client
         self._coordinator = coordinator
 
+        # Which sensor axis this ring's hole runs through: Z for most firmware,
+        # Y on an R08 (see const.resolve_hole_axis). Read once per manager like
+        # the anchors: an option change reloads the entry and rebuilds us, so
+        # nothing can switch axis mid-session.
+        self._hole_axis = resolve_hole_axis(
+            self._entry.options.get(CONF_MOTION_HOLE_AXIS, DEFAULT_MOTION_HOLE_AXIS),
+            self._entry.title,
+        )
         (
             still_hold_s,
             flip_hold_s,
@@ -130,9 +141,12 @@ class MotionManager:
             flip_hold_s=flip_hold_s,
             raised_hold_s=raised_hold_s,
             chop_hold_s=chop_hold_s,
+            hole_axis=self._hole_axis,
         )
         flat_deg, vertical_deg = self._vertical_anchors()
-        self._angle = VerticalAngleTracker(flat_deg=flat_deg, vertical_deg=vertical_deg)
+        self._angle = VerticalAngleTracker(
+            flat_deg=flat_deg, vertical_deg=vertical_deg, hole_axis=self._hole_axis
+        )
         self._session: MotionSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._stream_timer: Callable[[], None] | None = None
@@ -342,6 +356,7 @@ class MotionManager:
             flip_hold_s=flip_hold_s,
             raised_hold_s=raised_hold_s,
             chop_hold_s=chop_hold_s,
+            hole_axis=self._hole_axis,
         )
         self._angle.reset()
         self.last_angle_deg = None

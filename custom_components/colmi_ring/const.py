@@ -1,5 +1,6 @@
 """Constants for colmi_ring."""
 
+import re
 from logging import Logger, getLogger
 
 LOGGER: Logger = getLogger(__package__)
@@ -209,9 +210,56 @@ MOTION_SAMPLE_GAP_MAX_S = 5.0
 # Which sensor axis runs through the ring hole. The reported angle is the
 # elevation of this axis above the horizontal plane, so the axis choice is the
 # whole calibration: if the sensor reads 90 degrees with the hole axis flat on
-# a table (and 0 held upright), the firmware maps the axes differently and this
-# one constant is the only thing to change.
+# a table (and 0 held upright), the firmware maps the axes differently, and
+# this is the fallback for rings whose model is not in the table below.
 MOTION_VERTICAL_AXIS = "z"
+
+# The axes an ``AccelSample`` exposes; an option naming anything else is
+# garbage and falls back rather than raising deep inside the packet path.
+MOTION_HOLE_AXES = frozenset({"x", "y", "z"})
+
+# Per-model hole-axis overrides, keyed by the advertisement name (which the
+# config entry is titled after). Most Colmi firmware maps the hole onto the Z
+# axis, but the R08 runs the hole through the Y axis instead: held upright on
+# a finger, its Z reads near zero and Y reads 1 g. A ring that misreads by a
+# quarter turn is a table entry, not a code change. Match the ``Rnn_``
+# advertisement shape (see config_flow._COLMI_NAME_RE); ``?`` covers the
+# ``R8_``-style spelling some firmwares use for single-digit models.
+_HOLE_AXIS_BY_MODEL: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^R0?8[ _]", re.IGNORECASE), "y"),
+)
+
+# Option selecting the hole axis for the vertical angle and the angle-gated
+# gestures. "auto" (the default) picks it from the model-name table above, so
+# a newly discovered axis mapping is a table entry that existing entries pick
+# up on reload; an explicit X/Y/Z overrides the table for a unit that turns
+# out to differ. Changing the option reloads the entry, which rebuilds the
+# motion manager, so the tracker never changes axis mid-session.
+CONF_MOTION_HOLE_AXIS = "motion_hole_axis"
+DEFAULT_MOTION_HOLE_AXIS = "auto"
+MOTION_HOLE_AXIS_CHOICES = (DEFAULT_MOTION_HOLE_AXIS, "x", "y", "z")
+
+
+def resolve_hole_axis(axis_option: object, model_name: object) -> str:
+    """
+    Work out which sensor axis the hole runs through for this ring.
+
+    An explicit X/Y/Z option always wins (it is the user's direct answer to
+    "which axis reads 1 g when the finger points up"); anything else,
+    including the "auto" default and garbage, consults the model table with
+    the ring's name and falls back to ``MOTION_VERTICAL_AXIS``. Never raises:
+    this runs on a packet-adjacent path, and a wrong-but-plausible axis is
+    exactly the failure the calibration anchors already exist to be able to
+    deny, so an unusable input must degrade to the old behaviour.
+    """
+    if isinstance(axis_option, str) and axis_option.lower() in MOTION_HOLE_AXES:
+        return axis_option.lower()
+    name = model_name if isinstance(model_name, str) else ""
+    for pattern, axis in _HOLE_AXIS_BY_MODEL:
+        if pattern.search(name):
+            return axis
+    return MOTION_VERTICAL_AXIS
+
 
 # Time constant of the low-pass applied to the elevation angle. The angle is
 # smoothed rather than read from each raw sample: the accelerometer's least

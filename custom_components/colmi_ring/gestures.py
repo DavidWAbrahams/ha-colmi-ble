@@ -172,15 +172,20 @@ def _separation_deg(a: AccelSample, b: AccelSample) -> float:
     return math.degrees(math.acos(cosine))
 
 
-def _elevation_deg(unit: AccelSample) -> float:
+def _elevation_deg(unit: AccelSample, hole_axis: str = MOTION_VERTICAL_AXIS) -> float:
     """
     Raw elevation of the hole axis above the horizontal plane, 0..90.
 
     ``|component|`` of the unit gravity direction along the hole axis is
     ``sin(elevation)``; ``asin`` recovers the elevation, folded to 0..90
     because the axis reading gravity at +1 g and at -1 g is equally vertical.
+
+    ``hole_axis`` names the sensor axis the ring hole runs through: most
+    firmware maps it onto Z, but not all (see ``const.MOTION_VERTICAL_AXIS``),
+    so callers pass the per-ring answer resolved by
+    ``const.resolve_hole_axis``.
     """
-    along = abs(getattr(unit, MOTION_VERTICAL_AXIS))
+    along = abs(getattr(unit, hole_axis))
     return math.degrees(math.asin(min(1.0, along)))
 
 
@@ -201,6 +206,7 @@ class StreamGestureDetector:
         flip_hold_s: float = DEFAULT_GESTURE_HOLD_FLIP_S,
         raised_hold_s: float = DEFAULT_GESTURE_HOLD_RAISED_S,
         chop_hold_s: float = DEFAULT_GESTURE_HOLD_CHOP_S,
+        hole_axis: str = MOTION_VERTICAL_AXIS,
     ) -> None:
         """
         Create a detector with per-gesture hold thresholds.
@@ -211,6 +217,8 @@ class StreamGestureDetector:
         the hand must stay calm *and* raised before ``raised_hand`` fires;
         ``chop_hold_s`` is how long each half of a ``hand_chop`` - the raised
         pose that arms it and the flat pose that completes it - must be held.
+        ``hole_axis`` is only used on the fallback elevation path (see
+        :meth:`feed`); pass what the manager resolved for this ring.
         """
         self._still_hold_s = self._clamp_hold(
             still_hold_s, DEFAULT_GESTURE_HOLD_STILL_S
@@ -220,6 +228,7 @@ class StreamGestureDetector:
             raised_hold_s, DEFAULT_GESTURE_HOLD_RAISED_S
         )
         self._chop_hold_s = self._clamp_hold(chop_hold_s, DEFAULT_GESTURE_HOLD_CHOP_S)
+        self._hole_axis = hole_axis
 
         self._gravity: AccelSample | None = None
         self._samples: deque[tuple[float, AccelSample]] = deque()
@@ -346,7 +355,7 @@ class StreamGestureDetector:
         elevation = (
             angle_deg
             if angle_deg is not None
-            else (_elevation_deg(unit) if unit is not None else None)
+            else (_elevation_deg(unit, self._hole_axis) if unit is not None else None)
         )
 
         events: list[GestureEvent] = []
@@ -683,7 +692,12 @@ class VerticalAngleTracker:
     settles in well under a second instead of visibly sliding.
     """
 
-    def __init__(self, flat_deg: float = 0.0, vertical_deg: float = 90.0) -> None:
+    def __init__(
+        self,
+        flat_deg: float = 0.0,
+        vertical_deg: float = 90.0,
+        hole_axis: str = MOTION_VERTICAL_AXIS,
+    ) -> None:
         """
         Start with no estimate, calibrated to the given anchors.
 
@@ -693,6 +707,10 @@ class VerticalAngleTracker:
         real sensor bias the raw reading tops out below 90 (see
         ``const.CONF_VERTICAL_UPRIGHT_DEG``), and that offset is a property of
         the unit and the wear, so the anchors come from the entry options.
+
+        ``hole_axis`` names the sensor axis the ring hole runs through - Z for
+        most firmware, Y on an R08 - as resolved per ring by
+        ``const.resolve_hole_axis``; see :func:`_elevation_deg`.
         """
         # Low-passed elevation of the hole axis, in degrees (0..90), raw scale.
         self._elevation: float | None = None
@@ -702,6 +720,7 @@ class VerticalAngleTracker:
         # (const.resolve_vertical_anchors).
         self._flat_deg = flat_deg
         self._vertical_deg = vertical_deg
+        self._hole_axis = hole_axis
 
     def feed(self, sample: AccelSample, now: float | None = None) -> float | None:
         """
@@ -726,7 +745,7 @@ class VerticalAngleTracker:
             return self.angle_deg
 
         # The elevation of the hole axis, folded to 0..90 (see _elevation_deg).
-        target = _elevation_deg(unit)
+        target = _elevation_deg(unit, self._hole_axis)
 
         if self._elevation is None:
             self._elevation = target

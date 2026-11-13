@@ -26,6 +26,7 @@ from .const import (
     CONF_GESTURE_HOLD_RAISED_S,
     CONF_GESTURE_HOLD_STILL_S,
     CONF_HR_STALE_POLLS,
+    CONF_MOTION_HOLE_AXIS,
     CONF_MOTION_LOG_SAMPLES,
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_GESTURE_HOLD_FLIP_S,
     DEFAULT_GESTURE_HOLD_RAISED_S,
     DEFAULT_GESTURE_HOLD_STILL_S,
+    DEFAULT_MOTION_HOLE_AXIS,
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
@@ -47,6 +49,7 @@ from .const import (
     FAMILY_COLMI,
     FAMILY_YCBT,
     LOGGER,
+    MOTION_HOLE_AXIS_CHOICES,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
 )
@@ -375,6 +378,20 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             max=1440,
                             step=15,
                             mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_MOTION_HOLE_AXIS,
+                        default=self.config_entry.options.get(
+                            CONF_MOTION_HOLE_AXIS, DEFAULT_MOTION_HOLE_AXIS
+                        ),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                {"value": choice, "label": choice.upper()}
+                                for choice in MOTION_HOLE_AXIS_CHOICES
+                            ],
+                            mode=selector.SelectSelectorMode.DROPDOWN,
                         )
                     ),
                     vol.Optional(

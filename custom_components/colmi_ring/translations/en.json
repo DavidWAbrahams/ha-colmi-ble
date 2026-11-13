@@ -33,6 +33,7 @@
                     "gesture_hold_chop_s": "Hand chop gesture: hold raised (above ~70°) and then flat (below ~20°) for this many seconds each, with a rapid drop between",
                     "motion_stream_timeout": "Motion stream timeout minutes, to save battery (0 = unlimited)",
                     "wave_timeout": "Wave detection timeout minutes, to save battery (0 = unlimited)",
+                    "motion_hole_axis": "Ring hole axis for the Vertical Angle and angle gestures. Auto detects from the model name (R08 rings run the hole through Y); override if this ring's angle sensor reads 0 when your finger points up and 90 when the ring lies flat.",
                     "motion_sensor_update_s": "Min seconds between accelerometer sensor updates, to save db space. 0 or decimals are allowed",
                     "vertical_flat_deg": "Angle calibration: raw angle that means flat (reported as 0°). Set 0 if a flat hand already reads ~0; raise it (20 max) if it reads high.",
                     "vertical_upright_deg": "Angle calibration: raw angle that means upright (reported as 90°). Set 90 if a fully vertical hand already reads ~90; lower it (70 min) if it reads low.",
