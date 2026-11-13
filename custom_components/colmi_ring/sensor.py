@@ -13,12 +13,14 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfEnergy,
     UnitOfLength,
     UnitOfTemperature,
     UnitOfTime,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
     CONF_DEVICE_FAMILY,
@@ -31,7 +33,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
 
-    from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from .colmi_codec.motion import AccelSample
@@ -206,7 +207,7 @@ VERTICAL_ANGLE_SENSOR = SensorEntityDescription(
 
 
 async def async_setup_entry(
-    hass: HomeAssistant,  # noqa: ARG001 Unused function argument: `hass`
+    hass: HomeAssistant,
     entry: ColmiRingConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
@@ -224,7 +225,13 @@ async def async_setup_entry(
         )
         for entity_description in descriptions
     )
-    async_add_entities([ColmiRingLastSeenSensor(coordinator=coordinator)])
+    async_add_entities(
+        [
+            ColmiRingLastSeenSensor(coordinator=coordinator),
+            ColmiRingLastSeenBySensor(hass, coordinator=coordinator),
+            ColmiRingSignalStrengthSensor(coordinator=coordinator),
+        ]
+    )
     # The accelerometer sensors only have data while the RAW stream is on, which
     # is up to the user to switch on. Yucheng rings have no motion manager at
     # all, so they are gated out.
@@ -359,6 +366,163 @@ class ColmiRingLastSeenSensor(ColmiRingEntity, SensorEntity):
     def native_value(self) -> datetime | None:
         """The last (second-floored) time any traffic from the ring arrived."""
         return self.coordinator.last_seen
+
+
+class ColmiRingLastSeenBySensor(ColmiRingEntity, SensorEntity):
+    """
+    Which bluetooth adapter last heard the ring: the local one or a proxy.
+
+    Every advertisement HA's stack processes carries the ``source`` of the
+    scanner that heard it - for an ESPHome proxy that is the proxy's MAC,
+    which is also how the proxy is registered as a device. Mapping it back
+    through the device registry gives the proxy's friendly name, so the
+    state of this sensor is e.g. "Living Room Proxy" (or "Home Assistant"
+    when the host's own adapter heard the ring). The area id of the proxy
+    device, if it has one, is exposed as an attribute, which makes
+    whole-area zoning templates trivial.
+
+    Which proxy is credited is decided by proximity scoring over a rolling
+    30 s window (see ColmiRingDataUpdateCoordinator._async_credit_proxy):
+    the proxy with the best median RSSI wins, and where the medians are
+    within noise of each other, the one with a clearly higher reception
+    count wins. Comparing window statistics with a handover margin means
+    overlapping coverage - several proxies hearing every advertisement -
+    never oscillates the state, so history records room changes rather than
+    radio noise.
+
+    Push-driven like the Last Seen sensor, but state changes only when the
+    credit moves, so history stays sparse. Deliberately enabled by default:
+    unlike the per-second Last Seen entity, its cost is negligible.
+
+    GATT notifications (while a link is open) carry no source, so during a
+    poll or stream the value is simply retained between advertisements.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Seen By"
+    _attr_icon = "mdi:bluetooth-audio"
+
+    def __init__(
+        self, hass: HomeAssistant, coordinator: ColmiRingDataUpdateCoordinator
+    ) -> None:
+        """Keep the hass reference for device-registry name lookups."""
+        super().__init__(coordinator)
+        self._hass = hass
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_last_seen_by"
+        self._last_reported_source: str | None = None
+
+    @callback
+    def _async_on_seen(self, _seen: datetime) -> None:
+        """Repaint when the observer changed (or before the first report)."""
+        source = self.coordinator.last_seen_source
+        if source != self._last_reported_source:
+            self._last_reported_source = source
+            self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the seen signal once fully added."""
+        await super().async_added_to_hass()
+        # Seed so the first advertisement after setup repaints, and paint now
+        # in case the ring was already heard before this entity existed.
+        self._last_reported_source = None
+        self.async_on_remove(self.coordinator.add_seen_listener(self._async_on_seen))
+        self._last_reported_source = self.coordinator.last_seen_source
+        self.async_write_ha_state()
+
+    def _proxy_device(self, source: str) -> dr.DeviceEntry | None:
+        """Find the proxy/adapter device whose bluetooth MAC is ``source``."""
+        registry = dr.async_get(self._hass)
+        for candidate in (source, source.upper(), source.lower()):
+            device = registry.async_get_device(
+                connections={(dr.CONNECTION_BLUETOOTH, candidate)}
+            )
+            if device is not None:
+                return device
+        return None
+
+    @property
+    def native_value(self) -> str | None:
+        """Name of the adapter that last heard the ring, None until it has."""
+        source = self.coordinator.last_seen_source
+        if source is None:
+            return None
+        device = self._proxy_device(source)
+        if device is None:
+            # Not (yet) in the registry: fall back to the raw source so the
+            # sensor still zoning-ably distinguishes the observers.
+            return source
+        return device.name_by_user or device.name or source
+
+    @property
+    def available(self) -> bool:
+        """Unknown until the first advertisement has been seen."""
+        return self.coordinator.last_seen_source is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose the raw source and the proxy's area for zoning templates."""
+        source = self.coordinator.last_seen_source
+        attrs: dict[str, object] = {"source": source}
+        if source is not None and (device := self._proxy_device(source)):
+            attrs["area_id"] = device.area_id
+        return attrs
+
+
+class ColmiRingSignalStrengthSensor(ColmiRingEntity, SensorEntity):
+    """
+    The ring's signal strength, as the credited proxy has been hearing it.
+
+    HA's bluetooth stack carries the hearing adapter's own ``rssi`` (dBm)
+    alongside every advertisement, so this is free - no extra scanning. The
+    value is the window *median* of the credited proxy's own samples (the
+    same proxy the Last Seen By sensor names), not another proxy's stronger
+    reading and not a single jittery sample: mixing or unsmoothing would
+    make the number jump whenever coverage credit moved or one advertisement
+    bounced off a wall.
+
+    Disabled by default: RSSI jitters by several dB between consecutive
+    advertisements, so while enabled every (once-per-second, throttled) seen
+    notification is a genuine state change and a recorder row - the same
+    history cost as the Last Seen sensor. Enable per-install if RSSI history
+    is wanted; the live value and its attributes are available through
+    diagnostics while disabled, and a template sensor can snapshot it on
+    gesture events without paying continuous history.
+
+    RSSI is a rough distance proxy at best: body shadowing, orientation and
+    antenna pattern move it more than a metre of distance does. Fine as a
+    "roughly here vs roughly gone" signal next to the zonal Last Seen By
+    value; not a ranging measurement.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_name = "Signal Strength"
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Name and unique-id the sensor (the seen signal drives repaints)."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_signal_strength"
+
+    @callback
+    def _async_on_seen(self, _seen: datetime) -> None:
+        """The ring was just heard from; repaint with the fresh RSSI."""
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the (throttled) seen signal once fully added."""
+        await super().async_added_to_hass()
+        # Subscribed here rather than in __init__: a seen event can fire from
+        # the bluetooth scanner at any moment, and writing state before the
+        # entity is registered would raise.
+        self.async_on_remove(self.coordinator.add_seen_listener(self._async_on_seen))
+
+    @property
+    def native_value(self) -> int | None:
+        """dBm of the credited proxy's last hearing of the ring."""
+        return self.coordinator.last_seen_rssi
 
 
 class ColmiRingAccelerometerSensor(ColmiRingEntity, SensorEntity):

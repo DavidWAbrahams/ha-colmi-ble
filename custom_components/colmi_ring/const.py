@@ -57,6 +57,43 @@ def clamp_ycbt_monitor_interval(value: object) -> int:
     return max(YCBT_MONITOR_INTERVAL_MIN, min(YCBT_MONITOR_INTERVAL_MAX, minutes))
 
 
+# --- Proximity ("Last Seen By") ---------------------------------------------
+#
+# Which bluetooth proxy hears the ring is decided by scoring, over a rolling
+# window, each proxy that has heard it: the proxy with the best median RSSI
+# wins, and where signal strength is a wash, the one that reliably receives
+# more advertisements wins. The ring advertises about once per second and
+# every in-range proxy hears (nearly) every advertisement, so mean RSSI is
+# the distance signal while the count is a packet-loss/reliability signal -
+# a proxy at the edge of coverage persistently misses advertisements.
+#
+# Window length (seconds) each proxy's samples are scored over: ~30 expected
+# samples, enough to shrink per-advertisement RSSI jitter (body shadowing
+# swings single readings by several dB) to a usable median.
+PROXIMITY_WINDOW_S = 30.0
+# How much better (in dB) a challenger's median must be to dethrone the
+# current proxy. Two proxies in the same room have medians that straddle each
+# other by a dB or two from noise alone; this margin is comfortably above
+# that, so noise cannot hand the credit back and forth.
+PROXIMITY_RSSI_MARGIN_DB = 6
+# When two proxies' medians are within the margin of each other, a challenger
+# still wins if it has heard the ring this factor more times in the window:
+# a persistent ~25% reception-rate advantage means a genuinely better link,
+# while a single lucky extra sample moves the counts far less than this.
+PROXIMITY_COUNT_RATIO = 1.25
+# A proxy must have heard the ring at least this many times in the window to
+# compete at all: keeps a distant proxy that only rarely overhears the ring
+# out of the decision, and delays the very first credit until there is a
+# sample base worth scoring.
+PROXIMITY_MIN_SAMPLES = 3
+# Sane RSSI bounds (dBm) for accepting a sample. Bleak types rssi as
+# "int | None"; ESP32 controllers report 127 (0x7F) as "no measurement" and
+# some stacks hand over 0 or positive junk. A ring on a wrist realistically
+# never reads stronger than -20 dBm, so anything outside the bounds below is
+# dropped from scoring (the sighting still counts; only its RSSI is ignored).
+PROXIMITY_RSSI_FLOOR_DB = -127
+PROXIMITY_RSSI_CEIL_DB = -20
+
 # Import samples recorded on the ring while out of BLE range into HA history
 # (direct recorder states insert). Heart rate is a plain MEASUREMENT and
 # imports cleanly; the steps/distance/calories sensors are TOTAL_INCREASING

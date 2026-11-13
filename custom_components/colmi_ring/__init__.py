@@ -183,7 +183,16 @@ async def async_setup_entry(
     @callback
     def _async_ring_advertised(service_info: object, _change: object) -> None:
         if getattr(service_info, "address", "").upper() == ring_address_upper:
-            coordinator.async_note_ring_seen()
+            # ``source`` is the MAC of the adapter that heard this particular
+            # advertisement: the HA host's own adapter, or an ESPHome proxy.
+            # ``rssi`` is that adapter's own measurement of this advertisement
+            # in dBm. The coordinator keeps both as the ring's last known
+            # observer and its signal level (driving the Last Seen By and
+            # Signal Strength sensors used for zoning).
+            coordinator.async_note_ring_seen(
+                getattr(service_info, "source", None),
+                getattr(service_info, "rssi", None),
+            )
 
     entry.async_on_unload(
         async_register_callback(

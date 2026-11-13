@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from statistics import median
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
@@ -27,6 +31,12 @@ from .const import (
     DEFAULT_YCBT_MONITOR_INTERVAL,
     FAMILY_YCBT,
     LOGGER,
+    PROXIMITY_COUNT_RATIO,
+    PROXIMITY_MIN_SAMPLES,
+    PROXIMITY_RSSI_CEIL_DB,
+    PROXIMITY_RSSI_FLOOR_DB,
+    PROXIMITY_RSSI_MARGIN_DB,
+    PROXIMITY_WINDOW_S,
     clamp_ycbt_monitor_interval,
 )
 
@@ -42,6 +52,21 @@ if TYPE_CHECKING:
 # a busy refusal is not a connection fault and must not count towards the
 # consecutive-failure budget.
 _POLL_BUSY = object()
+
+
+@dataclass
+class _ProxySamples:
+    """
+    One proxy's recent sightings of the ring, pruned to the proximity window.
+
+    ``stamps`` (monotonic seconds) and ``signals`` (RSSI dBm, None when the
+    sample carried no usable RSSI) stay index-aligned: samples leave both
+    deques together from the left. A sighting without RSSI still counts -
+    reception frequency is scored even when the level is not.
+    """
+
+    stamps: deque[float] = field(default_factory=deque)
+    signals: deque[int | None] = field(default_factory=deque)
 
 
 # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -101,6 +126,19 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # an advertisement seen by HA's scanner, or any GATT notification we
         # received. Pushed (not polled): see async_note_ring_seen.
         self.last_seen: datetime | None = None
+        # Source (adapter MAC) of the proxy credited with hearing the ring:
+        # decided by proximity scoring over a rolling window, not by which
+        # advertisement arrived last (see _async_credit_proxy). GATT
+        # notifications carry no source, so between polls the credit is
+        # simply retained.
+        self.last_seen_source: str | None = None
+        # Window median RSSI (dBm) of the credited proxy, the smoothed number
+        # the Signal Strength sensor reports; None while the credited proxy
+        # has no usable RSSI samples.
+        self.last_seen_rssi: int | None = None
+        # Per proxy: when and how strongly it heard the ring, as parallel
+        # deques pruned to the proximity window on every sighting.
+        self._proxy_stats: dict[str, _ProxySamples] = {}
         self._seen_listeners: list[Callable[[datetime], None]] = []
 
     # Throttle for the seen signal: the timestamp is floored to whole
@@ -111,19 +149,41 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     _SEEN_THROTTLE_S = 1.0
 
     @callback
-    def async_note_ring_seen(self) -> None:
+    def async_note_ring_seen(
+        self, source: str | None = None, rssi: int | None = None
+    ) -> None:
         """
         Record that the ring was just heard from; push if the second moved.
 
-        Called from HA's bluetooth advertisement callback and from the GATT
-        notification handlers of both protocol clients. Cheap and idempotent
-        within one second: the floored timestamp doubles as the throttle, so
-        a burst of notifications re-notifies the listeners at most once per
-        second.
+        Called from HA's bluetooth advertisement callback (which passes the
+        hearing scanner's source and that advertisement's RSSI) and from the
+        GATT notification handlers of both protocol clients (no source: the
+        ring was heard over an open link, not scanned). Advertisement
+        sightings are added to the per-proxy window and re-run the proximity
+        credit; the push itself stays throttled to about once per second
+        (the floored timestamp doubles as the throttle), except on a credit
+        handover, which is worth reporting immediately.
         """
+        mono = time.monotonic()
+        credited_now = False
+        if source:
+            stats = self._proxy_stats.setdefault(source, _ProxySamples())
+            stats.stamps.append(mono)
+            stats.signals.append(
+                rssi
+                if rssi is not None
+                and PROXIMITY_RSSI_FLOOR_DB < rssi <= PROXIMITY_RSSI_CEIL_DB
+                else None
+            )
+            winner, score = self._async_credit_proxy(mono)
+            credited_now = winner != self.last_seen_source
+            self.last_seen_source = winner
+            self.last_seen_rssi = score
         seen = datetime.now(tz=UTC).replace(microsecond=0)
-        if self.last_seen is not None and (
-            seen - self.last_seen < timedelta(seconds=self._SEEN_THROTTLE_S)
+        if (
+            not credited_now
+            and self.last_seen is not None
+            and seen - self.last_seen < timedelta(seconds=self._SEEN_THROTTLE_S)
         ):
             return
         self.last_seen = seen
@@ -132,6 +192,98 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 listener(seen)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring seen-listener failed")
+
+    @callback
+    def _async_credit_proxy(self, now: float) -> tuple[str | None, int | None]:
+        """
+        Which proxy to credit with the ring, and its smoothed signal level.
+
+        Scoring over the rolling PROXIMITY_WINDOW_S window, among proxies that
+        heard the ring at least PROXIMITY_MIN_SAMPLES times: best median RSSI
+        wins; a challenger takes the credit from the current holder only if it
+        beats the holder's median by PROXIMITY_RSSI_MARGIN_DB, or the medians
+        are within that margin and it has heard the ring PROXIMITY_COUNT_RATIO
+        times more often (a persistent reception-rate edge, i.e. a genuinely
+        better link). Because the decision compares whole-window statistics
+        with a margin, per-advertisement RSSI noise - the usual flip-flop
+        driver when several proxies hear the same ring - cannot move the
+        credit at all: two same-room proxies fail both handover conditions
+        indefinitely. When the ring is heard by nobody strongly (it is out of
+        range of everything) the current credit is retained; presence is the
+        Last Seen sensor's job, not this one's.
+        """
+        stats = self._proxy_stats
+        # Prune each proxy's window (O(1) amortised from the left) and drop
+        # proxies whose window is now empty, so a day of proxy restarts
+        # cannot grow the dict.
+        for src in list(stats):
+            sample = stats[src]
+            while sample.stamps and now - sample.stamps[0] > PROXIMITY_WINDOW_S:
+                sample.stamps.popleft()
+                sample.signals.popleft()
+            if not sample.stamps:
+                del stats[src]
+
+        qualified = {
+            src: sample
+            for src, sample in stats.items()
+            if len(sample.stamps) >= PROXIMITY_MIN_SAMPLES
+        }
+        current = self.last_seen_source
+        if not qualified:
+            return current, self.last_seen_rssi
+
+        def signal_of(sample: _ProxySamples) -> float | None:
+            valid = [val for val in sample.signals if val is not None]
+            return median(valid) if valid else None
+
+        incumbent = qualified.get(current)
+        if incumbent is None:
+            # No credit yet, or the holder has fallen out of the qualified
+            # set (moved out of range / proxy restarted): hand the ring to
+            # the strongest qualified proxy. A proxy without usable RSSI
+            # scores below any measured one; equal signals go to the higher
+            # sample count.
+            best_src = max(
+                qualified,
+                key=lambda src: (
+                    signal_of(qualified[src]) is not None,
+                    signal_of(qualified[src]) or float("-inf"),
+                    len(qualified[src].stamps),
+                ),
+            )
+            best = qualified[best_src]
+            score = signal_of(best)
+            return best_src, round(score) if score is not None else None
+
+        inc_signal = signal_of(incumbent)
+        inc_count = len(incumbent.stamps)
+        challenger: str | None = None
+        challenger_sample: _ProxySamples | None = None
+        for src, sample in qualified.items():
+            if src == current:
+                continue
+            count = len(sample.stamps)
+            signal = signal_of(sample)
+            if inc_signal is None or signal is None:
+                # A median we cannot compute must never look like a signal
+                # advantage: fall back to the count rule alone.
+                beats = count >= inc_count * PROXIMITY_COUNT_RATIO
+            else:
+                beats = signal >= inc_signal + PROXIMITY_RSSI_MARGIN_DB or (
+                    abs(signal - inc_signal) < PROXIMITY_RSSI_MARGIN_DB
+                    and count >= inc_count * PROXIMITY_COUNT_RATIO
+                )
+            if beats and (
+                challenger_sample is None
+                or (signal or float("-inf"))
+                > (signal_of(challenger_sample) or float("-inf"))
+            ):
+                challenger, challenger_sample = src, sample
+        if challenger is None or challenger_sample is None:
+            return current, (round(inc_signal) if inc_signal is not None else None)
+        score = signal_of(challenger_sample)
+        return challenger, round(score) if score is not None else None
 
     def add_seen_listener(
         self, listener: Callable[[datetime], None]
