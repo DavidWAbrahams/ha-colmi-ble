@@ -241,6 +241,11 @@ class _RingConnection:
         # byte. Used to account for what a stream session actually received, so
         # a stream on an unexpected command byte is not misread as silence.
         self.observer: Callable[[bytearray], None] | None = None
+        # Second tap, fired *before* the 16-byte length filter, so the dev-only
+        # debug probe (debug_probe.py) also sees frames the normal dispatch
+        # drops. Deliberately separate from ``observer``: a stream session may
+        # own that one while a probe captures alongside it.
+        self.raw_observer: Callable[[bytearray], None] | None = None
         # Monotonic timestamp of the most recent motion packet (see
         # ``add_motion_timestamp``); used by the stream watchdog.
         self.last_motion: float | None = None
@@ -389,6 +394,68 @@ class _RingConnection:
         """Record that motion data just arrived (feeds the stream watchdog)."""
         self.last_motion = time.monotonic()
 
+    # ------------------------------------------------------------------
+    # Dev-only debug probe helpers (see debug_probe.py). These deliberately
+    # poke past the normal dispatch: the point of a probe is to see what the
+    # ring actually sends, not only what this transport knows how to parse.
+    # ------------------------------------------------------------------
+
+    def debug_gatt_table(self) -> list[str]:
+        """One line per service and characteristic, for the probe log."""
+        if self._client is None:
+            return ["(no client)"]
+        lines: list[str] = []
+        for service in self._client.services:
+            lines.append(f"service {service.uuid}")
+            lines.extend(
+                f"  char {char.uuid} [{', '.join(char.properties)}]"
+                for char in service.characteristics
+            )
+        return lines
+
+    async def debug_subscribe_extras(
+        self,
+        on_notify: Callable[[BleakGATTCharacteristic, bytearray], None],
+    ) -> list[str]:
+        """
+        Subscribe to every other notify/indicate characteristic we can find.
+
+        A probe hunting for an undocumented report (an R08 touch event, say)
+        must not assume it arrives on the UART TX characteristic. Each
+        characteristic is subscribed individually so one refusal (a firmware
+        that errors on a CCCD write) does not lose the rest. Returns the
+        UUIDs actually subscribed, for the matching unsubscribe.
+        """
+        assert self._client is not None
+        subscribed: list[str] = []
+        for service in self._client.services:
+            for char in service.characteristics:
+                if char.uuid.upper() == UART_TX_CHAR_UUID:
+                    continue  # already dispatched through _handle_tx
+                if not {"notify", "indicate"} & set(char.properties):
+                    continue
+                try:
+                    await self._client.start_notify(char, on_notify)
+                except (TimeoutError, BleakError, OSError):
+                    LOGGER.debug("Probe could not subscribe to %s", char.uuid)
+                    continue
+                subscribed.append(char.uuid)
+        return subscribed
+
+    async def debug_unsubscribe_extras(self, uuids: list[str]) -> None:
+        """Best-effort undo of :meth:`debug_subscribe_extras`."""
+        if self._client is None:
+            return
+        for uuid in uuids:
+            try:
+                await self._client.stop_notify(uuid)
+            except (TimeoutError, BleakError, OSError):
+                LOGGER.debug("Probe could not unsubscribe %s", uuid)
+
+    async def debug_send(self, frame: bytearray) -> None:
+        """Send one raw caller-built frame (the probe supplies the checksum)."""
+        await self._send(frame)
+
     async def close(self) -> None:
         """Disconnect the GATT link; safe to call twice or on a dead link."""
         if self._client is None:
@@ -404,6 +471,13 @@ class _RingConnection:
 
     def _handle_tx(self, _: BleakGATTCharacteristic, packet: bytearray) -> None:
         """Bleak notification callback: dispatch a 16-byte packet to its parser."""
+        if self.raw_observer is not None:
+            # Debug-probe tap: sees *every* notification, including ones of a
+            # length this transport would otherwise discard.
+            try:
+                self.raw_observer(packet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring raw packet observer raised")
         if self._on_seen is not None:
             # Any inbound notification is proof the ring is alive and in
             # range, whether or not the packet itself is usable. The
@@ -1146,6 +1220,11 @@ class ColmiRingApiClient:
         connection owned by nobody in the meantime.
         """
         await self._link.close()
+
+    @property
+    def debug_link(self) -> SharedLink:
+        """The shared link, exposed for the dev-only debug probe service."""
+        return self._link
 
     def _claim_measurement(self, name: str) -> None:
         """

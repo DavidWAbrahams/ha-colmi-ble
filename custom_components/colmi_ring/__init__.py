@@ -7,6 +7,7 @@ https://github.com/ludeeus/integration_blueprint
 
 from __future__ import annotations
 
+import functools
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,7 @@ from .const import (
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
+from .debug_probe import cancel_probe, register_probe_service, remove_probe_service
 from .motion_manager import MotionManager
 from .ycbt_api import YcbtRingApiClient
 
@@ -216,6 +218,13 @@ async def async_setup_entry(
     # which ignores errors from the first refresh.
     await coordinator.async_config_entry_first_refresh()
 
+    # Dev-only raw-packet capture service (see debug_probe.py), shown in
+    # Developer Actions as colmi_ring.debug_packet_probe. Registered per
+    # entry and reference counted, so one entry unloading keeps the service
+    # for the others.
+    register_probe_service(hass)
+    entry.async_on_unload(functools.partial(remove_probe_service, hass))
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
@@ -227,6 +236,9 @@ async def async_unload_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
+    # A running dev probe holds the link and has polling paused; end it
+    # before anything else goes away so its cleanup sees a live coordinator.
+    await cancel_probe(entry.entry_id)
     # Close a live stream before its entities disappear, and before the
     # coordinator stops: otherwise the stream task is left holding a connection
     # nobody owns any more.

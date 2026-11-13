@@ -1,0 +1,60 @@
+# Dev-only diagnostic service (see debug_probe.py). The results are log
+# lines tagged PROBE, not returned data.
+debug_packet_probe:
+  name: Debug packet probe
+  description: >-
+    Captures every raw BLE notification from the ring (and optionally sends
+    raw hex frames) for a fixed duration, using Home Assistant's own
+    Bluetooth connection. Polling is paused for the duration. Everything is
+    logged at warning level as lines containing "PROBE". Colmi-family rings
+    only.
+  fields:
+    entry_id:
+      name: Config entry
+      description: >-
+        The colmi_ring config entry to probe. Optional when only one entry
+        exists.
+      required: false
+      example: 01HZY123456789ABCDEF
+      selector:
+        text:
+    address:
+      name: Ring MAC address
+      description: >-
+        Alternative to entry_id: the MAC address of the ring's config entry.
+      required: false
+      example: "78:14:12:A0:0F:8C"
+      selector:
+        text:
+    duration_s:
+      name: Duration (seconds)
+      description: >-
+        How long to capture. Interact with the ring during this window.
+      required: false
+      default: 60
+      selector:
+        number:
+          min: 5
+          max: 900
+          step: 5
+          unit_of_measurement: s
+    frames:
+      name: Raw frames to send (hex)
+      description: >-
+        Optional list of raw packets to write to the ring, each as plain hex
+        (spaces optional), sent in order at the start of the capture. The
+        ring's 16-byte protocol expects a checksum in byte 15; it is your
+        responsibility.
+      required: false
+      example: '["3B 02 01 05 00 00 00 00 00 00 00 00 00 00 00 43"]'
+      selector:
+        object:
+    subscribe_all:
+      name: Subscribe to all characteristics
+      description: >-
+        Also start_notify on every other notify-capable characteristic of the
+        ring, so reports on unknown characteristics are captured too.
+      required: false
+      default: true
+      selector:
+        boolean:
