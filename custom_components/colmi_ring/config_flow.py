@@ -64,8 +64,8 @@ from .const import (
     TOUCH_SLEEP_MINUTES_MIN,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
-    supports_touch,
 )
+from .touch_gate import ring_has_touch
 from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:
@@ -508,10 +508,10 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
 
     def _touch_options(self) -> dict[vol.Optional, Any]:
         """Touch-surface options, for rings that have a touch surface."""
-        # Same name gate as the entity layer: a ring with no touch surface gets
-        # no touch options, so the options form never offers controls that
-        # nothing reads.
-        if not supports_touch(self.config_entry.title):
+        # The same gate setup used to build (or omit) the TouchManager, so the
+        # options form offers touch settings exactly when some entity reads
+        # them.
+        if not ring_has_touch(self.hass, self.config_entry):
             return {}
         return {
             vol.Optional(

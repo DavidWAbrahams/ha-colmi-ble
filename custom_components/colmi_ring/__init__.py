@@ -33,12 +33,12 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     clamp_ycbt_monitor_interval,
-    supports_touch,
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
 from .debug_probe import cancel_probe, register_probe_service, remove_probe_service
 from .motion_manager import MotionManager
+from .touch_gate import ring_has_touch
 from .touch_manager import TouchManager
 from .ycbt_api import YcbtRingApiClient
 
@@ -230,7 +230,7 @@ async def async_setup_entry(
     # options flow all check it rather than re-deriving it.
     touch = (
         TouchManager(hass, entry, client, coordinator)
-        if family == FAMILY_COLMI and supports_touch(entry.title)
+        if family == FAMILY_COLMI and ring_has_touch(hass, entry)
         else None
     )
     coordinator.touch = touch
