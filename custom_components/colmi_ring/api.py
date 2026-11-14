@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
 
     from bleak.backends.characteristic import BleakGATTCharacteristic
+    from bleak.backends.descriptor import BleakGATTDescriptor
     from bleak.backends.device import BLEDevice
     from homeassistant.core import HomeAssistant
 
@@ -408,14 +409,21 @@ class _RingConnection:
     # ------------------------------------------------------------------
 
     def debug_gatt_table(self) -> list[str]:
-        """One line per service and characteristic, for the probe log."""
+        """
+        One line per service and characteristic, for the probe log.
+
+        Handles are included because they, not UUIDs, identify a declaration:
+        a Bluetooth HID device publishes several characteristics under one UUID
+        (the R08 has four ``2a4d`` Reports), so a capture that names only UUIDs
+        cannot say which of them anything happened on.
+        """
         if self._client is None:
             return ["(no client)"]
         lines: list[str] = []
         for service in self._client.services:
             lines.append(f"service {service.uuid}")
             lines.extend(
-                f"  char {char.uuid} [{', '.join(char.properties)}]"
+                f"  char {char.uuid}#{char.handle} [{', '.join(char.properties)}]"
                 for char in service.characteristics
             )
         return lines
@@ -423,47 +431,86 @@ class _RingConnection:
     async def debug_subscribe_extras(
         self,
         on_notify: Callable[[BleakGATTCharacteristic, bytearray], None],
-    ) -> list[str]:
+    ) -> tuple[list[BleakGATTCharacteristic], list[BleakGATTCharacteristic]]:
         """
         Subscribe to every other notify/indicate characteristic we can find.
 
         A probe hunting for an undocumented report (an R08 touch event, say)
         must not assume it arrives on the UART TX characteristic. Each
         characteristic is subscribed individually so one refusal (a firmware
-        that errors on a CCCD write) does not lose the rest. Returns the
-        UUIDs actually subscribed, for the matching unsubscribe.
+        that errors on a CCCD write) does not lose the rest.
+
+        Returns ``(subscribed, refused)`` *as characteristic objects* rather
+        than UUIDs. Addressing by object is what distinguishes this ring's four
+        Report declarations (``2a4d``, same UUID, different handles): addressed
+        by UUID, both a subscription and its unsubscribe mean "whichever
+        declaration the stack happens to find first", so the probe can end up
+        listening on a report that is not the one carrying events. Refusals are
+        returned rather than swallowed for the same reason - in a live capture
+        exactly one of the two notify-capable ``2a4d`` declarations refused the
+        CCCD write, and being able to retry that specific one (see
+        :meth:`debug_subscribe_specific`) is what separates "this device is
+        silent" from "the only report characteristic we could enable is silent".
         """
         assert self._client is not None
-        subscribed: list[str] = []
-        for service in self._client.services:
-            for char in service.characteristics:
-                if char.uuid.upper() == UART_TX_CHAR_UUID:
-                    continue  # already dispatched through _handle_tx
-                if not {"notify", "indicate"} & set(char.properties):
-                    continue
-                try:
-                    await self._client.start_notify(char, on_notify)
-                except (TimeoutError, BleakError, OSError):
-                    LOGGER.debug("Probe could not subscribe to %s", char.uuid)
-                    continue
-                subscribed.append(char.uuid)
-        return subscribed
+        candidates = [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+            # The UART TX characteristic is already dispatched through
+            # _handle_tx; anything else that can notify is fair game.
+            if char.uuid.upper() != UART_TX_CHAR_UUID
+            and {"notify", "indicate"} & set(char.properties)
+        ]
+        return await self.debug_subscribe_specific(candidates, on_notify)
 
-    async def debug_unsubscribe_extras(self, uuids: list[str]) -> None:
+    async def debug_subscribe_specific(
+        self,
+        chars: list[BleakGATTCharacteristic],
+        on_notify: Callable[[BleakGATTCharacteristic, bytearray], None],
+    ) -> tuple[list[BleakGATTCharacteristic], list[BleakGATTCharacteristic]]:
+        """
+        Subscribe to the given characteristics, one at a time.
+
+        Split out from :meth:`debug_subscribe_extras` so a probe can retry a
+        known set after changing the device's state: a peripheral may reject a
+        CCCD write while its input source is idle and accept the same write
+        once configured, so an early refusal is not necessarily a final one.
+        """
+        assert self._client is not None
+        subscribed: list[BleakGATTCharacteristic] = []
+        refused: list[BleakGATTCharacteristic] = []
+        for char in chars:
+            try:
+                await self._client.start_notify(char, on_notify)
+            except (TimeoutError, BleakError, OSError):
+                refused.append(char)
+                continue
+            subscribed.append(char)
+        return subscribed, refused
+
+    async def debug_unsubscribe_extras(
+        self,
+        chars: list[BleakGATTCharacteristic],
+    ) -> None:
         """Best-effort undo of :meth:`debug_subscribe_extras`."""
         if self._client is None:
             return
-        for uuid in uuids:
+        for char in chars:
             try:
-                await self._client.stop_notify(uuid)
+                await self._client.stop_notify(char)
             except (TimeoutError, BleakError, OSError):
-                LOGGER.debug("Probe could not unsubscribe %s", uuid)
+                LOGGER.debug(
+                    "Probe could not unsubscribe %s (handle %d)",
+                    char.uuid,
+                    char.handle,
+                )
 
     async def debug_send(self, frame: bytearray) -> None:
         """Send one raw caller-built frame (the probe supplies the checksum)."""
         await self._send(frame)
 
-    async def debug_write(self, uuid: str, data: bytearray) -> None:
+    async def debug_write(self, uuid: str, data: bytearray) -> int:
         """
         Write one arbitrary characteristic by UUID, for the dev probe.
 
@@ -473,6 +520,11 @@ class _RingConnection:
         characteristics insist on a response. Bleak does not reliably infer it
         here, so the choice comes straight from the characteristic's own
         advertised properties.
+
+        Returns the handle actually written, because a UUID can name more than
+        one declaration - this ring publishes four Report characteristics
+        (``2a4d``) - and then "which one did I just write" is the question the
+        capture turns on.
         """
         if self._client is None:
             raise ColmiRingApiClientError("not connected")
@@ -487,29 +539,69 @@ class _RingConnection:
         else:
             raise ColmiRingApiClientError(f"{uuid} is not writable ({char.properties})")
         await self._client.write_gatt_char(char, data, response=response)
+        return char.handle
 
-    async def debug_read(self, uuid: str) -> bytes:
+    async def debug_read(self, specifier: BleakGATTCharacteristic | int | str) -> bytes:
         """
-        Read one characteristic by UUID, for the dev probe.
+        Read one characteristic, for the dev probe.
 
         Some answers are descriptors of the protocol rather than traffic: the
         Bluetooth HID Report Map (``2a4b``) says exactly how this ring's input
         reports are laid out, which no amount of packet sniffing will tell you
         if the device stays quiet during the capture.
+
+        Accepts a characteristic object or handle as well as a UUID, for the
+        same reason the subscription helpers do: duplicated UUIDs make "read
+        this by UUID" mean "read whichever declaration the stack found first".
         """
         assert self._client is not None
-        return bytes(await self._client.read_gatt_char(uuid))
+        return bytes(await self._client.read_gatt_char(specifier))
 
-    def debug_readable_chars(self) -> list[str]:
-        """UUIDs of every readable characteristic, for the dev probe's dump."""
+    def debug_readable_chars(self) -> list[BleakGATTCharacteristic]:
+        """
+        Every characteristic with a readable value, for the probe's dump.
+
+        Characteristics, not UUIDs: addressing by object is what distinguishes
+        the ring's four ``2a4d`` Report declarations from one another.
+        """
         if self._client is None:
             return []
         return [
-            char.uuid
+            char
             for service in self._client.services
             for char in service.characteristics
             if "read" in char.properties
         ]
+
+    def debug_gatt_chars(self) -> list[BleakGATTCharacteristic]:
+        """Every characteristic on the link, for the dev probe's inspection."""
+        if self._client is None:
+            return []
+        return [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+        ]
+
+    def debug_char_descriptors(
+        self,
+        char: BleakGATTCharacteristic,
+    ) -> list[BleakGATTDescriptor]:
+        """
+        A characteristic's descriptors, for the dev probe to name and read.
+
+        Descriptors are where a duplicated UUID stops being ambiguous: a
+        Bluetooth HID Report characteristic carries a Report Reference
+        (``2908``) holding its report ID and type (1 Input / 2 Output /
+        3 Feature), which is what says which of four ``2a4d`` declarations is
+        the input report, and therefore which one to listen to.
+        """
+        return list(char.descriptors)
+
+    async def debug_read_descriptor(self, descriptor: BleakGATTDescriptor) -> bytes:
+        """Read one descriptor, for the dev probe."""
+        assert self._client is not None
+        return bytes(await self._client.read_gatt_descriptor(descriptor.handle))
 
     async def close(self) -> None:
         """Disconnect the GATT link; safe to call twice or on a dead link."""

@@ -49,9 +49,11 @@ from .api import ColmiRingApiClient, ColmiRingApiClientError
 from .const import DOMAIN, LOGGER
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
     from datetime import timedelta
 
     from bleak.backends.characteristic import BleakGATTCharacteristic
+    from bleak.backends.descriptor import BleakGATTDescriptor
     from homeassistant.core import HomeAssistant, ServiceCall
 
     from .api import _RingConnection
@@ -74,11 +76,35 @@ _MAX_PACKET_LINES = 400
 
 # How many static descriptors to dump, and how many bytes of each. A Report
 # Map fits well inside these; a runaway descriptor must not spam the log.
-_MAX_READ_CHARS = 12
+#
+# The cap has a footgun, learned the hard way: a live run read exactly this
+# many characteristics and stopped *before* the Bluetooth HID service, which
+# happened to enumerate last - so the Report Map it was run to obtain never
+# got read. Interesting characteristics are therefore dumped first (see
+# ``_hogp_priority``) rather than trusting discovery order.
+_MAX_READ_CHARS = 24
 _MAX_READ_BYTES = 300
 
 # How much of a raw write to echo into the log before truncating it.
 _MAX_WRITE_LOG_BYTES = 32
+
+# Standard base UUID, so a characteristic's 16-bit assigned number can be
+# pulled out and compared against the Bluetooth HID Service's.
+_BASE_UUID_SUFFIX = "-0000-1000-8000-00805f9b34fb"
+
+# The Bluetooth HID Service's characteristics: HID Information (2a4a), Report
+# Map (2a4b), HID Control Point (2a4c), Report (2a4d), Protocol Mode (2a4e).
+_HOGP_SHORT_UUIDS = frozenset({"2a4a", "2a4b", "2a4c", "2a4d", "2a4e"})
+
+# A HID Report characteristic's Report Reference descriptor, holding the
+# report ID and report type that distinguish one 2a4d declaration from the
+# next. Report Reference is 2908, but the descriptor list is read as a whole
+# because firmware also stashes a User Description (2901) there sometimes.
+_HID_DESCRIPTOR_SHORT_UUIDS = frozenset({"2908", "2901", "2902"})
+
+# Per-characteristic descriptor cap, for a firmware that advertises a lot.
+_MAX_DESCRIPTORS_PER_CHAR = 6
+_MAX_DESCRIPTOR_BYTES = 16
 
 SERVICE_SCHEMA = vol.Schema(
     {
@@ -283,6 +309,24 @@ def _parse_writes(writes: object) -> list[tuple[str, bytearray]]:
     return parsed
 
 
+def _short_uuid(uuid: str) -> str:
+    """A characteristic UUID's assigned number, when it has the base form."""
+    lowered = uuid.lower()
+    if lowered.endswith(_BASE_UUID_SUFFIX):
+        return lowered[4:8]
+    return lowered
+
+
+def _hogp_priority(char: BleakGATTCharacteristic) -> int:
+    """Sort key putting the Bluetooth HID Service's characteristics first."""
+    return 0 if _short_uuid(char.uuid) in _HOGP_SHORT_UUIDS else 1
+
+
+def _label(char: BleakGATTCharacteristic) -> str:
+    """``uuid#handle``, the only way to name one of several same-UUID declarations."""
+    return f"{char.uuid}#{char.handle}"
+
+
 async def _send_writes(
     conn: _RingConnection,
     address: str,
@@ -300,15 +344,22 @@ async def _send_writes(
             suffix,
         )
         try:
-            await conn.debug_write(uuid, payload)
+            handle = await conn.debug_write(uuid, payload)
         except (TimeoutError, BleakError, OSError) as err:
             LOGGER.warning("PROBE %s TX[%s] failed: %s", address, uuid[:8], err)
+            continue
+        # The handle answers "which declaration did I just write", which for a
+        # HID peripheral with four Report characteristics is not pedantry:
+        # writing the wrong one is a silent no-op that looks like a dead device.
+        LOGGER.warning(
+            "PROBE %s TX[%s] written to handle %d", address, uuid[:8], handle
+        )
         await asyncio.sleep(0.2)
 
 
 async def _dump_readable_chars(conn: _RingConnection, address: str) -> None:
     """
-    Log every readable characteristic's value.
+    Log every readable characteristic's value, HID ones first.
 
     Static descriptors answer questions traffic cannot: the Bluetooth HID
     Report Map (``2a4b``) states how a ring's input reports are laid out,
@@ -317,15 +368,195 @@ async def _dump_readable_chars(conn: _RingConnection, address: str) -> None:
     capped so an unexpectedly huge descriptor cannot spam the log, and each
     is guarded because some firmwares reject individual reads.
     """
-    for uuid in conn.debug_readable_chars()[:_MAX_READ_CHARS]:
+    readable = sorted(conn.debug_readable_chars(), key=_hogp_priority)
+    for char in readable[:_MAX_READ_CHARS]:
         try:
-            value = await conn.debug_read(uuid)
+            value = await conn.debug_read(char)
         except (TimeoutError, BleakError, OSError) as err:
-            LOGGER.warning("PROBE %s READ %s failed: %s", address, uuid, err)
+            LOGGER.warning("PROBE %s READ %s failed: %s", address, _label(char), err)
             continue
         shown = value[:_MAX_READ_BYTES]
         suffix = f" ... ({len(value)} bytes total)" if len(value) > len(shown) else ""
-        LOGGER.warning("PROBE %s READ %s = %s%s", address, uuid, shown.hex(" "), suffix)
+        LOGGER.warning(
+            "PROBE %s READ %s = %s%s",
+            address,
+            _label(char),
+            shown.hex(" "),
+            suffix,
+        )
+
+
+def _label_desc(desc: BleakGATTDescriptor) -> str:
+    """``uuid#handle`` for a descriptor, matching how characteristics are named."""
+    return f"{desc.uuid}#{desc.handle}"
+
+
+async def _dump_hid_descriptors(conn: _RingConnection, address: str) -> None:
+    """
+    Log the descriptors that tell the HID reports apart.
+
+    A HID peripheral declares one characteristic per report, all under the
+    same ``2a4d`` UUID - this ring publishes four. Their Report Reference
+    descriptors (``2908``) hold the report ID and the report type (1 Input /
+    2 Output / 3 Feature), which is what identifies the input reports, and
+    therefore which declaration a touch notification would arrive on. Without
+    it, a probe that hears nothing cannot tell "not the report I subscribed
+    to" from "no notifications at all".
+    """
+    chars = [
+        char
+        for char in sorted(conn.debug_gatt_chars(), key=_hogp_priority)
+        if _hogp_priority(char) == 0
+    ]
+    for char in chars:
+        descriptors = conn.debug_char_descriptors(char)
+        interesting = [
+            desc
+            for desc in descriptors
+            if _short_uuid(desc.uuid) in _HID_DESCRIPTOR_SHORT_UUIDS
+        ]
+        if not interesting:
+            continue
+        LOGGER.warning(
+            "PROBE %s CHAR %s descriptors: %s",
+            address,
+            _label(char),
+            ", ".join(_label_desc(desc) for desc in descriptors),
+        )
+        for desc in interesting[:_MAX_DESCRIPTORS_PER_CHAR]:
+            try:
+                value = await conn.debug_read_descriptor(desc)
+            except (TimeoutError, BleakError, OSError) as err:
+                LOGGER.warning(
+                    "PROBE %s DESC %s failed: %s", address, _label_desc(desc), err
+                )
+                continue
+            shown = value[:_MAX_DESCRIPTOR_BYTES]
+            LOGGER.warning(
+                "PROBE %s DESC %s = %s", address, _label_desc(desc), shown.hex(" ")
+            )
+
+
+def _log_refusals(
+    address: str, verb: str, chars: Sequence[BleakGATTCharacteristic]
+) -> None:
+    """
+    Log each characteristic ``start_notify`` refused, one line at a time.
+
+    A refusal can be the finding rather than the noise: in a live capture one
+    of the two notify-capable ``2a4d`` declarations rejected the CCCD write
+    while the other accepted it, so "silent" may mean "silent on the one
+    declaration we managed to enable".
+    """
+    for char in chars:
+        LOGGER.warning("PROBE %s %s %s", address, verb, _label(char))
+
+
+async def _async_subscribe_extras(
+    conn: _RingConnection,
+    address: str,
+    on_extra: Callable[[BleakGATTCharacteristic, bytearray], None],
+) -> tuple[list[BleakGATTCharacteristic], list[BleakGATTCharacteristic]]:
+    """Subscribe to every other notify characteristic; return (got, refused)."""
+    extra_chars, refused = await conn.debug_subscribe_extras(on_extra)
+    LOGGER.warning(
+        "PROBE %s subscribed to %d extra notify characteristic(s): %s",
+        address,
+        len(extra_chars),
+        ", ".join(_label(char) for char in extra_chars) or "none",
+    )
+    _log_refusals(address, "could not subscribe", refused)
+    return extra_chars, refused
+
+
+async def _async_retry_refused(
+    conn: _RingConnection,
+    address: str,
+    refused: Sequence[BleakGATTCharacteristic],
+    on_extra: Callable[[BleakGATTCharacteristic, bytearray], None],
+) -> list[BleakGATTCharacteristic]:
+    """
+    Retry the subscriptions that refused, now that the device is configured.
+
+    A peripheral is allowed to reject a CCCD write while its input source is
+    idle and accept it once configured, so the first pass's refusals are not
+    necessarily permanent ones - and a report characteristic left
+    unsubscribed is exactly how a live device looks silent.
+    """
+    retried, still_refused = await conn.debug_subscribe_specific(refused, on_extra)
+    if retried:
+        LOGGER.warning(
+            "PROBE %s subscribed after configuring: %s",
+            address,
+            ", ".join(_label(char) for char in retried),
+        )
+    _log_refusals(address, "still cannot subscribe", still_refused)
+    return retried
+
+
+async def _async_wait_for_window(
+    conn: _RingConnection, address: str, duration_s: float
+) -> bool:
+    """
+    Sleep out the capture window; True when the GATT link dropped instead.
+
+    Ending early on a drop keeps the probe honest: with no link there is
+    nothing left to capture, and a minute of silence after a disconnect reads
+    like a dead input source.
+    """
+    sleeper = asyncio.ensure_future(asyncio.sleep(duration_s))
+    dropped = asyncio.ensure_future(conn.dead.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {sleeper, dropped},
+            timeout=duration_s + 5.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for waiter in (sleeper, dropped):
+            if not waiter.done():
+                waiter.cancel()
+    if dropped in done:
+        LOGGER.warning(
+            "PROBE %s GATT link dropped - ending the probe early",
+            address,
+        )
+        return True
+    return False
+
+
+async def _recheck_hid_descriptors(conn: _RingConnection, address: str) -> None:
+    """
+    Re-read the HID descriptors once the capture window has closed.
+
+    Doing it at the end as well as the start is what makes one run answer the
+    ``appType`` question: if the firmware swaps a gesture's HID usage table
+    when configured, the Report Map read after the config frame differs from
+    the one read before it, and the two lines sit next to each other in the
+    log. If they match while report payloads differ, the map is fixed and only
+    the usages inside it move - a single decoder plus a config knob, instead of
+    a layout per profile.
+    """
+    chars = [
+        char
+        for char in sorted(conn.debug_gatt_chars(), key=_hogp_priority)
+        if _hogp_priority(char) == 0 and "read" in char.properties
+    ]
+    for char in chars:
+        try:
+            value = await conn.debug_read(char)
+        except (TimeoutError, BleakError, OSError) as err:
+            LOGGER.warning("PROBE %s RE-READ %s failed: %s", address, _label(char), err)
+            continue
+        shown = value[:_MAX_READ_BYTES]
+        suffix = f" ... ({len(value)} bytes total)" if len(value) > len(shown) else ""
+        LOGGER.warning(
+            "PROBE %s RE-READ %s = %s%s",
+            address,
+            _label(char),
+            shown.hex(" "),
+            suffix,
+        )
 
 
 async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
@@ -345,7 +576,7 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
 
     started = time.monotonic()
     lines_logged = 0
-    extra_uuids: list[str] = []
+    extra_chars: list[BleakGATTCharacteristic] = []
     conn = None
     tally: dict[str, int] = {}
 
@@ -375,7 +606,10 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
         note("RX", packet)
 
     def on_extra(char: BleakGATTCharacteristic, packet: bytearray) -> None:
-        note(f"RX[{char.uuid[:8]}]", packet)
+        # The handle is part of the label so a report on one of several
+        # same-UUID declarations is attributable: on this ring four of them
+        # share ``2a4d``, and which one fired is the whole measurement.
+        note(f"RX[{char.uuid[:8]}#{char.handle}]", packet)
 
     def pause_polling() -> timedelta | None:
         """
@@ -421,39 +655,26 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
                     for line in conn.debug_gatt_table():
                         LOGGER.warning("PROBE %s GATT %s", address, line)
                     await _dump_readable_chars(conn, address)
+                    await _dump_hid_descriptors(conn, address)
+                    refused: list[BleakGATTCharacteristic] = []
                     if subscribe_all:
-                        extra_uuids = await conn.debug_subscribe_extras(on_extra)
-                        LOGGER.warning(
-                            "PROBE %s subscribed to %d extra notify"
-                            " characteristic(s): %s",
-                            address,
-                            len(extra_uuids),
-                            ", ".join(extra_uuids) or "none",
+                        extra_chars, refused = await _async_subscribe_extras(
+                            conn, address, on_extra
                         )
                     for frame in frames:
                         LOGGER.warning("PROBE %s TX %s", address, frame.hex(" "))
                         await conn.debug_send(frame)
                         await asyncio.sleep(0.2)
                     await _send_writes(conn, address, writes)
-                    # End early if the ring drops the link; the probe is
-                    # worthless once there is nothing to capture from.
-                    sleeper = asyncio.ensure_future(asyncio.sleep(duration_s))
-                    dropped = asyncio.ensure_future(conn.dead.wait())
-                    try:
-                        done, _ = await asyncio.wait(
-                            {sleeper, dropped},
-                            timeout=duration_s + 5.0,
-                            return_when=asyncio.FIRST_COMPLETED,
+                    if refused:
+                        extra_chars.extend(
+                            await _async_retry_refused(conn, address, refused, on_extra)
                         )
-                    finally:
-                        for waiter in (sleeper, dropped):
-                            if not waiter.done():
-                                waiter.cancel()
-                    if dropped in done:
-                        LOGGER.warning(
-                            "PROBE %s GATT link dropped - ending the probe early",
-                            address,
-                        )
+                    if not await _async_wait_for_window(conn, address, duration_s):
+                        # Re-read the HID descriptors now that everything above
+                        # has been configured, so one run can say whether the
+                        # config frame changed them (see the function).
+                        await _recheck_hid_descriptors(conn, address)
                 finally:
                     conn.raw_observer = prev_observer
         except (TimeoutError, ColmiRingApiClientError) as err:
@@ -464,7 +685,7 @@ async def _async_run_probe(  # noqa: PLR0915 - one straight-line probe procedure
             )
     finally:
         if conn is not None:
-            await conn.debug_unsubscribe_extras(extra_uuids)
+            await conn.debug_unsubscribe_extras(extra_chars)
         if polling_paused:
             resume_polling(saved_interval)
         summary = ", ".join(f"{key} x{count}" for key, count in tally.items())
