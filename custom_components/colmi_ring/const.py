@@ -173,12 +173,18 @@ CONF_BACKFILL_ON_RECONNECT = "backfill_on_reconnect"
 # custom event of the same name.
 GESTURE_EVENT_TYPE = "colmi_ring_gesture"
 
+# Event type for the R08 touch surface (tap / swipe), kept separate from the
+# accelerometer gestures above: different sensor, different firmware path, and
+# an R08-only capability, so the two event kinds stay separately subscribable.
+TOUCH_EVENT_TYPE = "colmi_ring_touch"
+
 # The two sessions refuse each other with these (see MotionManager): RAW mode
 # takes the accelerometer for itself and silences the ring's camera-gesture
 # reports, so the modes cannot run at once even though they now share one link.
 # One message per kind of session, so the refusal names the switch to turn off.
 STREAM_BUSY_MESSAGE = "Unavailable while the motion stream is on"
 WAVE_BUSY_MESSAGE = "Unavailable while wave detection is on"
+TOUCH_BUSY_MESSAGE = "Unavailable while touch control is on"
 
 # The ring's optical sensor lights different LEDs per reading type, so the
 # on-demand measurements (Read Heart Rate / Read SpO2 / Read Temperature /
@@ -321,16 +327,19 @@ MOTION_VERTICAL_AXIS = "z"
 # garbage and falls back rather than raising deep inside the packet path.
 MOTION_HOLE_AXES = frozenset({"x", "y", "z"})
 
-# Per-model hole-axis overrides, keyed by the advertisement name (which the
-# config entry is titled after). Most Colmi firmware maps the hole onto the Z
-# axis, but the R08 runs the hole through the Y axis instead: held upright on
-# a finger, its Z reads near zero and Y reads 1 g. A ring that misreads by a
-# quarter turn is a table entry, not a code change. Match the ``Rnn_``
+# Matches the R08's advertisement name, which is what the config entry is
+# titled after (see config_flow._entry_title). Shared by every per-model R08
+# quirk below so a rename is fixed in one place. Match the ``Rnn_``
 # advertisement shape (see config_flow._COLMI_NAME_RE); ``?`` covers the
 # ``R8_``-style spelling some firmwares use for single-digit models.
-_HOLE_AXIS_BY_MODEL: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^R0?8[ _]", re.IGNORECASE), "y"),
-)
+_R08_NAME_RE = re.compile(r"^R0?8[ _]", re.IGNORECASE)
+
+# Per-model hole-axis overrides, keyed by the advertisement name. Most Colmi
+# firmware maps the hole onto the Z axis, but the R08 runs the hole through the
+# Y axis instead: held upright on a finger, its Z reads near zero and Y reads
+# 1 g. A ring that misreads by a quarter turn is a table entry, not a code
+# change.
+_HOLE_AXIS_BY_MODEL: tuple[tuple[re.Pattern[str], str], ...] = ((_R08_NAME_RE, "y"),)
 
 # Option selecting the hole axis for the vertical angle and the angle-gated
 # gestures. "auto" (the default) picks it from the model-name table above, so
@@ -496,3 +505,53 @@ MOTION_STREAM_SILENCE_TIMEOUT_S = 30.0
 # fires one HA event per packet. Set below the gap a deliberate double-wave has
 # in practice, so two real waves stay two events.
 WAVE_REPORT_COOLDOWN_S = 0.8
+
+
+# --- R08 touch surface ------------------------------------------------------
+#
+# A touch-sensitive outer surface, reported over Bluetooth HID rather than the
+# Colmi UART (see colmi_codec/r08.py). Nothing here has been observed on a
+# non-R08 ring: the surface is absent on the R07, and the R20/R99 family speaks
+# a different protocol entirely. Gating on the advertisement name follows the
+# hole-axis table above for the same reason - the capability is a property of
+# the model, and a name match means an existing entry picks the capability up
+# on reload without a config-entry migration.
+def supports_touch(model_name: object) -> bool:
+    """
+    True if this ring is known to have a touch surface we can read.
+
+    Takes the config entry's title (the advertisement name) rather than a
+    capability bit, because the ring offers no capability query for touch: the
+    only honest answer available before connecting is which model it is.
+    Anything unusable - ``None``, a non-string, an unknown model - is False, so
+    a ring we have never seen gets no touch entities rather than ones that can
+    never fire.
+    """
+    name = model_name if isinstance(model_name, str) else ""
+    return bool(_R08_NAME_RE.search(name))
+
+
+# Minutes the touch listener holds the ring's link before switching itself off.
+# Same convention as CONF_WAVE_TIMEOUT, and the same cost: the listener does not
+# stream, so it is meant to be left on, but while it is on the ring's single
+# link is taken and heart rate, battery and steps stop updating. So it defaults
+# to 0 ("leave it on until I say otherwise").
+CONF_TOUCH_TIMEOUT = "touch_timeout"
+DEFAULT_TOUCH_TIMEOUT = 0
+
+# Minutes the ring's touch surface stays awake between touches, sent as the
+# sleep byte of the touch config frame. The firmware default is 5 (the OEM app's
+# ``touchMusicKeys`` frame); after that the surface sleeps and the next tap may
+# need a re-arm, which is why it is an option rather than a constant.
+# ``colmi_codec.r08.DEFAULT_TOUCH_SLEEP_MINUTES`` is the wire-side twin.
+CONF_TOUCH_SLEEP_MINUTES = "touch_sleep_minutes"
+DEFAULT_TOUCH_SLEEP_MINUTES = 5
+TOUCH_SLEEP_MINUTES_MIN = 1
+TOUCH_SLEEP_MINUTES_MAX = 255
+
+# Which HID usage profile the firmware lights up. 1 is the documented media-key
+# profile and the only one touch reports have been captured under; 4 is the OEM
+# app's "touch fallback". Not yet exposed in the options flow: the media profile
+# already produces the reports, so there is no user-visible reason to choose.
+CONF_TOUCH_APP_TYPE = "touch_app_type"
+DEFAULT_TOUCH_APP_TYPE = 1
