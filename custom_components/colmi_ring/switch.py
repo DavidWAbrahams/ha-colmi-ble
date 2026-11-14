@@ -1,5 +1,5 @@
 """
-Switch platform for colmi_ring: the two things that hold the ring's link.
+Switch platform for colmi_ring: the things that hold the ring's link.
 
 ``Motion Stream`` takes the ring's shared Bluetooth link for itself and streams
 raw accelerometer data, which is what makes gesture detection possible and is
@@ -16,8 +16,14 @@ other, though: RAW mode takes the accelerometer and silences the ring's
 gesture reports, so turning one on while the other runs raises rather than
 silently killing the user's session.
 
-Both report the state of their session rather than the last request, so if the
-ring refuses to connect, or an auto-off timer fires, or a reload shuts a
+``Touch Control`` is the third, and only exists on a ring with a touch surface
+(R08). It shares the link like wave detection does - reports are HID
+notifications - so unlike the other two it costs nothing in polling: what it
+costs is the capacitive sensor the firmware keeps powered while it listens,
+which is why it too has an auto-off.
+
+All three report the state of their session rather than the last request, so if
+the ring refuses to connect, or an auto-off timer fires, or a reload shuts a
 session down, the switch settles back to off instead of lying.
 """
 
@@ -43,6 +49,7 @@ if TYPE_CHECKING:
 
 STREAM_UNIQUE_ID_SUFFIX = "colmi_ring_motion_stream"
 WAVE_UNIQUE_ID_SUFFIX = "colmi_ring_wave_detection"
+TOUCH_UNIQUE_ID_SUFFIX = "colmi_ring_touch_control"
 
 # Kept as the stream's suffix so existing entities keep their unique ids.
 UNIQUE_ID_SUFFIX = STREAM_UNIQUE_ID_SUFFIX
@@ -56,9 +63,9 @@ async def async_setup_entry(
     """
     Set up the link-holding switches.
 
-    Both switches are offered to every Colmi setup: neither needs an opt-in
-    option, and each only costs battery while it is actually on. Yucheng rings
-    have no motion manager, so they get neither switch.
+    Both motion switches are offered to every Colmi setup: neither needs an
+    opt-in option, and each only costs battery while it is actually on. Yucheng
+    rings have no motion manager, so they get neither switch.
     """
     motion = entry.runtime_data.motion
     if motion is None:  # pragma: no cover - setup order guard
@@ -68,6 +75,12 @@ async def async_setup_entry(
         ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
         ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
     ]
+    # The touch switch follows the manager rather than the model name, so there
+    # is one source for "this ring has a touch surface" (see __init__).
+    if entry.runtime_data.touch is not None:
+        entities.append(
+            ColmiRingTouchControlSwitch(coordinator=entry.runtime_data.coordinator)
+        )
     async_add_entities(entities)
 
 
@@ -222,4 +235,79 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
         if motion is None:  # pragma: no cover - guarded by available
             return
         motion.async_stop_waves(reason="user")
+        self.async_write_ha_state()
+
+
+class ColmiRingTouchControlSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Put the ring's touch surface into reporting mode.
+
+    The counterpart to the official app's touch switch: while it is on, a tap or
+    swipe on the ring arrives as a Bluetooth HID report and fires this
+    integration's touch events.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Touch Control"
+    # Not mdi:hand-waving (absent from the Material Design Icons set this HA
+    # version ships, so it renders as no icon); mdi:gesture-tap reads as
+    # "finger on a surface", which is literally what this switch arms.
+    _attr_icon = "mdi:gesture-tap"
+    # Operational toggle, not a settings knob: same reasoning as the other two.
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{TOUCH_UNIQUE_ID_SUFFIX}"
+        )
+        self._unsubscribe: Callable[[], None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the listener so the switch cannot drift from reality."""
+        await super().async_added_to_hass()
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - setup order guard
+            return
+        self._unsubscribe = touch.add_state_listener(self._on_touch_state)
+        self.async_on_remove(self._unsubscribe)
+
+    @callback
+    def _on_touch_state(self, _listening: bool) -> None:
+        """The listener turned on or off (also how auto-off reaches the UI)."""
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool:
+        """True while the listener actually holds the link."""
+        touch = self._touch_manager()
+        return bool(touch is not None and touch.is_listening)
+
+    @property
+    def available(self) -> bool:
+        """Available whenever the manager exists and HA is connected to it."""
+        return super().available and self._touch_manager() is not None
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """
+        Start listening for touch reports.
+
+        Raises :class:`HomeAssistantError` if the motion stream is running: its
+        lease is exclusive, and this session's arm/disarm writes would queue
+        behind it indefinitely. A failure to connect is *not* raised from here -
+        the client reports an unopenable session by returning, the manager then
+        clears the flag, and the switch lands on off with one warning in the log.
+        """
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - guarded by available
+            return
+        await touch.async_start()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop listening, so it can stop powering the surface."""
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - guarded by available
+            return
+        touch.async_stop(reason="user")
         self.async_write_ha_state()

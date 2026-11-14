@@ -14,6 +14,7 @@ from .coordinator import ColmiRingDataUpdateCoordinator
 
 if TYPE_CHECKING:
     from .motion_manager import MotionManager
+    from .touch_manager import TouchManager
 
 
 class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
@@ -35,6 +36,10 @@ class ColmiRingEntity(CoordinatorEntity[ColmiRingDataUpdateCoordinator]):
     def _motion_manager(self) -> MotionManager | None:
         """The stream owner, or None if motion detection is not set up."""
         return self.coordinator.motion
+
+    def _touch_manager(self) -> TouchManager | None:
+        """The touch listener owner, or None if this ring has no touch surface."""
+        return self.coordinator.touch
 
     def _assert_ring_free(self) -> None:
         """

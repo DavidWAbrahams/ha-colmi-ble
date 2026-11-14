@@ -33,11 +33,13 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     clamp_ycbt_monitor_interval,
+    supports_touch,
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
 from .debug_probe import cancel_probe, register_probe_service, remove_probe_service
 from .motion_manager import MotionManager
+from .touch_manager import TouchManager
 from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:
@@ -221,11 +223,23 @@ async def async_setup_entry(
         else None
     )
     coordinator.motion = motion
+    # Touch is gated one level finer than motion: it is Colmi *and* model
+    # specific, because the touch surface is physical and the R07 (same
+    # protocol family) has none. A None here is the whole integration's answer
+    # to "does this ring have touch" - the switch, the event entities and the
+    # options flow all check it rather than re-deriving it.
+    touch = (
+        TouchManager(hass, entry, client, coordinator)
+        if family == FAMILY_COLMI and supports_touch(entry.title)
+        else None
+    )
+    coordinator.touch = touch
     entry.runtime_data = ColmiRingData(
         client=client,
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,
         motion=motion,
+        touch=touch,
     )
 
     # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -260,6 +274,11 @@ async def async_unload_entry(
     motion = entry.runtime_data.motion
     if motion is not None:
         await motion.async_shutdown()
+    # The touch session has to end before the link closes: its teardown is the
+    # write that stops the ring powering a capacitive surface we asked for.
+    touch = entry.runtime_data.touch
+    if touch is not None:
+        await touch.async_shutdown()
     # The Colmi client keeps its shared link open after its last user leaves
     # (the sessions above are gone by now); close it rather than let the idle
     # timer hold a GATT connection for a dead entry.

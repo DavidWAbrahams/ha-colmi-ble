@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .backfill import BackfillManager
     from .data import ColmiRingConfigEntry
     from .motion_manager import MotionManager
+    from .touch_manager import TouchManager
 
 # Returned by _async_try_poll when the ring refused the poll because another
 # session holds its single link. Distinct from None (every attempt failed):
@@ -105,6 +106,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # a connection of our own: the ring serves one central at a time, and
         # either of its two sessions (RAW stream, wave listener) owns that link.
         self.motion: MotionManager | None = None
+        # Set by async_setup_entry on a ring with a touch surface (R08). Unlike
+        # ``motion`` this never blocks a poll: the touch listener shares the
+        # link. It lives here so each manager can cross-check the other through
+        # the one object both already have, and so entities can reach it.
+        self.touch: TouchManager | None = None
         # keys spo2 (int | None) and spo2_timestamp (datetime | None), or None
         self.spo2_reading: dict[str, Any] | None = None
         # keys heart_rate (int | None) and heart_rate_timestamp (datetime)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -34,6 +34,8 @@ from .const import (
     CONF_PROXIMITY_SAMPLES_N,
     CONF_PROXIMITY_TOP_K,
     CONF_PROXIMITY_VOTE_MARGIN,
+    CONF_TOUCH_SLEEP_MINUTES,
+    CONF_TOUCH_TIMEOUT,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
@@ -48,6 +50,8 @@ from .const import (
     DEFAULT_PROXIMITY_SAMPLES_N,
     DEFAULT_PROXIMITY_TOP_K,
     DEFAULT_PROXIMITY_VOTE_MARGIN,
+    DEFAULT_TOUCH_SLEEP_MINUTES,
+    DEFAULT_TOUCH_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
@@ -56,8 +60,11 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     MOTION_HOLE_AXIS_CHOICES,
+    TOUCH_SLEEP_MINUTES_MAX,
+    TOUCH_SLEEP_MINUTES_MIN,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
+    supports_touch,
 )
 from .ycbt_api import YcbtRingApiClient
 
@@ -495,5 +502,43 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         ),
                     ): selector.BooleanSelector(),
                 }
+                | self._touch_options(),
             ),
         )
+
+    def _touch_options(self) -> dict[vol.Optional, Any]:
+        """Touch-surface options, for rings that have a touch surface."""
+        # Same name gate as the entity layer: a ring with no touch surface gets
+        # no touch options, so the options form never offers controls that
+        # nothing reads.
+        if not supports_touch(self.config_entry.title):
+            return {}
+        return {
+            vol.Optional(
+                CONF_TOUCH_TIMEOUT,
+                default=self.config_entry.options.get(
+                    CONF_TOUCH_TIMEOUT, DEFAULT_TOUCH_TIMEOUT
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    # 0 means "stay on until switched off".
+                    min=0,
+                    max=1440,
+                    step=15,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TOUCH_SLEEP_MINUTES,
+                default=self.config_entry.options.get(
+                    CONF_TOUCH_SLEEP_MINUTES, DEFAULT_TOUCH_SLEEP_MINUTES
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=TOUCH_SLEEP_MINUTES_MIN,
+                    max=TOUCH_SLEEP_MINUTES_MAX,
+                    step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+        }

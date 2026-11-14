@@ -21,6 +21,13 @@ one-sample-per-second rate.
 The entities are created whenever the motion manager exists: a user who only
 ever turns on Wave Detection still needs something to trigger on, and vice
 versa.
+
+Tap and the two swipes are a separate, R08-only set (see the Touch Control
+switch and ``TouchManager``): a different sensor, a different firmware path, and
+a different event type, so they get their own descriptions, their own entity
+class and their own gate. All three are offered even though the swipe
+directions are still unverified, because a user who finds them reversed needs to
+be able to see the evidence (see ``r08.SWIPE_DIRECTION_UNVERIFIED``).
 """
 
 from __future__ import annotations
@@ -30,6 +37,12 @@ from typing import TYPE_CHECKING
 from homeassistant.components.event import EventEntity, EventEntityDescription
 from homeassistant.core import callback
 
+from .colmi_codec.r08 import (
+    GESTURE_SWIPE_DOWN,
+    GESTURE_SWIPE_UP,
+    GESTURE_TAP,
+    TouchEvent,
+)
 from .const import (
     CONF_DEVICE_FAMILY,
     FAMILY_COLMI,
@@ -88,6 +101,29 @@ ENTITY_DESCRIPTIONS = (
     ),
 )
 
+# Touch gestures, for the ring's capacitive surface rather than its
+# accelerometer. Same key convention as above: the key is both the unique-id
+# suffix and the ``gesture`` value in the event data. The icons here are all
+# old enough to be in the Material Design Icons set this HA version ships
+# (unlike the mdi:hand-waving note above).
+TOUCH_ENTITY_DESCRIPTIONS = (
+    EventEntityDescription(
+        key=GESTURE_TAP,
+        name="Tap",
+        icon="mdi:gesture-tap",
+    ),
+    EventEntityDescription(
+        key=GESTURE_SWIPE_UP,
+        name="Swipe Up",
+        icon="mdi:gesture-swipe-up",
+    ),
+    EventEntityDescription(
+        key=GESTURE_SWIPE_DOWN,
+        name="Swipe Down",
+        icon="mdi:gesture-swipe-down",
+    ),
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,  # noqa: ARG001 Unused function argument: `hass`
@@ -114,6 +150,17 @@ async def async_setup_entry(
         )
         for entity_description in ENTITY_DESCRIPTIONS
     )
+    # Touch is gated on the manager, which __init__ only builds for a model
+    # whose advertisement name says it has the surface. Creating these for an
+    # R07 would offer three triggers that can never fire.
+    if entry.runtime_data.touch is not None:
+        async_add_entities(
+            ColmiRingTouchEvent(
+                coordinator=coordinator,
+                entity_description=entity_description,
+            )
+            for entity_description in TOUCH_ENTITY_DESCRIPTIONS
+        )
 
 
 class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
@@ -165,4 +212,56 @@ class ColmiRingGestureEvent(ColmiRingEntity, EventEntity):
         self._trigger_event(self._gesture, event.as_event_data())
         # Event entities are otherwise stateless; this refreshes the
         # "last triggered" timestamp shown in the UI.
+        self.async_write_ha_state()
+
+
+class ColmiRingTouchEvent(ColmiRingEntity, EventEntity):
+    """
+    Fires when the ring's touch surface reports this gesture.
+
+    Mirrors :class:`ColmiRingGestureEvent` with one difference in the matching:
+    a touch report is a bitmap, so one report can legitimately carry more than
+    one gesture, and every entity whose bit is set fires. The integration also
+    fires ``colmi_ring_touch`` on the bus (see ``TouchManager._announce``) with
+    the same data, which catches every touch with one trigger and does not
+    depend on how the event component names its generated events.
+    """
+
+    _attr_has_entity_name = True
+    # Not DIAGNOSTIC: these exist to be triggered on.
+
+    def __init__(
+        self,
+        coordinator: ColmiRingDataUpdateCoordinator,
+        entity_description: EventEntityDescription,
+    ) -> None:
+        """Initialize the event entity."""
+        super().__init__(coordinator)
+        self.entity_description = entity_description
+        self._gesture = entity_description.key
+        self._attr_event_types = [entity_description.key]
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_touch_{entity_description.key}"
+        )
+        self._unsubscribe: Callable[[], None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Start listening for touches once the entity is registered."""
+        await super().async_added_to_hass()
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - setup order guard
+            LOGGER.debug(
+                "Colmi ring touch entity %s has no touch manager", self._gesture
+            )
+            return
+        self._unsubscribe = touch.add_event_listener(self._on_touch)
+        self.async_on_remove(self._unsubscribe)
+
+    @callback
+    def _on_touch(self, event: TouchEvent) -> None:
+        """Fire if this report set our gesture's bit."""
+        if self._gesture not in event.gestures:
+            return
+        self._trigger_event(self._gesture, event.as_event_data())
+        # Refresh the "last triggered" timestamp shown in the UI.
         self.async_write_ha_state()
