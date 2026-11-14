@@ -77,6 +77,7 @@ from .gestures import (
     StreamGestureDetector,
     VerticalAngleTracker,
 )
+from .ring_identity import ring_model_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -126,10 +127,13 @@ class MotionManager:
         # Which sensor axis this ring's hole runs through: Z for most firmware,
         # Y on an R08 (see const.resolve_hole_axis). Read once per manager like
         # the anchors: an option change reloads the entry and rebuilds us, so
-        # nothing can switch axis mid-session.
+        # nothing can switch axis mid-session. The model name comes from
+        # ring_identity rather than the entry title alone, so an R08 renamed by
+        # its owner - or added by MAC, where the title never carried a model -
+        # keeps its Y axis.
         self._hole_axis = resolve_hole_axis(
             self._entry.options.get(CONF_MOTION_HOLE_AXIS, DEFAULT_MOTION_HOLE_AXIS),
-            self._entry.title,
+            ring_model_name(self._hass, self._entry),
         )
         (
             still_hold_s,

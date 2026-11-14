@@ -2765,9 +2765,10 @@ class ColmiRingApiClient:
         reconnecting cannot add a command to its firmware, and burning 180 s of
         retries on it only delays polling resuming.
 
-        Callers must gate this on :func:`supports_touch`: on a ring without the
-        HID report characteristics this fails at session open, and would spend
-        its whole retry budget finding out what the model name already said.
+        Callers must gate this on :func:`ring_identity.ring_has_touch`: on a
+        ring without the HID report characteristics this fails at session open,
+        and would spend its whole retry budget finding out what the model name
+        already said.
         """
         self._touch_config = (app_type, sleep_minutes)
         return await self._run_sessions(

@@ -65,7 +65,7 @@ from .const import (
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
 )
-from .touch_gate import ring_has_touch
+from .ring_identity import ring_has_touch
 from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:

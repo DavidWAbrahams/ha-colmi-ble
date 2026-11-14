@@ -19,6 +19,19 @@ CONF_DEVICE_FAMILY = "device_family"
 FAMILY_COLMI = "colmi"
 FAMILY_YCBT = "ycbt"
 
+# --- Remembered advertisement name ------------------------------------------
+#
+# Colmi rings advertise a name that carries the model (``R08_5703``), and
+# model-gated features (the R08 touch surface, the R08 hole axis) need that
+# name. Neither user-facing label can be trusted to hold it: the entry title
+# only mirrors the advertisement name for entries created by discovery and
+# can be renamed, and the device name is the user's to choose. So the
+# advertisement name seen while the ring is in range gets stamped into the
+# entry's *data*, which no UI exposes for editing. Sourced and stamped by
+# ``ring_identity.remember_advertisement_name``; read by
+# ``ring_identity.ring_model_name``.
+CONF_ADVERTISED_NAME = "advertised_name"
+
 CONF_HR_STALE_POLLS = "hr_stale_after_polls"
 
 # Upper bound (minutes) for the adaptive BLE poll interval: the coordinator
@@ -520,9 +533,10 @@ def supports_touch(model_name: object) -> bool:
     """
     True if this ring is known to have a touch surface we can read.
 
-    Takes the config entry's title (the advertisement name) rather than a
-    capability bit, because the ring offers no capability query for touch: the
-    only honest answer available before connecting is which model it is.
+    Takes a model name (sourced for an entry by
+    ``ring_identity.ring_model_name``) rather than a capability bit, because
+    the ring offers no capability query for touch: the only honest answer
+    available before connecting is which model it is.
     Anything unusable - ``None``, a non-string, an unknown model - is False, so
     a ring we have never seen gets no touch entities rather than ones that can
     never fire.
