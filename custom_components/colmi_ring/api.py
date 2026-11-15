@@ -141,11 +141,25 @@ REALTIME_FIRST_SAMPLE_S = 60.0
 REALTIME_FIRST_SAMPLE_S_BY_KIND: dict[real_time.RealTimeReading, float] = {
     real_time.RealTimeReading.HRV: 90.0,
 }
+# How many usable samples one measurement gathers before sending STOP. HRV
+# is one: measured on an R08, the ring reports a single non-zero HRV frame
+# (~60 s in) and then falls silent, and the vendor apps treat HRV as one
+# reported value - waiting through five more reply timeouts for samples that
+# can never arrive just added ~50 s to every HRV button press.
+REALTIME_SAMPLES_NEEDED_DEFAULT = 6
+REALTIME_SAMPLES_NEEDED_BY_KIND: dict[real_time.RealTimeReading, int] = {
+    real_time.RealTimeReading.HRV: 1,
+}
 # How long to wait for the reply to the STOP frame. On the R08 this is not a
 # mere acknowledgement: the final measurement arrives only inside it
 # ([0x6A, kind, value, error]). Generous for proxy latency; reference
 # implementations allow 3 s plus retries.
 REALTIME_STOP_REPLY_TIMEOUT_S = 5.0
+# When the stream already produced samples, the STOP reply is only awaited
+# this briefly - long enough for the ring's ack to arrive and be consumed by
+# this transaction, so it does not surface as an "unexpected packet" once the
+# transaction has torn its handlers down.
+REALTIME_STOP_ACK_DRAIN_S = 0.5
 # Consecutive reply timeouts tolerated while streaming (upstream tolerates
 # many; we cap them so a button press finishes in bounded time even when the
 # ring never streams at all - per-sample timeout stays generous for proxy
@@ -1326,8 +1340,11 @@ class _RingConnection:
         first_sample_s = REALTIME_FIRST_SAMPLE_S_BY_KIND.get(
             reading_type, REALTIME_FIRST_SAMPLE_S
         )
+        needed = REALTIME_SAMPLES_NEEDED_BY_KIND.get(
+            reading_type, REALTIME_SAMPLES_NEEDED_DEFAULT
+        )
         stalled_deadline = time.monotonic() + first_sample_s
-        while len(valid) < 6 and empty_waits < REALTIME_EMPTY_WAITS_MAX:
+        while len(valid) < needed and empty_waits < REALTIME_EMPTY_WAITS_MAX:
             remaining = stalled_deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1394,7 +1411,7 @@ class _RingConnection:
 
         reason = (
             "collected"
-            if len(valid) >= 6
+            if len(valid) >= needed
             else "reply-timeout cap"
             if empty_waits >= REALTIME_EMPTY_WAITS_MAX
             else "first-sample stall deadline"
@@ -1437,33 +1454,45 @@ class _RingConnection:
         """
         End a real-time measurement; return the value its STOP reply carries.
 
-        Sends the STOP frame and, when ``listen``, awaits the reply on the
-        0x6A queue. That reply is usually a bare zero-filled ack worth
-        ignoring, but R08-Access-Bridge field-tested that the R08's QRing
-        firmware reports the *final* measurement only inside it, as
-        ``[0x6A, kind, value, error]`` (``real_time.parse_stop_reading``).
-        A missing, zero, or unknown-kind reply means "no value": ``None``.
+        Sends the STOP frame and awaits its reply on the 0x6A queue - fully
+        when ``listen`` (the stream produced nothing and the reply is the
+        last place a value can come from: R08-Access-Bridge field-tested
+        that the R08's QRing firmware reports the *final* measurement only
+        here, as ``[0x6A, kind, value, error]``, see
+        ``real_time.parse_stop_reading``), and only briefly otherwise, to
+        consume the bare ack rather than let it surface as an "unexpected
+        packet" once this transaction's handlers are gone. A missing, zero,
+        or unknown-kind reply means "no value": ``None``.
         """
         stop_queue = self._queues[real_time.CMD_STOP_REAL_TIME]
         # Drain before sending so what we (might) read is this STOP's reply.
         while not stop_queue.empty():
             stop_queue.get_nowait()
         await self._send(real_time.get_stop_packet(reading_type))
-        if not listen:
-            return None
         try:
             data: (
                 real_time.Reading | real_time.ReadingError | None
             ) = await asyncio.wait_for(
-                stop_queue.get(), timeout=REALTIME_STOP_REPLY_TIMEOUT_S
+                stop_queue.get(),
+                timeout=(
+                    REALTIME_STOP_REPLY_TIMEOUT_S
+                    if listen
+                    else REALTIME_STOP_ACK_DRAIN_S
+                ),
             )
         except TimeoutError:
             return None
         if isinstance(data, real_time.ReadingError):
-            raise ColmiRingApiClientError(
-                f"Ring returned error code {data.code} when stopping"
-                f" real-time reading {reading_type.name}"
-            )
+            if listen:
+                raise ColmiRingApiClientError(
+                    f"Ring returned error code {data.code} when stopping"
+                    f" real-time reading {reading_type.name}"
+                )
+            # Samples are already in hand: an ack-level error code must not
+            # throw a finished measurement away.
+            return None
+        if not listen:
+            return None
         if isinstance(data, real_time.Reading) and data.value != 0:
             return data.value
         return None
