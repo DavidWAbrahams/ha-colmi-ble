@@ -1275,10 +1275,27 @@ class _RingConnection:
         while not queue.empty():
             queue.get_nowait()
 
-        await self._send(real_time.get_start_packet(reading_type))
+        start_packet = real_time.get_start_packet(reading_type)
+        # DIAGNOSTIC (R08 real-time, temporary, WARNING for the HA UI): name the
+        # exact start frame sent. R08-Access-Bridge starts HRV with `69 0A 25`
+        # (sub-byte 0x25 rather than our Action.START 0x01) and comments that
+        # this R08 firmware returns the final HRV value only in the 0x6A *stop*
+        # reply; which hypothesis holds starts with this line.
+        LOGGER.warning(
+            "Colmi ring %s starting real-time %s measurement: %s",
+            self._address,
+            reading_type.name,
+            start_packet.hex(" "),
+        )
+        await self._send(start_packet)
 
         valid: list[int] = []
         empty_waits = 0
+        zero_frames = 0
+        # DIAGNOSTIC (R08 real-time, temporary): wall-clock start so the ending
+        # summary can say how long the ring really took; Access Bridge lets HRV
+        # run ~80 s, past our first-sample stall deadline.
+        started_at = time.monotonic()
         # A zero reply means "measuring, no value yet": the ring is alive, so
         # zeros do not count toward the timeout cap - but they must not keep
         # the loop alive forever either. Upstream reset its timeout counter on
@@ -1322,12 +1339,64 @@ class _RingConnection:
                 # Alive but not yet measured: clears the timeout streak (the
                 # ring answered) without extending the stall deadline.
                 empty_waits = 0
+                # DIAGNOSTIC (R08 real-time, temporary): Access Bridge reports
+                # this R08 firmware streams zero-valued progress frames "until
+                # close to the deadline"; first five at WARNING then one per
+                # twenty-five, so a perpetual-zero ring is visible in the GUI
+                # log without flooding it.
+                zero_frames += 1
+                if zero_frames <= 5 or zero_frames % 25 == 0:
+                    LOGGER.warning(
+                        "Colmi ring %s real-time %s zero frame #%d"
+                        " (ring answering, no value yet)",
+                        self._address,
+                        reading_type.name,
+                        zero_frames,
+                    )
                 continue
+            # DIAGNOSTIC (R08 real-time, temporary): name every real sample up
+            # to twelve, so a partial or late-warming stream is visible.
+            if len(valid) < 12:
+                LOGGER.warning(
+                    "Colmi ring %s real-time %s sample #%d: %d",
+                    self._address,
+                    reading_type.name,
+                    len(valid) + 1,
+                    data.value,
+                )
             valid.append(data.value)
             empty_waits = 0
             stalled_deadline = time.monotonic() + REALTIME_FIRST_SAMPLE_S
 
-        await self._send(real_time.get_stop_packet(reading_type))
+        # DIAGNOSTIC (R08 real-time, temporary): how the loop ended decides
+        # between the live hypotheses. "first-sample stall deadline" with many
+        # zero frames means the 0x69 stream never carries a value - matching
+        # Access Bridge's note that on this firmware it arrives only in the
+        # 0x6A stop reply (which we do not parse; it surfaces as "Unexpected
+        # packet type 106"). "reply-timeout cap" means the ring answered
+        # nothing at all, pointing at the start frame's sub-byte instead.
+        reason = (
+            "collected"
+            if len(valid) >= 6
+            else "reply-timeout cap"
+            if empty_waits >= REALTIME_EMPTY_WAITS_MAX
+            else "first-sample stall deadline"
+        )
+        stop_packet = real_time.get_stop_packet(reading_type)
+        LOGGER.warning(
+            "Colmi ring %s real-time %s measurement ending after %.1fs"
+            " (%s): %d valid %s, %d zero frames, %d empty waits; stop %s",
+            self._address,
+            reading_type.name,
+            time.monotonic() - started_at,
+            reason,
+            len(valid),
+            valid[:12],
+            zero_frames,
+            empty_waits,
+            stop_packet.hex(" "),
+        )
+        await self._send(stop_packet)
         return valid
 
 
