@@ -25,6 +25,16 @@ which is why it too has an auto-off.
 All three report the state of their session rather than the last request, so if
 the ring refuses to connect, or an auto-off timer fires, or a reload shuts a
 session down, the switch settles back to off instead of lying.
+
+``Heart Rate Logging`` is different: it holds nothing and costs nothing. It is
+the UI for the ``enabled`` byte of the ring's ``0x16`` heart-rate logging
+settings - the flag that decides whether the ring samples heart rate at all.
+A ring can sit with it off (its own firmware default, an OEM app, or an old
+integration write) and then answer every daily-log query with "no data" no
+matter what the sampling interval says, and until now nothing in this
+integration could read it back *and* change it. It is offered to every Colmi
+family ring - the ``0x16`` command predates the R08 - and its state comes from
+the settings answer on the last poll.
 """
 
 from __future__ import annotations
@@ -32,9 +42,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
+from .api import ColmiRingApiClientError
+from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import LOGGER, measurement_busy_message
 from .entity import ColmiRingEntity
 
@@ -50,6 +63,7 @@ if TYPE_CHECKING:
 STREAM_UNIQUE_ID_SUFFIX = "colmi_ring_motion_stream"
 WAVE_UNIQUE_ID_SUFFIX = "colmi_ring_wave_detection"
 TOUCH_UNIQUE_ID_SUFFIX = "colmi_ring_touch_control"
+HR_LOGGING_UNIQUE_ID_SUFFIX = "colmi_ring_hr_logging"
 
 # Kept as the stream's suffix so existing entities keep their unique ids.
 UNIQUE_ID_SUFFIX = STREAM_UNIQUE_ID_SUFFIX
@@ -74,6 +88,7 @@ async def async_setup_entry(
     entities: list[ColmiRingEntity] = [
         ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
         ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
+        ColmiRingHrLoggingSwitch(coordinator=entry.runtime_data.coordinator),
     ]
     # The touch switch follows the manager rather than the model name, so there
     # is one source for "this ring has a touch surface" (see __init__).
@@ -311,3 +326,90 @@ class ColmiRingTouchControlSwitch(ColmiRingEntity, SwitchEntity):
             return
         touch.async_stop(reason="user")
         self.async_write_ha_state()
+
+
+class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Turn the ring's periodic heart-rate recording on and off.
+
+    This is byte 2 of the ``0x16`` settings answer: with it off the ring
+    records nothing and answers every daily heart-rate log query with
+    "no data", whatever the sampling interval says. Like the interval number
+    entity, a write is read-modify-write - the ring's last-reported interval
+    and its four extra settings bytes are echoed back unchanged - and the
+    state shown is the ring's answer on the last poll, not the last request.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Heart Rate Logging"
+    _attr_icon = "mdi:heart-plus"
+    # CONFIG rather than operational: this is a firmware setting, not a
+    # session, and no automation should be toggling it on a timer. Even so,
+    # enabled by default in the registry - a ring silently not recording is
+    # exactly the case this entity exists to surface.
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{HR_LOGGING_UNIQUE_ID_SUFFIX}"
+        )
+
+    def _current_settings(self) -> HeartRateLogSettings | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        settings = data.get("hr_settings")
+        return settings if isinstance(settings, HeartRateLogSettings) else None
+
+    @property
+    def is_on(self) -> bool:
+        """Whether the ring reported heart-rate logging enabled."""
+        settings = self._current_settings()
+        return settings.enabled if settings else False
+
+    @property
+    def available(self) -> bool:
+        """Available when the ring has answered the settings query."""
+        return super().available and self._current_settings() is not None
+
+    async def _async_set_logging(self, enabled: bool) -> None:
+        """Write ``enabled`` while preserving the ring's other settings."""
+        self._assert_ring_free()
+        settings = self._current_settings()
+        if settings is None:  # pragma: no cover - guarded by available
+            return
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            result = await client.async_set_hr_log_settings(
+                HeartRateLogSettings(
+                    enabled=enabled,
+                    interval=settings.interval,
+                    extra=settings.extra,
+                )
+            )
+        except ColmiRingApiClientError as err:
+            LOGGER.warning(
+                "Failed to set Colmi ring HR logging to %s: %s",
+                "on" if enabled else "off",
+                err,
+            )
+            raise HomeAssistantError(
+                f"Could not change heart-rate logging on the ring: {err}"
+            ) from err
+        LOGGER.warning(
+            "Colmi ring HR logging set to %s, ring now reports: %s",
+            "on" if enabled else "off",
+            result,
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """Tell the ring to start recording heart rate."""
+        await self._async_set_logging(True)
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop recording heart rate."""
+        await self._async_set_logging(False)
