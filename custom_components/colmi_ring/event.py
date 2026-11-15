@@ -25,9 +25,8 @@ versa.
 Tap and the two swipes are a separate, R08-only set (see the Touch Control
 switch and ``TouchManager``): a different sensor, a different firmware path, and
 a different event type, so they get their own descriptions, their own entity
-class and their own gate. All three are offered even though the swipe
-directions are still unverified, because a user who finds them reversed needs to
-be able to see the evidence (see ``r08.SWIPE_DIRECTION_UNVERIFIED``).
+class and their own gate. The swipe directions are measured, not guessed: the
+mapping lives in ``r08.USAGE_GESTURES``, settled by a labelled on-device test.
 """
 
 from __future__ import annotations

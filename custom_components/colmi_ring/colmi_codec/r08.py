@@ -34,10 +34,8 @@ every Colmi frame - discards these. Touch reports therefore never travel the
 Like the rest of this subpackage this module is pure: no Home Assistant, no
 Bluetooth, no I/O.
 
-.. warning::
-
-   The swipe **direction** mapping below is unverified. See
-   ``SWIPE_DIRECTION_UNVERIFIED``.
+The swipe direction mapping is the one fact here that started life as a guess;
+an on-device labelled test settled it. See :data:`USAGE_GESTURES`.
 """
 
 from __future__ import annotations
@@ -181,33 +179,28 @@ GESTURE_SWIPE_DOWN = "swipe_down"
 #: appear here, so an unobserved bit stays decodable (in ``TouchEvent.usages``)
 #: without becoming an entity that can never fire.
 #:
-#: ``play_pause`` = tap is solid: the probe's tester pressed the button 15 times
-#: and every press reported bit ``0.3``.
+#: What belongs to whom: the usage names are the HID standard's, which physical
+#: swipe lights which usage is the OEM firmware's choice, and "up"/"down" is
+#: this integration's convention - so only measurement can pin the last link,
+#: and it has been: a labelled on-device test (2026-11-14, R08 worn with the
+#: sensor at the pad-side base of the finger) reported ``02 00 00``
+#: (Scan Previous) for a physical swipe up and ``01 00 00`` (Scan Next) for a
+#: swipe down. The original mapping guessed the other way, from Access
+#: Bridge's ``GestureLogic.classify`` reading up == forward through a list.
 #:
-#: The two swipes are NOT solid - see ``SWIPE_DIRECTION_UNVERIFIED``.
+#: ``play_pause`` = tap was solid from the start: the probe's tester pressed
+#: the button 15 times and every press reported bit ``0.3``.
 USAGE_GESTURES: dict[str, str] = {
     "play_pause": GESTURE_TAP,
-    "scan_next": GESTURE_SWIPE_UP,
-    "scan_previous": GESTURE_SWIPE_DOWN,
+    "scan_next": GESTURE_SWIPE_DOWN,
+    "scan_previous": GESTURE_SWIPE_UP,
 }
 
-#: TODO(r08-touch): **swipe direction is unverified - confirm before shipping
-#: the swipe entities.**
-#:
-#: The Phase 0 capture performed swipes but did not label them, so the tally
-#: proves only that the two directions are *distinct*: 7 reports of
-#: ``01 00 00`` (Scan Next) and 3 of ``02 00 00`` (Scan Previous), never both
-#: bits at once. Which physical direction is which is a guess, currently
-#: "Scan Next = up", taken from Access Bridge's ``GestureLogic.classify``
-#: mapping Scan Next to FORWARD / Scan Previous to BACKWARD and reading the
-#: glasses' launcher as up == forward through the list. That last step is
-#: inference, not measurement.
-#:
-#: Nothing in this file should be edited to "fix" a reversed swipe except this
-#: table and this comment: flip the two ``USAGE_GESTURES`` entries and the
-#: entities follow. Settled by one labelled probe run (plan Phase 0.5), whose
-#: ``testdata/r08/`` capture becomes the selftest fixture that pins the mapping.
-SWIPE_DIRECTION_UNVERIFIED = True
+#: Set back to ``True`` if a firmware or wear orientation is ever reported
+#: that disagrees with the measured mapping above; callers warn on a non-empty
+#: :data:`UNVERIFIED_GESTURES` instead of trusting the table blindly, and
+#: ``scripts/_r08_check.py`` asserts the two still agree.
+SWIPE_DIRECTION_UNVERIFIED = False
 
 #: Gestures whose mapping still needs the labelled run, for callers (and the
 #: selftest) that want to warn rather than silently offer wrong entities.

@@ -292,13 +292,15 @@ class TouchManager:
 
     def _warn_unverified_swipes(self) -> None:
         """
-        Say once that swipe directions are a guess.
+        Say once that swipe directions would be a guess, if they were one.
 
-        The labelled capture that settles which physical direction is which
-        (plan Phase 0.5) has not been run, so a user automating on the swipe
-        entities is betting on a mapping this repo could not measure. The tap
-        entities need no such notice, which is why the set is checked rather
-        than the flag assumed non-empty.
+        The mapping shipped measured after a labelled on-device test, so
+        ``UNVERIFIED_GESTURES`` is empty and this stays silent. The notice
+        stays as the fail-safe: if a firmware or orientation is ever reported
+        that makes the mapping doubtful again, re-flagging it in the codec
+        warns users here instead of silently serving reversed entities. The
+        tap entities need no such notice, which is why the set is checked
+        rather than the flag assumed non-empty.
         """
         if self._warned_unverified or not r08.UNVERIFIED_GESTURES:
             return

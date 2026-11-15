@@ -19,9 +19,11 @@ Two things get pinned here.
    The capture records counts, not the interleaving, so the replay is grouped
    by value; the counts are what the probe measured.
 
-Swipe direction is deliberately not asserted as fact: the direction mapping is
-flagged unverified in the codec, and this script asserts that the flag is
-honest rather than asserting which way is up.
+Swipe direction is asserted as fact: the mapping that started life as a guess
+was settled by a labelled on-device test, recorded in the codec's
+USAGE_GESTURES comment, so the replay below pins which usage decodes to which
+gesture. The script also checks the codec's unverified-gestures machinery stays
+self-consistent, since that is what callers warn from.
 """
 
 from __future__ import annotations
@@ -195,8 +197,8 @@ def check_reply_parsing() -> None:
 #: arrived on the same subscription and is checked separately above.
 CAPTURE: tuple[tuple[bytes, int], ...] = (
     (bytes([0x08, 0x00, 0x00]), 15),  # Play/Pause - fifteen button presses
-    (bytes([0x01, 0x00, 0x00]), 7),  # Scan Next - one swipe direction
-    (bytes([0x02, 0x00, 0x00]), 3),  # Scan Previous - the other
+    (bytes([0x01, 0x00, 0x00]), 7),  # Scan Next - swipe down
+    (bytes([0x02, 0x00, 0x00]), 3),  # Scan Previous - swipe up
     (bytes([0x00, 0x00, 0x00]), 25),  # release, one per press
 )
 
@@ -227,8 +229,8 @@ def check_capture() -> None:
         == Counter(
             {
                 r08.GESTURE_TAP: 15,
-                r08.GESTURE_SWIPE_UP: 7,
-                r08.GESTURE_SWIPE_DOWN: 3,
+                r08.GESTURE_SWIPE_UP: 3,
+                r08.GESTURE_SWIPE_DOWN: 7,
             }
         ),
         str(dict(gesture_tally)),
@@ -267,14 +269,24 @@ def check_report_edge_cases() -> None:
     )
     check("Play/Pause reports the raw bitmap", tap is not None and tap.raw == 0x0008)
 
-    up = r08.parse_touch_report(bytes([0x01, 0x00, 0x00]))
-    down = r08.parse_touch_report(bytes([0x02, 0x00, 0x00]))
+    scan_next = r08.parse_touch_report(bytes([0x01, 0x00, 0x00]))
+    scan_previous = r08.parse_touch_report(bytes([0x02, 0x00, 0x00]))
     check(
         "the two swipe usages are distinct",
-        up is not None
-        and down is not None
-        and up.gestures != down.gestures
-        and not (up.gestures & down.gestures),
+        scan_next is not None
+        and scan_previous is not None
+        and scan_next.gestures != scan_previous.gestures
+        and not (scan_next.gestures & scan_previous.gestures),
+    )
+    # Which physical direction each usage means, now measured rather than
+    # guessed (see USAGE_GESTURES). Reversing the codec's table fails here
+    # rather than on someone's finger.
+    check(
+        "Scan Previous is swipe up, Scan Next is swipe down",
+        scan_next is not None
+        and scan_next.gestures == frozenset({r08.GESTURE_SWIPE_DOWN})
+        and scan_previous is not None
+        and scan_previous.gestures == frozenset({r08.GESTURE_SWIPE_UP}),
     )
 
     # Bit order: the Report Map declares fields 1 bit apart starting at the low
@@ -336,7 +348,7 @@ def check_usage_table() -> None:
 
 
 def check_unverified_flag() -> None:
-    """The swipe-direction TODO has to stay honest."""
+    """The unverified-gestures machinery has to stay self-consistent."""
     swipes = {r08.GESTURE_SWIPE_UP, r08.GESTURE_SWIPE_DOWN}
     check(
         "unverified set matches the flag",
