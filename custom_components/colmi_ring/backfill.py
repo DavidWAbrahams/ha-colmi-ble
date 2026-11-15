@@ -159,6 +159,10 @@ class BackfillManager:
         self._loaded = False
         self._lock = asyncio.Lock()
         self._gates_logged = False
+        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date for which the
+        # "nothing to import" condition was already reported, so a ring whose
+        # log query answers empty warns once a day, not once a poll.
+        self._empty_diag_day: str | None = None
 
     async def async_sync(
         self,
@@ -201,10 +205,17 @@ class BackfillManager:
             # first non-empty batch still imports the whole backlog.
             # WARNING (diagnostic): if this repeats all day, the ring log
             # queries are returning empty and backfill can never see data.
-            LOGGER.warning(
-                "Colmi backfill: no hr_entries/sport_bins in poll data; nothing "
-                "to import (ring log query returned empty)"
-            )
+            # Throttled to once per UTC day: at a 5-minute poll this fired
+            # ~300x/day and buried everything else in the log.
+            today = datetime.now(tz=UTC).date().isoformat()
+            if self._empty_diag_day != today:
+                self._empty_diag_day = today
+                LOGGER.warning(
+                    "Colmi backfill: no hr_entries/sport_bins in poll data; nothing"
+                    " to import (today's and yesterday's ring log queries both came"
+                    " back empty/zero) - see the 'Colmi ring ... HR' warnings for the"
+                    " ring's actual log answer"
+                )
             return
         async with self._lock:
             await self._async_ensure_loaded()

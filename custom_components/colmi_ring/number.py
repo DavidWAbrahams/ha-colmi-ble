@@ -200,10 +200,17 @@ class ColmiRingHrIntervalNumber(ColmiRingEntity, NumberEntity):
         settings = self._current_settings()
         # Preserve the ring's current enabled flag unless we know it.
         enabled = settings.enabled if settings else True
+        # R08-class firmware carries four extra settings in the 0x16 reply
+        # (bytes 4..7: startInterval/tooLow/tooHigh/mainSwitch per the R08
+        # Access Bridge) and its write frame is expected to echo them back
+        # unchanged - the OEM apps read-modify-write them. Writing zeros over
+        # them can disable recording on firmware that honours those fields,
+        # so reuse the ring's own last-reported values.
+        extra = settings.extra if settings else b"\x00\x00\x00\x00"
         client = self.coordinator.config_entry.runtime_data.client
         try:
             result = await client.async_set_hr_log_settings(
-                HeartRateLogSettings(enabled=enabled, interval=int(value))
+                HeartRateLogSettings(enabled=enabled, interval=int(value), extra=extra)
             )
         except ColmiRingApiClientError as err:
             LOGGER.warning("Failed to set Colmi ring HR interval to %s: %s", value, err)

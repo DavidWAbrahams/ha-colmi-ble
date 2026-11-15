@@ -1,5 +1,5 @@
 """
-Switch platform for colmi_ring: the two things that hold the ring's link.
+Switch platform for colmi_ring: the things that hold the ring's link.
 
 ``Motion Stream`` takes the ring's shared Bluetooth link for itself and streams
 raw accelerometer data, which is what makes gesture detection possible and is
@@ -16,9 +16,25 @@ other, though: RAW mode takes the accelerometer and silences the ring's
 gesture reports, so turning one on while the other runs raises rather than
 silently killing the user's session.
 
-Both report the state of their session rather than the last request, so if the
-ring refuses to connect, or an auto-off timer fires, or a reload shuts a
+``Touch Control`` is the third, and only exists on a ring with a touch surface
+(R08). It shares the link like wave detection does - reports are HID
+notifications - so unlike the other two it costs nothing in polling: what it
+costs is the capacitive sensor the firmware keeps powered while it listens,
+which is why it too has an auto-off.
+
+All three report the state of their session rather than the last request, so if
+the ring refuses to connect, or an auto-off timer fires, or a reload shuts a
 session down, the switch settles back to off instead of lying.
+
+``Heart Rate Logging`` is different: it holds nothing and costs nothing. It is
+the UI for the ``enabled`` byte of the ring's ``0x16`` heart-rate logging
+settings - the flag that decides whether the ring samples heart rate at all.
+A ring can sit with it off (its own firmware default, an OEM app, or an old
+integration write) and then answer every daily-log query with "no data" no
+matter what the sampling interval says, and until now nothing in this
+integration could read it back *and* change it. It is offered to every Colmi
+family ring - the ``0x16`` command predates the R08 - and its state comes from
+the settings answer on the last poll.
 """
 
 from __future__ import annotations
@@ -29,6 +45,8 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
+from .api import ColmiRingApiClientError
+from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import LOGGER, measurement_busy_message
 from .entity import ColmiRingEntity
 
@@ -43,6 +61,8 @@ if TYPE_CHECKING:
 
 STREAM_UNIQUE_ID_SUFFIX = "colmi_ring_motion_stream"
 WAVE_UNIQUE_ID_SUFFIX = "colmi_ring_wave_detection"
+TOUCH_UNIQUE_ID_SUFFIX = "colmi_ring_touch_control"
+HR_LOGGING_UNIQUE_ID_SUFFIX = "colmi_ring_hr_logging"
 
 # Kept as the stream's suffix so existing entities keep their unique ids.
 UNIQUE_ID_SUFFIX = STREAM_UNIQUE_ID_SUFFIX
@@ -56,9 +76,9 @@ async def async_setup_entry(
     """
     Set up the link-holding switches.
 
-    Both switches are offered to every Colmi setup: neither needs an opt-in
-    option, and each only costs battery while it is actually on. Yucheng rings
-    have no motion manager, so they get neither switch.
+    Both motion switches are offered to every Colmi setup: neither needs an
+    opt-in option, and each only costs battery while it is actually on. Yucheng
+    rings have no motion manager, so they get neither switch.
     """
     motion = entry.runtime_data.motion
     if motion is None:  # pragma: no cover - setup order guard
@@ -67,7 +87,14 @@ async def async_setup_entry(
     entities: list[ColmiRingEntity] = [
         ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
         ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
+        ColmiRingHrLoggingSwitch(coordinator=entry.runtime_data.coordinator),
     ]
+    # The touch switch follows the manager rather than the model name, so there
+    # is one source for "this ring has a touch surface" (see __init__).
+    if entry.runtime_data.touch is not None:
+        entities.append(
+            ColmiRingTouchControlSwitch(coordinator=entry.runtime_data.coordinator)
+        )
     async_add_entities(entities)
 
 
@@ -162,8 +189,10 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Wave Detection"
     # Not mdi:hand-waving: that name postdates the Material Design Icons set
-    # this HA version ships, so it renders as no icon at all.
-    _attr_icon = "mdi:motion-sensor"
+    # this HA version ships, so it renders as no icon at all. The previous
+    # mdi:motion-sensor reads as a walking person, so use the same hand as the
+    # "Raised hand" event, which is known to render.
+    _attr_icon = "mdi:hand-back-right"
     # Same reasoning as the stream switch: an operational toggle automations
     # may switch, not a settings knob, and no translation entry is needed.
 
@@ -223,3 +252,165 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
             return
         motion.async_stop_waves(reason="user")
         self.async_write_ha_state()
+
+
+class ColmiRingTouchControlSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Put the ring's touch surface into reporting mode.
+
+    The counterpart to the official app's touch switch: while it is on, a tap or
+    swipe on the ring arrives as a Bluetooth HID report and fires this
+    integration's touch events.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Touch Control"
+    # Not mdi:hand-waving (absent from the Material Design Icons set this HA
+    # version ships, so it renders as no icon); mdi:gesture-tap reads as
+    # "finger on a surface", which is literally what this switch arms.
+    _attr_icon = "mdi:gesture-tap"
+    # Operational toggle, not a settings knob: same reasoning as the other two.
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{TOUCH_UNIQUE_ID_SUFFIX}"
+        )
+        self._unsubscribe: Callable[[], None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the listener so the switch cannot drift from reality."""
+        await super().async_added_to_hass()
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - setup order guard
+            return
+        self._unsubscribe = touch.add_state_listener(self._on_touch_state)
+        self.async_on_remove(self._unsubscribe)
+
+    @callback
+    def _on_touch_state(self, _listening: bool) -> None:
+        """The listener turned on or off (also how auto-off reaches the UI)."""
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool:
+        """True while the listener actually holds the link."""
+        touch = self._touch_manager()
+        return bool(touch is not None and touch.is_listening)
+
+    @property
+    def available(self) -> bool:
+        """Available whenever the manager exists and HA is connected to it."""
+        return super().available and self._touch_manager() is not None
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """
+        Start listening for touch reports.
+
+        Raises :class:`HomeAssistantError` if the motion stream is running: its
+        lease is exclusive, and this session's arm/disarm writes would queue
+        behind it indefinitely. A failure to connect is *not* raised from here -
+        the client reports an unopenable session by returning, the manager then
+        clears the flag, and the switch lands on off with one warning in the log.
+        """
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - guarded by available
+            return
+        await touch.async_start()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop listening, so it can stop powering the surface."""
+        touch = self._touch_manager()
+        if touch is None:  # pragma: no cover - guarded by available
+            return
+        touch.async_stop(reason="user")
+        self.async_write_ha_state()
+
+
+class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Turn the ring's periodic heart-rate recording on and off.
+
+    This is byte 2 of the ``0x16`` settings answer: with it off the ring
+    records nothing and answers every daily heart-rate log query with
+    "no data", whatever the sampling interval says. Like the interval number
+    entity, a write is read-modify-write - the ring's last-reported interval
+    and its four extra settings bytes are echoed back unchanged - and the
+    state shown is the ring's answer on the last poll, not the last request.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Heart Rate Logging"
+    _attr_icon = "mdi:heart-plus"
+    # Deliberately not entity_category=CONFIG, unlike it might seem: CONFIG
+    # pushes the entity into a collapsed "Configuration" section on the device
+    # page and out of auto-populated dashboard cards. This is the one switch
+    # whose state explains a silent no-data sensor, so it belongs where the
+    # other switches are, under Controls, enabled by default in the registry.
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{HR_LOGGING_UNIQUE_ID_SUFFIX}"
+        )
+
+    def _current_settings(self) -> HeartRateLogSettings | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        settings = data.get("hr_settings")
+        return settings if isinstance(settings, HeartRateLogSettings) else None
+
+    @property
+    def is_on(self) -> bool:
+        """Whether the ring reported heart-rate logging enabled."""
+        settings = self._current_settings()
+        return settings.enabled if settings else False
+
+    @property
+    def available(self) -> bool:
+        """Available when the ring has answered the settings query."""
+        return super().available and self._current_settings() is not None
+
+    async def _async_set_logging(self, enabled: bool) -> None:
+        """Write ``enabled`` while preserving the ring's other settings."""
+        self._assert_ring_free()
+        settings = self._current_settings()
+        if settings is None:  # pragma: no cover - guarded by available
+            return
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            result = await client.async_set_hr_log_settings(
+                HeartRateLogSettings(
+                    enabled=enabled,
+                    interval=settings.interval,
+                    extra=settings.extra,
+                )
+            )
+        except ColmiRingApiClientError as err:
+            LOGGER.warning(
+                "Failed to set Colmi ring HR logging to %s: %s",
+                "on" if enabled else "off",
+                err,
+            )
+            raise HomeAssistantError(
+                f"Could not change heart-rate logging on the ring: {err}"
+            ) from err
+        LOGGER.warning(
+            "Colmi ring HR logging set to %s, ring now reports: %s",
+            "on" if enabled else "off",
+            result,
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """Tell the ring to start recording heart rate."""
+        await self._async_set_logging(True)
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop recording heart rate."""
+        await self._async_set_logging(False)

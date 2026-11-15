@@ -64,6 +64,7 @@ from .const import (
     GESTURE_EVENT_TYPE,
     LOGGER,
     STREAM_BUSY_MESSAGE,
+    TOUCH_BUSY_MESSAGE,
     WAVE_BUSY_MESSAGE,
     WAVE_REPORT_COOLDOWN_S,
     resolve_hole_axis,
@@ -76,6 +77,7 @@ from .gestures import (
     StreamGestureDetector,
     VerticalAngleTracker,
 )
+from .ring_identity import ring_model_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -125,10 +127,13 @@ class MotionManager:
         # Which sensor axis this ring's hole runs through: Z for most firmware,
         # Y on an R08 (see const.resolve_hole_axis). Read once per manager like
         # the anchors: an option change reloads the entry and rebuilds us, so
-        # nothing can switch axis mid-session.
+        # nothing can switch axis mid-session. The model name comes from
+        # ring_identity rather than the entry title alone, so an R08 renamed by
+        # its owner - or added by MAC, where the title never carried a model -
+        # keeps its Y axis.
         self._hole_axis = resolve_hole_axis(
             self._entry.options.get(CONF_MOTION_HOLE_AXIS, DEFAULT_MOTION_HOLE_AXIS),
-            self._entry.title,
+            ring_model_name(self._hass, self._entry),
         )
         (
             still_hold_s,
@@ -329,11 +334,19 @@ class MotionManager:
         accelerometer, and the ring stops announcing camera gestures while it is
         on - so a stream layered onto a live wave listener would silently break
         the gestures the user enabled.
+
+        Also refuses while touch control is on. That refusal is a link conflict
+        with teeth: the stream holds the link exclusively, which would starve
+        the touch listener's disarm write and leave the ring powering a
+        capacitive surface we no longer have any way to switch off.
         """
         if self._want_stream:
             return
         if self._want_wave:
             raise HomeAssistantError(WAVE_BUSY_MESSAGE)
+        touch = self._coordinator.touch
+        if touch is not None and touch.is_listening:
+            raise HomeAssistantError(TOUCH_BUSY_MESSAGE)
 
         self._want_stream = True
         self._log_samples = bool(

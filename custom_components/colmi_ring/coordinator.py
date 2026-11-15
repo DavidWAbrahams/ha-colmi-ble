@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -22,11 +25,20 @@ from .const import (
     CONF_DEVICE_FAMILY,
     CONF_HR_STALE_POLLS,
     CONF_POLL_MAX_INTERVAL,
+    CONF_PROXIMITY_SAMPLES_N,
+    CONF_PROXIMITY_TOP_K,
+    CONF_PROXIMITY_VOTE_MARGIN,
     CONF_YCBT_MONITOR_INTERVAL,
     DEFAULT_POLL_MAX_INTERVAL,
     DEFAULT_YCBT_MONITOR_INTERVAL,
     FAMILY_YCBT,
     LOGGER,
+    PROXIMITY_MAX_AGE_S,
+    PROXIMITY_RSSI_CEIL_DB,
+    PROXIMITY_RSSI_FLOOR_DB,
+    clamp_proximity_samples_n,
+    clamp_proximity_top_k,
+    clamp_proximity_vote_margin,
     clamp_ycbt_monitor_interval,
 )
 
@@ -36,12 +48,29 @@ if TYPE_CHECKING:
     from .backfill import BackfillManager
     from .data import ColmiRingConfigEntry
     from .motion_manager import MotionManager
+    from .touch_manager import TouchManager
 
 # Returned by _async_try_poll when the ring refused the poll because another
 # session holds its single link. Distinct from None (every attempt failed):
 # a busy refusal is not a connection fault and must not count towards the
 # consecutive-failure budget.
 _POLL_BUSY = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _Sighting:
+    """
+    One advertisement of the ring, as heard by one proxy.
+
+    ``signal`` is the hearing proxy's own RSSI measurement (dBm), or None
+    when the sample carried no usable level; a level-less sighting still
+    joins the pool and can still win the vote on count, it just never
+    ranks among the strongest.
+    """
+
+    when: float  # monotonic seconds
+    source: str  # MAC of the proxy that heard it
+    signal: int | None
 
 
 # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
@@ -77,6 +106,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # a connection of our own: the ring serves one central at a time, and
         # either of its two sessions (RAW stream, wave listener) owns that link.
         self.motion: MotionManager | None = None
+        # Set by async_setup_entry on a ring with a touch surface (R08). Unlike
+        # ``motion`` this never blocks a poll: the touch listener shares the
+        # link. It lives here so each manager can cross-check the other through
+        # the one object both already have, and so entities can reach it.
+        self.touch: TouchManager | None = None
         # keys spo2 (int | None) and spo2_timestamp (datetime | None), or None
         self.spo2_reading: dict[str, Any] | None = None
         # keys heart_rate (int | None) and heart_rate_timestamp (datetime)
@@ -101,7 +135,24 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # an advertisement seen by HA's scanner, or any GATT notification we
         # received. Pushed (not polled): see async_note_ring_seen.
         self.last_seen: datetime | None = None
+        # Source (adapter MAC) of the proxy credited with hearing the ring:
+        # decided by the top-K proximity vote, not by which advertisement
+        # arrived last (see _async_credit_proxy). GATT notifications carry no
+        # source, so between polls the credit is simply retained.
+        self.last_seen_source: str | None = None
+        # RSSI (dBm) of the most recent advertisement the credited proxy
+        # heard with a usable level - what the Signal Strength sensor
+        # reports; None while no recent hearing by the winner carried one.
+        self.last_seen_rssi: int | None = None
+        # Every recent sighting of the ring (any proxy), oldest first, pruned
+        # to the proximity pool on each advertisement (see _async_credit_proxy
+        # for the age/size limits).
+        self._sightings: deque[_Sighting] = deque()
         self._seen_listeners: list[Callable[[datetime], None]] = []
+        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date for which the
+        # staleness-clear WARNING was already emitted, so an hours-long
+        # Unknown sensor warns once a day rather than once a poll.
+        self._hr_stale_diag_day: str | None = None
 
     # Throttle for the seen signal: the timestamp is floored to whole
     # seconds, so every advertisement/notification within the same second is
@@ -111,19 +162,43 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     _SEEN_THROTTLE_S = 1.0
 
     @callback
-    def async_note_ring_seen(self) -> None:
+    def async_note_ring_seen(
+        self, source: str | None = None, rssi: int | None = None
+    ) -> None:
         """
         Record that the ring was just heard from; push if the second moved.
 
-        Called from HA's bluetooth advertisement callback and from the GATT
-        notification handlers of both protocol clients. Cheap and idempotent
-        within one second: the floored timestamp doubles as the throttle, so
-        a burst of notifications re-notifies the listeners at most once per
-        second.
+        Called from HA's bluetooth advertisement callback (which passes the
+        hearing scanner's source and that advertisement's RSSI) and from the
+        GATT notification handlers of both protocol clients (no source: the
+        ring was heard over an open link, not scanned). Advertisement
+        sightings join the proximity pool and re-run the top-K vote; the
+        push itself stays throttled to about once per second (the floored
+        timestamp doubles as the throttle), except on a credit handover,
+        which is worth reporting immediately.
         """
+        mono = time.monotonic()
+        credited_now = False
+        if source:
+            self._sightings.append(
+                _Sighting(
+                    when=mono,
+                    source=source,
+                    signal=rssi
+                    if rssi is not None
+                    and PROXIMITY_RSSI_FLOOR_DB < rssi <= PROXIMITY_RSSI_CEIL_DB
+                    else None,
+                ),
+            )
+            winner, score = self._async_credit_proxy(mono)
+            credited_now = winner != self.last_seen_source
+            self.last_seen_source = winner
+            self.last_seen_rssi = score
         seen = datetime.now(tz=UTC).replace(microsecond=0)
-        if self.last_seen is not None and (
-            seen - self.last_seen < timedelta(seconds=self._SEEN_THROTTLE_S)
+        if (
+            not credited_now
+            and self.last_seen is not None
+            and seen - self.last_seen < timedelta(seconds=self._SEEN_THROTTLE_S)
         ):
             return
         self.last_seen = seen
@@ -132,6 +207,102 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                 listener(seen)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring seen-listener failed")
+
+    @callback
+    def _async_credit_proxy(self, now: float) -> tuple[str | None, int | None]:
+        """
+        Which proxy to credit with the ring, and its smoothed signal level.
+
+        The top-K vote over the sighting pool: keep the pool's K strongest
+        samples (by the hearing proxy's own RSSI; level-less sightings rank
+        below any measured one), and the source holding the most of those K
+        slots is the winner. Deep fades sort themselves out of the top, and
+        a proxy earns slots in proportion to how strongly - not merely how
+        often - it hears the ring, so sparse but honest capture (WiFi-
+        time-shared ESP32 proxies) is represented by its true share of the
+        strong evidence. The incumbent keeps the credit unless a challenger
+        beats its slot count by the configured vote margin, which is what
+        makes a single lucky sample, or a window of ordinary multipath
+        noise, unable to move the ring to another room. When the pool is
+        empty (nothing heard within the age limit) the current credit is
+        retained; presence is the Last Seen sensor's job, not this one's.
+
+        The reported level is simply the most recent usable RSSI the
+        winner measured: the sensor answers "how strongly does *that
+        proxy* hear the ring *right now*", and staleness is already
+        covered by the Last Seen sensor.
+
+        N, K and the margin are options, clamped on every read so a bad
+        stored value (or a K larger than N) can never wedge the vote.
+        """
+        options = self.config_entry.options
+        pool_size = clamp_proximity_samples_n(options.get(CONF_PROXIMITY_SAMPLES_N))
+        top_k = clamp_proximity_top_k(options.get(CONF_PROXIMITY_TOP_K), pool_size)
+        vote_margin = clamp_proximity_vote_margin(
+            options.get(CONF_PROXIMITY_VOTE_MARGIN)
+        )
+
+        # Prune from the left (chronological): expired samples first, then
+        # over-capacity ones, so the pool is both bounded and fresh.
+        pool = self._sightings
+        while pool and (
+            now - pool[0].when > PROXIMITY_MAX_AGE_S or len(pool) > pool_size
+        ):
+            pool.popleft()
+        if not pool:
+            return self.last_seen_source, self.last_seen_rssi
+
+        top = sorted(
+            pool,
+            key=lambda s: (
+                s.signal is not None,
+                s.signal if s.signal is not None else 0,
+            ),
+            reverse=True,
+        )[:top_k]
+        votes = Counter(sighting.source for sighting in top)
+
+        # Strongest sample per source within the selection, for challenger
+        # and tie-break comparisons only; the reported level is separate.
+        best: dict[str, int] = {}
+        for sighting in top:
+            if sighting.signal is None:
+                continue
+            stored = best.get(sighting.source)
+            if stored is None or sighting.signal > stored:
+                best[sighting.source] = sighting.signal
+
+        def fresh_signal_of(source: str) -> int | None:
+            """Latest usable level the source measured, newest first."""
+            for sighting in reversed(pool):
+                if sighting.source == source and sighting.signal is not None:
+                    return sighting.signal
+            return None
+
+        current = self.last_seen_source
+        if current in votes:
+            incumbent_votes = votes[current]
+            contenders = [
+                (src, count)
+                for src, count in votes.items()
+                if src != current and count >= incumbent_votes + vote_margin
+            ]
+            if not contenders:
+                return current, fresh_signal_of(current)
+            # Among eligible challengers, most slots wins; equal slots goes
+            # to the one with the single strongest reading.
+            winner, _ = max(
+                contenders,
+                key=lambda sc: (sc[1], best.get(sc[0], PROXIMITY_RSSI_FLOOR_DB)),
+            )
+        else:
+            # No credit yet, or the holder heard nothing lately: plain
+            # plurality, ties broken by the strongest single reading.
+            winner = max(
+                votes,
+                key=lambda src: (votes[src], best.get(src, PROXIMITY_RSSI_FLOOR_DB)),
+            )
+        return winner, fresh_signal_of(winner)
 
     def add_seen_listener(
         self, listener: Callable[[datetime], None]
@@ -261,7 +432,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             except ColmiRingApiClientAuthenticationError as exception:
                 raise ConfigEntryAuthFailed(exception) from exception
             except ColmiRingApiClientError as exception:
-                LOGGER.debug(
+                # WARNING (diagnostic, R08): the user's HA log only shows
+                # WARNING+, and "the R08 shows nothing" needs to distinguish
+                # a failing poll from a poll that succeeds but finds an empty
+                # ring log. Capped at the attempt count per cycle.
+                LOGGER.warning(
                     "Colmi ring poll attempt %s/%s failed: %s",
                     attempt + 1,
                     self._POLL_ATTEMPTS,
@@ -335,9 +510,25 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             # The newest sample is old enough that the ring is almost certainly
             # off the finger; report "unknown" instead of a stale value.
             if data.get("heart_rate") is not None:
-                LOGGER.debug(
-                    "Colmi ring heart-rate sample is stale; clearing heart rate"
-                )
+                # DIAGNOSTIC (R08, temporary): WARNING once per UTC day so a
+                # "sensor is Unknown" bug can be told apart from an ordinary
+                # off-finger clear - the age-vs-threshold numbers are the
+                # whole diagnosis.
+                today = datetime.now(tz=UTC).date().isoformat()
+                if self._hr_stale_diag_day != today:
+                    self._hr_stale_diag_day = today
+                    ts = data.get("heart_rate_timestamp")
+                    age_min = (
+                        (datetime.now(tz=UTC) - ts).total_seconds() / 60
+                        if isinstance(ts, datetime)
+                        else -1.0
+                    )
+                    LOGGER.warning(
+                        "Colmi ring heart-rate sample is stale; clearing heart"
+                        " rate (sample age %.0f min, hr_zero_reading=%s)",
+                        age_min,
+                        data.get("hr_zero_reading"),
+                    )
             data["heart_rate"] = None
             data["heart_rate_timestamp"] = None
             self.hr_live = None

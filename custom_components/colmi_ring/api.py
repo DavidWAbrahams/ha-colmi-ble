@@ -37,6 +37,7 @@ from .colmi_codec import (
     hr,
     hr_settings,
     motion,
+    r08,
     real_time,
     reboot,
     steps,
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
 
     from bleak.backends.characteristic import BleakGATTCharacteristic
+    from bleak.backends.descriptor import BleakGATTDescriptor
     from bleak.backends.device import BLEDevice
     from homeassistant.core import HomeAssistant
 
@@ -69,6 +71,52 @@ if TYPE_CHECKING:
 UART_SERVICE_UUID = "6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+# The Bluetooth HID Service, SIG 16-bit UUIDs in the same 128-bit form bleak
+# reports. The R08's touch input is a HID *Consumer Control* report, so reaching
+# it means talking to the HID service as well as the Colmi UART service above.
+#
+# These are not decoration: ``2a4c`` (HID Control Point) and ``2a4e`` (Boot
+# Protocol Report Reference) are what put the ring into Report protocol, and the
+# ring refuses the touch report's CCCD write until that has happened.
+HID_CONTROL_POINT_CHAR_UUID = "00002A4C-0000-1000-8000-00805F9B34FB"
+HID_BOOT_PROTOCOL_CHAR_UUID = "00002A4E-0000-1000-8000-00805F9B34FB"
+HID_REPORT_CHAR_UUID = "00002A4D-0000-1000-8000-00805F9B34FB"
+# Report Reference descriptor: two bytes, ``<report ID> <report type>``. Four of
+# this ring's characteristics share the ``2a4d`` UUID, so this descriptor - not
+# the UUID - is what names the touch report.
+HID_REPORT_REFERENCE_DESC_UUID = "00002908-0000-1000-8000-00805F9B34FB"
+
+
+def _is_sig_uuid(uuid: str, short: str) -> bool:
+    """
+    True when ``uuid`` is the SIG 16-bit UUID ``short``, in any spelling.
+
+    Stacks differ in whether they hand back ``2a4d`` or the expanded 128-bit
+    form (and in case), so matching one literal string is how a characteristic
+    silently stops being found.
+    """
+    value = uuid.upper().replace("-", "")
+    if value == short.upper():
+        return True
+    return len(value) == 32 and value.startswith(f"0000{short.upper()}")
+
+
+def _write_needs_response(char: BleakGATTCharacteristic) -> bool:
+    """
+    Whether a write to ``char`` must ask for an acknowledgement.
+
+    Bleak does not reliably infer this for these characteristics, and guessing
+    wrong fails the write outright: the ring's UART RX is write-without-response
+    as is the HID Control Point, while the Boot Protocol Report Reference is
+    read/write and insists on a response. So the answer comes from what the
+    device advertises.
+    """
+    props = set(char.properties)
+    if "write-without-response" in props:
+        return False
+    return "write" in props
+
 
 # How long to wait for a (possibly multi-packet) reply to a single command.
 # The upstream library uses a fixed 2s which is too tight over a Bluetooth
@@ -94,6 +142,13 @@ REALTIME_EMPTY_WAITS_MAX = 5
 # command 1 do so at once, so a ring that does not answer is not worth
 # delaying a poll for longer than this.
 CAPABILITY_REPLY_TIMEOUT_S = 2.0
+# How long a touch session waits for the ring to echo the ``3B 02`` enable frame
+# it was just sent. That echo is the only acknowledgement the command offers:
+# the reports it unlocks are notifications on a different characteristic and may
+# not arrive for hours, so without the echo there is nothing to distinguish
+# "this firmware accepted the enable and no gesture has been made" from "this
+# firmware ignored the enable and nothing will ever arrive".
+TOUCH_ECHO_TIMEOUT_S = 5.0
 
 # How long each kind of caller will wait for the ring's shared link.
 #
@@ -132,20 +187,25 @@ def _latest_sample_is_zero(
     entries: list[tuple[int, datetime]],
     filled: int,
     interval_minutes: int,
+    range_minutes: int,
 ) -> bool:
     """
     True if the ring's newest *sample* read 0 bpm (off-finger evidence).
 
-    Slots between samples are also 0 ("no sample taken yet"), so a zero in the
-    newest slot only counts when the newest filled slot is clearly newer than
-    the newest non-zero sample. A *worn* ring can legitimately show a gap of
-    one logging interval plus one 5-min slot: the ring's log index advances
-    slot-by-slot (every 5 min) while samples land only once per interval, so
-    right after the index steps past a sample the newest filled slot sits
-    exactly interval + 5 minutes ahead. Only a gap *beyond* that means the
-    ring actually recorded a zero (and then kept advancing), i.e. it saw no
-    pulse. Requiring ``> interval + 5`` instead of ``>= interval`` fixes the
-    intermittent false "Away" seen at interval boundaries.
+    ``range_minutes`` is the log's slot grid: R02-class firmware logs on a
+    fixed 5-minute grid (samples sparser, zero slots between them), while
+    the R08 grids the day by its sampling interval (one slot per sample,
+    grid == interval). Slots between samples are also 0 ("no sample taken
+    yet"), so a zero in the newest slot only counts when the newest filled
+    slot is clearly newer than the newest non-zero sample. A *worn* ring can
+    legitimately show a gap of one logging interval plus one slot: the
+    ring's log index advances slot-by-slot while samples land only once per
+    interval, so right after the index steps past a sample the newest filled
+    slot sits exactly interval + range minutes ahead. Only a gap *beyond*
+    that means the ring actually recorded a zero (and then kept advancing),
+    i.e. it saw no pulse. Requiring ``> interval + range`` instead of
+    ``>= interval`` fixes the intermittent false "Away" seen at interval
+    boundaries.
     """
     if filled <= 0:
         return False
@@ -155,7 +215,9 @@ def _latest_sample_is_zero(
         return True
     newest_slot_ts = all_slots[filled - 1][1]
     latest_sample_ts = max(ts for _, ts in entries)
-    return newest_slot_ts - latest_sample_ts > timedelta(minutes=interval_minutes + 5)
+    return newest_slot_ts - latest_sample_ts > timedelta(
+        minutes=interval_minutes + range_minutes
+    )
 
 
 class ColmiRingApiClientError(Exception):
@@ -226,6 +288,11 @@ class _RingConnection:
         # since a stream repeats its frames every second, so each one is named
         # at most once per connection.
         self._logged_unexpected: set[int] = set()
+        # DIAGNOSTIC (R08 heart-rate log, temporary): count of sampled 0x15
+        # frame dumps already emitted on this link, so the WARNING-level
+        # capture below stays bounded even on links that survive many polls.
+        self._hr_frame_dumps = 0
+        self._len_drop_dumps = 0
         # Monotonic time the link came up, so a disconnect can be reported with
         # how long it lasted: "the stream died 29 ms after opening" and "the
         # stream died after 20 minutes" are completely different bugs, and
@@ -241,6 +308,19 @@ class _RingConnection:
         # byte. Used to account for what a stream session actually received, so
         # a stream on an unexpected command byte is not misread as silence.
         self.observer: Callable[[bytearray], None] | None = None
+        # Second tap, fired *before* the 16-byte length filter, so the dev-only
+        # debug probe (debug_probe.py) also sees frames the normal dispatch
+        # drops. Deliberately separate from ``observer``: a stream session may
+        # own that one while a probe captures alongside it.
+        self.raw_observer: Callable[[bytearray], None] | None = None
+        # Third tap, also above the length filter, but owned by a session rather
+        # than the probe. The R08's touch reports are 3-byte HID reports, so the
+        # 16-byte UART dispatch below cannot carry them: it would discard every
+        # gesture as "a packet of unexpected length". Fired for notifications of
+        # *any* length, because the ring has been observed multiplexing a 16-byte
+        # UART echo onto the touch report characteristic too - an observer must
+        # therefore check the length itself (see ``r08.TOUCH_REPORT_LEN``).
+        self.touch_observer: Callable[[bytearray], None] | None = None
         # Monotonic timestamp of the most recent motion packet (see
         # ``add_motion_timestamp``); used by the stream watchdog.
         self.last_motion: float | None = None
@@ -389,6 +469,207 @@ class _RingConnection:
         """Record that motion data just arrived (feeds the stream watchdog)."""
         self.last_motion = time.monotonic()
 
+    # ------------------------------------------------------------------
+    # Dev-only debug probe helpers (see debug_probe.py). These deliberately
+    # poke past the normal dispatch: the point of a probe is to see what the
+    # ring actually sends, not only what this transport knows how to parse.
+    # ------------------------------------------------------------------
+
+    def debug_gatt_table(self) -> list[str]:
+        """
+        One line per service and characteristic, for the probe log.
+
+        Handles are included because they, not UUIDs, identify a declaration:
+        a Bluetooth HID device publishes several characteristics under one UUID
+        (the R08 has four ``2a4d`` Reports), so a capture that names only UUIDs
+        cannot say which of them anything happened on.
+        """
+        if self._client is None:
+            return ["(no client)"]
+        lines: list[str] = []
+        for service in self._client.services:
+            lines.append(f"service {service.uuid}")
+            lines.extend(
+                f"  char {char.uuid}#{char.handle} [{', '.join(char.properties)}]"
+                for char in service.characteristics
+            )
+        return lines
+
+    async def debug_subscribe_extras(
+        self,
+        on_notify: Callable[[BleakGATTCharacteristic, bytearray], None],
+    ) -> tuple[list[BleakGATTCharacteristic], list[BleakGATTCharacteristic]]:
+        """
+        Subscribe to every other notify/indicate characteristic we can find.
+
+        A probe hunting for an undocumented report (an R08 touch event, say)
+        must not assume it arrives on the UART TX characteristic. Each
+        characteristic is subscribed individually so one refusal (a firmware
+        that errors on a CCCD write) does not lose the rest.
+
+        Returns ``(subscribed, refused)`` *as characteristic objects* rather
+        than UUIDs. Addressing by object is what distinguishes this ring's four
+        Report declarations (``2a4d``, same UUID, different handles): addressed
+        by UUID, both a subscription and its unsubscribe mean "whichever
+        declaration the stack happens to find first", so the probe can end up
+        listening on a report that is not the one carrying events. Refusals are
+        returned rather than swallowed for the same reason - in a live capture
+        exactly one of the two notify-capable ``2a4d`` declarations refused the
+        CCCD write, and being able to retry that specific one (see
+        :meth:`debug_subscribe_specific`) is what separates "this device is
+        silent" from "the only report characteristic we could enable is silent".
+        """
+        assert self._client is not None
+        candidates = [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+            # The UART TX characteristic is already dispatched through
+            # _handle_tx; anything else that can notify is fair game.
+            if char.uuid.upper() != UART_TX_CHAR_UUID
+            and {"notify", "indicate"} & set(char.properties)
+        ]
+        return await self.debug_subscribe_specific(candidates, on_notify)
+
+    async def debug_subscribe_specific(
+        self,
+        chars: list[BleakGATTCharacteristic],
+        on_notify: Callable[[BleakGATTCharacteristic, bytearray], None],
+    ) -> tuple[list[BleakGATTCharacteristic], list[BleakGATTCharacteristic]]:
+        """
+        Subscribe to the given characteristics, one at a time.
+
+        Split out from :meth:`debug_subscribe_extras` so a probe can retry a
+        known set after changing the device's state: a peripheral may reject a
+        CCCD write while its input source is idle and accept the same write
+        once configured, so an early refusal is not necessarily a final one.
+        """
+        assert self._client is not None
+        subscribed: list[BleakGATTCharacteristic] = []
+        refused: list[BleakGATTCharacteristic] = []
+        for char in chars:
+            try:
+                await self._client.start_notify(char, on_notify)
+            except (TimeoutError, BleakError, OSError):
+                refused.append(char)
+                continue
+            subscribed.append(char)
+        return subscribed, refused
+
+    async def debug_unsubscribe_extras(
+        self,
+        chars: list[BleakGATTCharacteristic],
+    ) -> None:
+        """Best-effort undo of :meth:`debug_subscribe_extras`."""
+        if self._client is None:
+            return
+        for char in chars:
+            try:
+                await self._client.stop_notify(char)
+            except (TimeoutError, BleakError, OSError):
+                LOGGER.debug(
+                    "Probe could not unsubscribe %s (handle %d)",
+                    char.uuid,
+                    char.handle,
+                )
+
+    async def debug_send(self, frame: bytearray) -> None:
+        """Send one raw caller-built frame (the probe supplies the checksum)."""
+        await self._send(frame)
+
+    async def debug_write(self, uuid: str, data: bytearray) -> int:
+        """
+        Write one arbitrary characteristic by UUID, for the dev probe.
+
+        Two write styles exist in the wild and picking wrong is an instant
+        failure: the ring's UART RX characteristic is write-without-response,
+        while a Bluetooth HID Control Point (``2a4c``) is too, but other
+        characteristics insist on a response. Bleak does not reliably infer it
+        here, so the choice comes straight from the characteristic's own
+        advertised properties.
+
+        Returns the handle actually written, because a UUID can name more than
+        one declaration - this ring publishes four Report characteristics
+        (``2a4d``) - and then "which one did I just write" is the question the
+        capture turns on.
+        """
+        if self._client is None:
+            raise ColmiRingApiClientError("not connected")
+        char = self._client.services.get_characteristic(uuid)
+        if char is None:
+            raise ColmiRingApiClientError(f"no characteristic {uuid}")
+        props = set(char.properties)
+        if "write-without-response" in props:
+            response = False
+        elif "write" in props:
+            response = True
+        else:
+            raise ColmiRingApiClientError(f"{uuid} is not writable ({char.properties})")
+        await self._client.write_gatt_char(char, data, response=response)
+        return char.handle
+
+    async def debug_read(self, specifier: BleakGATTCharacteristic | int | str) -> bytes:
+        """
+        Read one characteristic, for the dev probe.
+
+        Some answers are descriptors of the protocol rather than traffic: the
+        Bluetooth HID Report Map (``2a4b``) says exactly how this ring's input
+        reports are laid out, which no amount of packet sniffing will tell you
+        if the device stays quiet during the capture.
+
+        Accepts a characteristic object or handle as well as a UUID, for the
+        same reason the subscription helpers do: duplicated UUIDs make "read
+        this by UUID" mean "read whichever declaration the stack found first".
+        """
+        assert self._client is not None
+        return bytes(await self._client.read_gatt_char(specifier))
+
+    def debug_readable_chars(self) -> list[BleakGATTCharacteristic]:
+        """
+        Every characteristic with a readable value, for the probe's dump.
+
+        Characteristics, not UUIDs: addressing by object is what distinguishes
+        the ring's four ``2a4d`` Report declarations from one another.
+        """
+        if self._client is None:
+            return []
+        return [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+            if "read" in char.properties
+        ]
+
+    def debug_gatt_chars(self) -> list[BleakGATTCharacteristic]:
+        """Every characteristic on the link, for the dev probe's inspection."""
+        if self._client is None:
+            return []
+        return [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+        ]
+
+    def debug_char_descriptors(
+        self,
+        char: BleakGATTCharacteristic,
+    ) -> list[BleakGATTDescriptor]:
+        """
+        A characteristic's descriptors, for the dev probe to name and read.
+
+        Descriptors are where a duplicated UUID stops being ambiguous: a
+        Bluetooth HID Report characteristic carries a Report Reference
+        (``2908``) holding its report ID and type (1 Input / 2 Output /
+        3 Feature), which is what says which of four ``2a4d`` declarations is
+        the input report, and therefore which one to listen to.
+        """
+        return list(char.descriptors)
+
+    async def debug_read_descriptor(self, descriptor: BleakGATTDescriptor) -> bytes:
+        """Read one descriptor, for the dev probe."""
+        assert self._client is not None
+        return bytes(await self._client.read_gatt_descriptor(descriptor.handle))
+
     async def close(self) -> None:
         """Disconnect the GATT link; safe to call twice or on a dead link."""
         if self._client is None:
@@ -402,20 +683,95 @@ class _RingConnection:
         except (TimeoutError, BleakError, OSError):
             LOGGER.debug("Ignoring disconnect error for %s", self._address)
 
-    def _handle_tx(self, _: BleakGATTCharacteristic, packet: bytearray) -> None:
-        """Bleak notification callback: dispatch a 16-byte packet to its parser."""
+    def _notify_observers(self, packet: bytearray) -> None:
+        """
+        Run the whole-packet taps, before any filtering of this packet.
+
+        Three of them, each fenced: a callback raising here would otherwise
+        propagate out of the bleak notification callback and stop notifications
+        for the whole link, so no tap may be allowed to kill the others.
+
+        - ``raw_observer`` is the debug probe's tap: it sees *every*
+          notification, including lengths this transport discards.
+        - ``touch_observer`` is a session's tap, placed above the length gate
+          because a 3-byte HID touch report must not be discarded as "a packet
+          of unexpected length" before the session that asked for it sees it.
+        - ``_on_seen`` is not about the packet at all: any inbound notification
+          is proof the ring is alive and in range, whether or not this packet is
+          usable. The coordinator's throttle absorbs a stream's per-second
+          flood.
+        """
+        if self.raw_observer is not None:
+            try:
+                self.raw_observer(packet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring raw packet observer raised")
+        if self.touch_observer is not None:
+            try:
+                self.touch_observer(packet)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Colmi ring touch report observer raised")
         if self._on_seen is not None:
-            # Any inbound notification is proof the ring is alive and in
-            # range, whether or not the packet itself is usable. The
-            # coordinator's throttle absorbs a stream's per-second flood.
             try:
                 self._on_seen()
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Colmi ring on-seen callback raised")
+
+    def _handle_tx(self, char: BleakGATTCharacteristic, packet: bytearray) -> None:
+        """
+        Bleak notification callback: dispatch a packet to whoever wants it.
+
+        Registered on the UART TX characteristic *and* (for an armed touch
+        session) on the HID report characteristic, so the length test below is
+        what tells the two streams of traffic apart rather than the callback.
+        """
+        self._notify_observers(packet)
         if len(packet) != 16:
-            LOGGER.debug("Ignoring packet of unexpected length: %s", packet)
+            # HID touch reports are 3 bytes by design (the Consumer Control
+            # report is 24 one-bit fields), so a session that is listening for
+            # them owns short frames and the complaint would be pure noise at
+            # gesture rate. Anything else of a surprising length is still named.
+            if self.touch_observer is None or len(packet) != r08.TOUCH_REPORT_LEN:
+                LOGGER.debug(
+                    "Ignoring packet of unexpected length (%d bytes) from %s: %s",
+                    len(packet),
+                    getattr(char, "handle", "?"),
+                    packet.hex(" "),
+                )
+                # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING so the
+                # user's HA UI shows it): if a firmware ever answers a log
+                # query with the newer variable-length 0xBC history frames,
+                # they land on this drop path and used to vanish at DEBUG.
+                if self._len_drop_dumps < 8:
+                    self._len_drop_dumps += 1
+                    LOGGER.warning(
+                        "Colmi ring %s frame dropped during %s (length %d,"
+                        " expected 16) from char %s: %s",
+                        self._address,
+                        self.purpose,
+                        len(packet),
+                        getattr(char, "handle", "?"),
+                        packet.hex(" "),
+                    )
             return
         cmd = packet[0]
+        # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING for the same
+        # reason): the raw 0x15 answer bytes are the only way to tell "the
+        # firmware says no data" (sub_type ff) from "the header promises N
+        # packets but the slots are all zero" from "the parser finished the
+        # log early". Dump the framing-decisive sub_types (header, timestamp,
+        # the sub_type-23 early-complete quirk, no-data) plus every eighth
+        # data packet, capped per link.
+        if cmd == hr.CMD_READ_HEART_RATE and self._hr_frame_dumps < 30:
+            sub = packet[1]
+            if sub in (0, 1, 23, 255) or sub % 8 == 0:
+                self._hr_frame_dumps += 1
+                LOGGER.warning(
+                    "Colmi ring %s 0x15 frame during %s: %s",
+                    self._address,
+                    self.purpose,
+                    packet.hex(" "),
+                )
         if self.observer is not None:
             # Counted before dispatch so the tally covers bytes no listener on
             # this session was registered for.
@@ -447,12 +803,15 @@ class _RingConnection:
             # arrived - the deciding detail when a stream and a poll overlap.
             if not listeners and cmd not in self._logged_unexpected:
                 self._logged_unexpected.add(cmd)
-                LOGGER.debug(
+                # DIAGNOSTIC (R08 heart-rate log, temporary): WARNING so this
+                # surfaces in the user's HA log; if the ring answers a query
+                # under a command byte we do not parse, this is the only trace.
+                LOGGER.warning(
                     "Unexpected packet type %s (0x%02X) from ring during %s: %s",
                     cmd,
                     cmd,
                     self.purpose,
-                    packet.hex(),
+                    packet.hex(" "),
                 )
             return
         result = handler(packet)
@@ -634,6 +993,269 @@ class _RingConnection:
             )
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # R08 touch control (codec in colmi_codec/r08.py). Enabling it is an
+    # ordinary Colmi UART command, but the reports it unlocks are Bluetooth HID
+    # notifications on a characteristic that is *not* the UART TX one, so the
+    # path needs three things the rest of this transport has never needed:
+    # naming one of four same-UUID Report declarations, the HID handshake that
+    # makes the ring accept a CCCD write at all, and a tap on the notification
+    # callback above the 16-byte length filter (see ``touch_observer``).
+    # ------------------------------------------------------------------
+
+    async def _read_report_reference(
+        self, char: BleakGATTCharacteristic
+    ) -> bytes | None:
+        """
+        This Report characteristic's ``2908`` value, or None if it refused it.
+
+        Refused is a real answer here and not a bug: on a measured R08 three of
+        the four ``2a4d`` declarations answered the descriptor read and the one
+        carrying touch answered *error 5, Insufficient authentication* - the
+        same failure that makes a plain read of that characteristic fail, while
+        notifications on it work perfectly well unencrypted.
+        """
+        assert self._client is not None
+        descriptor = next(
+            (desc for desc in char.descriptors if _is_sig_uuid(desc.uuid, "2908")),
+            None,
+        )
+        if descriptor is None:
+            return None
+        try:
+            return bytes(await self._client.read_gatt_descriptor(descriptor.handle))
+        except (TimeoutError, BleakError, OSError):
+            return None
+
+    async def resolve_touch_report_char(self) -> BleakGATTCharacteristic:
+        """
+        Find the HID Report characteristic carrying touch, or raise.
+
+        This ring publishes four characteristics under the ``2a4d`` Report UUID,
+        and bleak's ``get_characteristic`` answers with whichever the stack
+        enumerated first - so a listener addressed by UUID can subscribe to the
+        (silent) Mouse Input declaration and conclude the ring reports nothing.
+        The Report Reference descriptor is what names a declaration, holding
+        ``<report ID> <report type>``; measured on an R08, touch is ID 4 type 1
+        (Input) on handle 68.
+
+        Because that read is auth-gated on the one declaration we want, an
+        unreadable descriptor on a notify-capable ``2a4d`` keeps the candidate
+        as a fallback rather than discarding it. Every candidate is logged with
+        its descriptor outcome: this is the most fragile step in the feature, so
+        a firmware revision that reorders handles has to be diagnosable from the
+        log rather than inferred from silence.
+        """
+        if self._client is None:
+            raise ColmiRingApiClientError("not connected")
+        candidates = [
+            char
+            for service in self._client.services
+            for char in service.characteristics
+            if _is_sig_uuid(char.uuid, "2A4D") and "notify" in set(char.properties)
+        ]
+        fallback: BleakGATTCharacteristic | None = None
+        for char in candidates:
+            reference = await self._read_report_reference(char)
+            LOGGER.debug(
+                "Colmi ring %s touch-report candidate handle %d (%s): 2908=%s",
+                self._address,
+                char.handle,
+                ", ".join(char.properties),
+                reference.hex(" ") if reference else "(unreadable)",
+            )
+            if reference is None:
+                # No descriptor at all and a refused read look the same from
+                # here; only a declaration that has descriptors can be the
+                # auth-gated touch one, so only those become the fallback.
+                if char.descriptors and fallback is None:
+                    fallback = char
+                continue
+            if (
+                len(reference) >= 2
+                and reference[0] == r08.TOUCH_REPORT_ID
+                and reference[1] == r08.HID_REPORT_TYPE_INPUT
+            ):
+                return char
+        if fallback is not None:
+            LOGGER.debug(
+                "Colmi ring %s touch report chosen by fallback: handle %d"
+                " (Report Reference unreadable, no declaration read %02X %02X)",
+                self._address,
+                fallback.handle,
+                r08.TOUCH_REPORT_ID,
+                r08.HID_REPORT_TYPE_INPUT,
+            )
+            return fallback
+        msg = (
+            f"Ring {self._address} exposes no notify-capable"
+            f" {HID_REPORT_CHAR_UUID} Report characteristic"
+        )
+        raise ColmiRingApiClientCommunicationError(msg)
+
+    async def hid_touch_handshake(self) -> None:
+        """
+        Put the ring into Report protocol, so it will accept a CCCD write.
+
+        Measured on an R08 as the sequence that starts touch reporting:
+        ``2a4c = 01`` (Suspend) then ``2a4c = 00`` (Resume) to bounce the HID
+        Control Point, then ``2a4e = 01`` to move the Boot Protocol Report
+        Reference off Boot (its cold state) and onto Report protocol, which is
+        what a HOGP host uses.
+
+        It has to be redone on *every* connection, not just the first: the ring
+        boots back to ``00``, and a reconnect that skips this is silent in a way
+        that reads as "the feature is broken" instead of "the handshake was
+        skipped". These writes go to HID characteristics by object, never to the
+        UART ``_rx_char``, and the write style comes from the advertised
+        properties because the two differ (``2a4c`` is write-without-response,
+        ``2a4e`` is read/write).
+        """
+        if self._client is None:
+            raise ColmiRingApiClientError("not connected")
+        control_point = self._client.services.get_characteristic(
+            HID_CONTROL_POINT_CHAR_UUID
+        )
+        boot_protocol = self._client.services.get_characteristic(
+            HID_BOOT_PROTOCOL_CHAR_UUID
+        )
+        if control_point is None or boot_protocol is None:
+            msg = (
+                f"Ring {self._address} does not expose the Bluetooth HID control"
+                " characteristics that touch reporting needs"
+            )
+            raise ColmiRingApiClientCommunicationError(msg)
+        sequence = (
+            (control_point, bytearray([0x01])),  # Suspend
+            (control_point, bytearray([0x00])),  # Resume / normal mode
+            (boot_protocol, bytearray([0x01])),  # Report protocol, not Boot
+        )
+        for char, payload in sequence:
+            props = set(char.properties)
+            if "write" not in props and "write-without-response" not in props:
+                msg = (
+                    f"Ring {self._address} HID characteristic {char.uuid}"
+                    f"#{char.handle} is not writable ({char.properties})"
+                )
+                raise ColmiRingApiClientCommunicationError(msg)
+            try:
+                await self._client.write_gatt_char(
+                    char, payload, response=_write_needs_response(char)
+                )
+            except (TimeoutError, BleakError, OSError) as err:
+                raise ColmiRingApiClientCommunicationError(
+                    f"Ring {self._address} refused the HID touch handshake"
+                    f" ({char.uuid}#{char.handle} <- {payload.hex(' ')}): {err}"
+                ) from err
+
+    async def start_touch_notify(self, char: BleakGATTCharacteristic) -> None:
+        """
+        Subscribe to the touch report characteristic, reusing ``_handle_tx``.
+
+        One notification callback for the whole link is deliberate. The ring has
+        been observed multiplexing a 16-byte UART echo onto the report
+        characteristic, so a callback that reasoned "this arrived on the HID
+        characteristic, so it must be a report" would hand the session UART
+        frames. A single dispatch point that re-tests the length is the only
+        honest place for that check.
+
+        Must run *after* :meth:`hid_touch_handshake`: measured on an R08 the ring
+        rejects this CCCD write before the handshake and accepts it after, so a
+        session that subscribes first hears nothing in exactly the way a session
+        on firmware without touch does.
+        """
+        assert self._client is not None
+        try:
+            await self._client.start_notify(char, self._handle_tx)
+        except (TimeoutError, BleakError, OSError) as err:
+            raise ColmiRingApiClientCommunicationError(
+                f"Ring {self._address} refused the touch report subscription"
+                f" ({char.uuid}#{char.handle}): {err}"
+            ) from err
+
+    async def stop_touch_notify(self, char: BleakGATTCharacteristic) -> None:
+        """Undo :meth:`start_touch_notify`; best-effort on a link already dying."""
+        if self._client is None:
+            return
+        try:
+            await self._client.stop_notify(char)
+        except (TimeoutError, BleakError, OSError):
+            LOGGER.debug(
+                "Could not unsubscribe touch reports on ring %s (handle %d)",
+                self._address,
+                char.handle,
+            )
+
+    async def set_touch_control(
+        self,
+        enabled: bool,
+        *,
+        app_type: int = r08.TOUCH_APP_TYPE_MEDIA,
+        sleep_minutes: int = r08.DEFAULT_TOUCH_SLEEP_MINUTES,
+    ) -> str:
+        """
+        Turn the ring's touch input on or off, and say how that went.
+
+        Returns ``"armed"``, ``"unwritten"``, ``"no-echo"`` or ``"disarmed"``
+        rather than a bool, because the two ways enabling fails deserve to be
+        told apart: ``"unwritten"`` means the frame never reached the ring, which
+        is a link problem and worth another attempt, while ``"no-echo"`` means
+        the ring took the frame and answered nothing, which is evidence that this
+        firmware does not implement the command and will not be fixed by
+        reconnecting.
+
+        Enabling is confirmed by the ring echoing the frame it was sent - the
+        only acknowledgement on offer, since the reports that follow are
+        notifications on another characteristic and may not arrive for hours.
+        The echo wait runs while the caller holds :meth:`SharedLink.gate`, which
+        is what bounds its cost: on a ring that ignores the command, polls queue
+        behind it for at most :data:`TOUCH_ECHO_TIMEOUT_S`.
+        """
+        packet = (
+            r08.touch_config_packet(app_type, sleep_minutes)
+            if enabled
+            else r08.touch_off_packet()
+        )
+        LOGGER.debug(
+            "Colmi ring %s touch-control packet (%s, appType %d, sleep %d min): %s",
+            self._address,
+            "on" if enabled else "off",
+            app_type,
+            sleep_minutes,
+            packet.hex(" "),
+        )
+        if not enabled:
+            # Teardown also runs after the link has dropped, where this write
+            # would raise; a ring out of range has nothing to acknowledge.
+            try:
+                await self._send(packet)
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Could not tell ring %s to turn touch control off (already gone?)",
+                    self._address,
+                )
+                return "unwritten"
+            return "disarmed"
+
+        echo = asyncio.Event()
+
+        def on_reply(reply: bytearray) -> None:
+            if r08.parse_touch_config_reply(reply):
+                echo.set()
+
+        self.add_listener(r08.CMD_TOUCH_CONTROL, on_reply)
+        try:
+            await self._send(packet)
+            try:
+                await asyncio.wait_for(echo.wait(), TOUCH_ECHO_TIMEOUT_S)
+            except TimeoutError:
+                return "no-echo"
+        except ColmiRingApiClientError:
+            return "unwritten"
+        finally:
+            self.remove_listener(r08.CMD_TOUCH_CONTROL, on_reply)
+        return "armed"
 
     async def poll_real_time_reading(
         self, reading_type: real_time.RealTimeReading
@@ -1023,6 +1645,59 @@ class _StreamTally:
         )
 
 
+class _TouchCounts:
+    """
+    What one touch session was told about, in terms a log line can use.
+
+    :class:`_StreamTally` keys everything by UART command byte, which is the
+    right question for a stream; for touch the questions are different - how
+    many HID reports arrived, and how many were the *all-zero release* report
+    that follows every press rather than a press itself. Runs inside the
+    notification callback, so like the tally it only counts.
+    """
+
+    def __init__(self) -> None:
+        self.reports = 0
+        self.releases = 0
+        self.events = 0
+        self.gestures: Counter[str] = Counter()
+        self.unknown_usages: Counter[int] = Counter()
+
+    def add(self, packet: bytearray) -> None:
+        """Record one notification of any length; report only what is a report."""
+        report = r08.parse_touch_report(packet)
+        if report is None:
+            # Either not a report at all, or the release that follows every
+            # press. Distinguishing the two needs the length, since a UART frame
+            # is not a release, just something else arriving on the same link.
+            if len(packet) == r08.TOUCH_REPORT_LEN:
+                self.releases += 1
+            return
+        self.reports += 1
+        self.events += 1
+        for gesture in report.gestures:
+            self.gestures[gesture] += 1
+        # Bits the usage table does not name. The table covers 0.0..0.18, so a
+        # set bit above that is a field the Report Map declares and we do not
+        # model: the ring pressed something we cannot even name. Logged rather
+        # than guessed at, because a misnamed gesture is worse than an unknown
+        # one - and this counter is how that gap surfaces at all.
+        unknown = report.raw >> len(r08.TOUCH_USAGE_BITS)
+        bit = len(r08.TOUCH_USAGE_BITS)
+        while unknown:
+            if unknown & 1:
+                self.unknown_usages[bit] += 1
+            unknown >>= 1
+            bit += 1
+
+    def describe(self) -> str:
+        """Human-readable summary of the gestures seen, most frequent first."""
+        return (
+            ", ".join(f"{name} x{num}" for name, num in self.gestures.most_common(5))
+            or "none"
+        )
+
+
 class _LinkSession:
     """
     One open connection to the ring that its holder may end early.
@@ -1075,7 +1750,30 @@ class WaveSession(_LinkSession):
     """
 
 
-# Either kind of session, so the shared retry loop can be typed against both.
+class TouchSession(_LinkSession):
+    """
+    A live touch session: one connection with the HID report subscribed.
+
+    Silence is normal here too, and for longer: between gestures there is
+    nothing, possibly for hours, so this kind of session is never closed for
+    lack of traffic.
+
+    It carries the report characteristic it subscribed to because that handle is
+    resolved at session open (see
+    :meth:`_RingConnection.resolve_touch_report_char`) and must be the same one
+    unsubscribed on the way out: addressing by UUID would name whichever
+    declaration the stack finds first, which is how a teardown leaves the wrong
+    report live on the ring.
+    """
+
+    def __init__(
+        self, conn: _RingConnection, report_char: BleakGATTCharacteristic
+    ) -> None:
+        super().__init__(conn)
+        self.report_char = report_char
+
+
+# Any kind of session, so the shared retry loop can be typed against all of them.
 _SessionT = TypeVar("_SessionT", bound=_LinkSession)
 
 
@@ -1084,10 +1782,10 @@ class _SessionKind[SessionT: _LinkSession]:
     """
     How one kind of long-lived session is opened, and when to reopen it.
 
-    The motion stream and the wave listener hold the ring's link in the same way
-    and want the same retry behaviour; what differs is the opening ritual and
-    which closing reasons are worth a reconnect, so those three things travel
-    together instead of as loose parameters.
+    The motion stream, the wave listener and the touch listener hold the ring's
+    link in the same way and want the same retry behaviour; what differs is the
+    opening ritual and which closing reasons are worth a reconnect, so those
+    three things travel together instead of as loose parameters.
     """
 
     #: What this kind of session is called in log lines.
@@ -1136,6 +1834,20 @@ class ColmiRingApiClient:
         # is reported on every poll in between.
         self._stress_reading: dict[str, Any] | None = None
         self._stress_slot: int | None = None
+        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date of the day
+        # whose "no HR" condition was already reported at WARNING, so the
+        # once-per-day diagnostics below stay once-per-day at any poll rate.
+        self._hr_diag_day: str | None = None
+        self._hr_settings_diag_day: str | None = None
+        self._hr_prev_day_diag: str | None = None
+        # The ``3B 02`` enable the most recent touch session armed with, as
+        # ``(app_type, sleep_minutes)``, or None if none ever went out. The
+        # watchdog may need to re-send that same frame after the ring's own
+        # touch sleep expires, and re-sending a *different* config than the one
+        # the session armed with would quietly change the behaviour partway
+        # through - so the session records what it wrote rather than each
+        # caller re-deriving it from options.
+        self._touch_config: tuple[int, int] | None = None
 
     async def async_close(self) -> None:
         """
@@ -1146,6 +1858,11 @@ class ColmiRingApiClient:
         connection owned by nobody in the meantime.
         """
         await self._link.close()
+
+    @property
+    def debug_link(self) -> SharedLink:
+        """The shared link, exposed for the dev-only debug probe service."""
+        return self._link
 
     def _claim_measurement(self, name: str) -> None:
         """
@@ -1160,8 +1877,10 @@ class ColmiRingApiClient:
             raise ColmiRingApiClientBusyError(measurement_busy_message(self._measuring))
         self._measuring = name
 
-    async def async_get_data(  # noqa: PLR0915 - one straight-line poll of every capability
-        self, include_previous_day: bool = False
+    async def async_get_data(  # noqa: PLR0912, PLR0915 - one straight-line poll of
+        # every capability; extra branches are temporary R08 HR diagnostics
+        self,
+        include_previous_day: bool = False,
     ) -> dict[str, Any]:
         """
         Return the latest heart rate plus the ring's HR logging settings.
@@ -1197,6 +1916,19 @@ class ColmiRingApiClient:
                 LOGGER.debug(
                     "Colmi ring %s did not answer heart-rate settings query",
                     self._ring_address,
+                )
+            # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING, once/day):
+            # the settings answer decides everything about the daily log -
+            # enabled=0 means the ring itself is not recording, and the
+            # interval drives the expected sample cadence. A missing answer
+            # also silently changes the staleness threshold upstream.
+            today_iso = date_utils.start_of_day(date_utils.now()).isoformat()
+            if self._hr_settings_diag_day != today_iso:
+                self._hr_settings_diag_day = today_iso
+                LOGGER.warning(
+                    "Colmi ring %s HR settings this poll: %s",
+                    self._ring_address,
+                    settings if settings is not None else "NO ANSWER (query timed out)",
                 )
 
             battery_level: int | None = None
@@ -1262,15 +1994,22 @@ class ColmiRingApiClient:
             await asyncio.sleep(0.5)
             log = await conn.get_heart_rate_log()
             if not isinstance(log, hr.HeartRateLog):
-                LOGGER.info(
-                    "Colmi ring %s returned no heart-rate log (NoData) for "
-                    "requested UTC day %s - ring clock/day mismatch?",
-                    self._ring_address,
-                    date_utils.start_of_day(date_utils.now()).isoformat(),
-                )
+                # DIAGNOSTIC (R08 heart-rate log, temporary): WARNING once/day
+                # so it survives the user's WARNING-only log view; the raw
+                # frames the parser saw are dumped separately in _handle_tx.
+                if self._hr_diag_day != today_iso:
+                    self._hr_diag_day = today_iso
+                    LOGGER.warning(
+                        "Colmi ring %s returned NO heart-rate log (NoData/error"
+                        " sub_type ff) for requested UTC day %s - ring not"
+                        " recording, or clock/day mismatch?",
+                        self._ring_address,
+                        today_iso,
+                    )
             else:
-                # Heart rate is sampled at the ring's logging interval but logged
-                # in 5-min slots, so most slots are 0 and must be filtered out
+                # Heart rate is logged on the ring's own slot grid (5-min
+                # slots on R02-class firmware; the sampling interval itself
+                # on the R08), so many slots are 0 and must be filtered out
                 # before picking the latest.
                 all_slots = log.heart_rates_with_times()
                 entries = [r for r in all_slots if r[0] > 0]
@@ -1283,27 +2022,58 @@ class ColmiRingApiClient:
                 # of slots and the parser's is-today cleanup zeroes (but does
                 # not shrink) the future ones.
                 interval = settings.interval if settings else 15
-                # Slots started so far today (slot k covers minutes 5k..5k+4).
-                # minutes_so_far() is "minutes + 1", so subtract it back before
-                # dividing: otherwise the clamp can admit a not-yet-started
-                # slot, inflating the zero-evidence gap by a spurious 5 min.
-                slots_now = (date_utils.minutes_so_far(date_utils.now()) - 1) // 5 + 1
+                slot_range = log.range
+                # Slots started so far today (slot k covers minutes
+                # range*k..range*(k+1)-1). minutes_so_far() is "minutes + 1",
+                # so subtract it back before dividing: otherwise the clamp can
+                # admit a not-yet-started slot, inflating the zero-evidence
+                # gap by a spurious slot.
+                slots_now = (
+                    date_utils.minutes_so_far(date_utils.now()) - 1
+                ) // slot_range + 1
                 filled = min(max(log.index, 0), len(all_slots), slots_now)
                 hr_zero_reading = _latest_sample_is_zero(
-                    all_slots, entries, filled, interval
+                    all_slots, entries, filled, interval, slot_range
                 )
                 if not entries:
-                    LOGGER.info(
-                        "Colmi ring %s returned a heart-rate log but every slot "
-                        "was 0/empty (log day=%s, raw slots=%d, filled=%d) - ring "
-                        "has not recorded HR today or its clock is off",
-                        self._ring_address,
-                        log.timestamp.isoformat(),
-                        len(log.heart_rates),
-                        log.index,
-                    )
+                    # DIAGNOSTIC (R08 heart-rate log, temporary): this is the
+                    # state behind an hours-long Unknown sensor on a ring that
+                    # answers the log query: a complete, well-formed day whose
+                    # every slot reads 0. WARNING once/day.
+                    if self._hr_diag_day != today_iso:
+                        self._hr_diag_day = today_iso
+                        LOGGER.warning(
+                            "Colmi ring %s returned a heart-rate log but EVERY"
+                            " SLOT WAS 0 (log day=%s, grid=%d min, packets=%d,"
+                            " slots=%d, filled=%d, off-finger=%s) - ring"
+                            " answered but recorded nothing today",
+                            self._ring_address,
+                            log.timestamp.isoformat(),
+                            log.range,
+                            log.size,
+                            len(log.heart_rates),
+                            log.index,
+                            hr_zero_reading,
+                        )
                 else:
                     heart_rate, heart_rate_timestamp = max(entries, key=lambda x: x[1])
+                    # DIAGNOSTIC (R08 heart-rate log, temporary): once/day, the
+                    # healthy path's key numbers, so a later "Unknown" can be
+                    # compared against the last known-good log state.
+                    if self._hr_diag_day != today_iso:
+                        self._hr_diag_day = today_iso
+                        LOGGER.warning(
+                            "Colmi ring %s HR log ok: samples=%d grid=%d min"
+                            " filled=%d/%d newest=%s@%s settings=%s",
+                            self._ring_address,
+                            len(entries),
+                            log.range,
+                            filled,
+                            len(all_slots),
+                            heart_rate,
+                            heart_rate_timestamp.isoformat(),
+                            settings,
+                        )
 
             # Stress is logged one value per 30-min slot of the ring's day,
             # so the log is re-read only when that slot changes and the
@@ -1428,11 +2198,36 @@ class ColmiRingApiClient:
                 hr_entries = hr_entries + [
                     (ts, bpm) for bpm, ts in log.heart_rates_with_times() if bpm > 0
                 ]
+            else:
+                # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING once per
+                # day): NoData for yesterday's query is the exact condition the
+                # "no hr_entries ... ring log query returned empty" backfill
+                # warning reports; say which day and which outcome.
+                diag_key = prev_day.date().isoformat()
+                if self._hr_prev_day_diag != diag_key:
+                    self._hr_prev_day_diag = diag_key
+                    LOGGER.warning(
+                        "Colmi ring %s previous-day (%s) HR log query answered"
+                        " with NoData - backfill has no yesterday history",
+                        self._ring_address,
+                        diag_key,
+                    )
         except ColmiRingApiClientError:
             LOGGER.debug(
                 "Colmi ring %s did not answer previous-day heart-rate query",
                 self._ring_address,
             )
+            # DIAGNOSTIC (R08, temporary): name the timeout/refusal too, since
+            # it is indistinguishable from NoData in the backfill warning.
+            diag_key = prev_day.date().isoformat()
+            if self._hr_prev_day_diag != diag_key:
+                self._hr_prev_day_diag = diag_key
+                LOGGER.warning(
+                    "Colmi ring %s previous-day (%s) HR log query failed: %s",
+                    self._ring_address,
+                    diag_key,
+                    "no answer / refused",
+                )
         try:
             sport = await conn.get_steps(prev_day)
             if isinstance(sport, list):
@@ -1744,6 +2539,173 @@ class ColmiRingApiClient:
             tally.describe(),
         )
 
+    @asynccontextmanager
+    async def _touch_session(
+        self, on_packet: Callable[[bytearray], None]
+    ) -> AsyncIterator[TouchSession]:
+        """
+        Hold the link with the ring's touch input on and its reports subscribed.
+
+        This is the session behind the (R08-only) Touch Control switch. It is a
+        shared lease like the wave listener - touch reports are notifications, so
+        nothing about *listening* needs the link to itself - but opening it is a
+        three-step ritual that has to happen in this order, measured on an R08:
+
+        1. the UART ``3B 02`` enable, confirmed by the ring echoing the frame;
+        2. the HID handshake (``2a4c`` bounce, ``2a4e = 01``), because the ring
+           boots in Boot protocol and refuses a CCCD write until it is moved to
+           Report protocol;
+        3. the ``start_notify`` on the resolved Report characteristic.
+
+        Subscribing first is refused, and a refused subscription is silent, so a
+        session that inverted steps 2 and 3 would look exactly like firmware
+        without touch. Step 2 is redone on *every* connection for the same
+        reason: the ring forgets it on reconnect.
+
+        The observer goes in before step 1 so the enable echo and any report that
+        arrives immediately cannot fall on the floor, and it is cleared on every
+        exit path: the shared link outlives this session, and leaving the tap in
+        place would count reports for a logged-and-done tally. The matching
+        ``3B 01`` goes out on every exit path too, because the ring keeps
+        listening for touches (and keeps powering the capacitive sensor) until
+        told otherwise.
+
+        No silence timeout, like the wave listener: silence here means the ring
+        is in nobody's hand, which is the normal case for hours at a time.
+        """
+        app_type, sleep_minutes = self._touch_config or (
+            r08.TOUCH_APP_TYPE_MEDIA,
+            r08.DEFAULT_TOUCH_SLEEP_MINUTES,
+        )
+        async with self._link.hold(
+            "touch control", exclusive=False, wait_s=STREAM_LOCK_WAIT_S
+        ) as conn:
+            # Not inside a gate: descriptor reads are a handful of small GATT
+            # reads on attributes the UART exchange never touches, and one of
+            # them is expected to fail on purpose. Holding the transaction lock
+            # across them would queue polls behind a session-opening scan.
+            report_char = await conn.resolve_touch_report_char()
+            session = TouchSession(conn, report_char)
+            counts = _TouchCounts()
+            listener = self._make_packet_listener(session, on_packet)
+
+            def on_report(packet: bytearray) -> None:
+                counts.add(packet)
+                # Only reports are forwarded. The observer sits above the link's
+                # length filter, so it also sees the UART frames this ring has
+                # been observed multiplexing onto the report characteristic; the
+                # touch caller has no use for those, and neither has the
+                # gesture-detecting manager above it.
+                if len(packet) == r08.TOUCH_REPORT_LEN:
+                    listener(packet)
+
+            # Everything that can raise from here on runs inside the try below.
+            # The observer is already installed by now, so a session that dies
+            # part-way through opening - a refused handshake, a busy gate -
+            # would otherwise leave its tap attached to a link this session does
+            # not own, counting reports for a tally that was never logged.
+            conn.touch_observer = on_report
+            # Set before anything can raise, so the teardown can always log a
+            # real reason rather than tripping over an unbound name.
+            armed = "unwritten"
+            subscribed = False
+            watchdog: asyncio.Task[None] | None = None
+            try:
+                async with self._link.gate("touch arm"):
+                    armed = await conn.set_touch_control(
+                        True, app_type=app_type, sleep_minutes=sleep_minutes
+                    )
+                if armed != "armed":
+                    # No point subscribing to a report the ring was never told to
+                    # send: that would hold the link open and report nothing. The
+                    # reason is the session's closing reason, so the retry loop
+                    # can tell a link that dropped the write from firmware that
+                    # ignored it - only the former is worth another connection.
+                    session.request_stop(armed)
+                else:
+                    async with self._link.gate("touch handshake"):
+                        await conn.hid_touch_handshake()
+                        await conn.start_touch_notify(report_char)
+                    subscribed = True
+                watchdog = asyncio.create_task(self._watch_link(session))
+                yield session
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await watchdog
+                conn.touch_observer = None
+                # Only what was actually subscribed gets unsubscribed, and by the
+                # characteristic object rather than the UUID: four declarations
+                # share the UUID, so unsubscribing whichever one the stack finds
+                # first leaves the real one live on the ring.
+                if subscribed:
+                    await conn.stop_touch_notify(report_char)
+                self._log_touch_session(session, counts, armed)
+                try:
+                    async with self._link.gate("touch disarm"):
+                        await conn.set_touch_control(False)
+                except ColmiRingApiClientError:
+                    # Best-effort: the link may already be gone (which is often
+                    # why this session ended), and then there is nothing to arm.
+                    LOGGER.debug(
+                        "Could not tell ring %s to turn touch control off",
+                        self._ring_address,
+                    )
+
+    def _log_touch_session(
+        self, session: TouchSession, counts: _TouchCounts, armed: str
+    ) -> None:
+        """Report what a finished touch session saw, and whether it could work."""
+        lived = f"{time.monotonic() - session.started_at:.1f}s"
+        reason = session.reason or "ABORTED (never stopped by anyone)"
+        if armed != "armed":
+            # INFO: this is the line that answers "I turned it on and nothing
+            # happens", and it names which kind of failure it was - "unwritten"
+            # is a link problem, "no-echo" means this firmware has no such
+            # command and no amount of retrying will teach it one.
+            LOGGER.info(
+                "Colmi ring %s touch control closed after %s (%s): the ring"
+                " never acknowledged the enable command (%s), so no gesture could"
+                " be reported",
+                self._ring_address,
+                lived,
+                reason,
+                armed,
+            )
+            return
+        unnamed = ", ".join(
+            f"bit 0.{bit} x{num}" for bit, num in counts.unknown_usages.most_common(5)
+        )
+        if counts.reports:
+            LOGGER.debug(
+                "Colmi ring %s touch control closed (%s, after %s): %d"
+                " report(s) + %d release(s), %d gesture(s): %s%s",
+                self._ring_address,
+                reason,
+                lived,
+                counts.reports,
+                counts.releases,
+                counts.events,
+                counts.describe(),
+                f"; unnamed usages: {unnamed}" if unnamed else "",
+            )
+            return
+        # INFO, for the same reason as the wave session's equivalent: a session
+        # that was armed, subscribed and alive yet heard not even a *release*
+        # report is the evidence that this firmware does not report touches.
+        LOGGER.info(
+            "Colmi ring %s touch control closed after %s (%s) with %d report(s)"
+            " and none of them a touch: %s%s. If you touched the ring during this"
+            " session, this firmware probably does not report the gesture",
+            self._ring_address,
+            lived,
+            reason,
+            counts.releases,
+            counts.describe(),
+            f"; unnamed usages: {unnamed}" if unnamed else "",
+        )
+
     @staticmethod
     async def _watch_link(session: _LinkSession) -> None:
         """
@@ -1896,6 +2858,52 @@ class ColmiRingApiClient:
             on_session,
         )
 
+    async def async_listen_touches(
+        self,
+        on_packet: Callable[[bytearray], None],
+        should_run: Callable[[], bool],
+        on_session: Callable[[TouchSession], None] | None = None,
+        *,
+        app_type: int = r08.TOUCH_APP_TYPE_MEDIA,
+        sleep_minutes: int = r08.DEFAULT_TOUCH_SLEEP_MINUTES,
+    ) -> str | None:
+        """
+        Run touch-listener sessions, restarting them while still wanted.
+
+        The wave listener's loop over the touch session. Two things are
+        different enough to be worth saying:
+
+        The options travel through :attr:`_touch_config` rather than as opener
+        arguments, because ``_SessionKind.opener`` is a one-argument contract
+        shared with the other two kinds of session. Stashing them here keeps
+        that contract intact and also means a session reopened by the retry loop
+        re-arms with the frame the user last asked for, not a default.
+
+        ``"no-echo"`` is deliberately *not* a retry reason. A ring that takes the
+        enable frame and answers nothing is telling us it has no such command;
+        reconnecting cannot add a command to its firmware, and burning 180 s of
+        retries on it only delays polling resuming.
+
+        Callers must gate this on :func:`ring_identity.ring_has_touch`: on a
+        ring without the HID report characteristics this fails at session open,
+        and would spend its whole retry budget finding out what the model name
+        already said.
+        """
+        self._touch_config = (app_type, sleep_minutes)
+        return await self._run_sessions(
+            _SessionKind(
+                label="touch control",
+                opener=self._touch_session,
+                # Silence is normal here, so it never closes a session; a
+                # dropped link is retried, and so is an enable write that never
+                # reached the ring, which may just have been a busy moment.
+                retry_reasons=("disconnected", "unwritten"),
+            ),
+            on_packet,
+            should_run,
+            on_session,
+        )
+
     async def _run_sessions(
         self,
         kind: _SessionKind[_SessionT],
@@ -1906,11 +2914,11 @@ class ColmiRingApiClient:
         """
         Hold one kind of session open, reopening it while it is wanted.
 
-        Shared by the motion stream and the wave listener: they differ only in
-        how the session is opened and in which closing reasons are worth another
-        attempt, but both hold the ring's single link for their whole life, so
-        both owe the host the same courtesy about retrying and about knowing when
-        to stop.
+        Shared by the motion stream, the wave listener and the touch listener:
+        they differ only in how the session is opened and in which closing
+        reasons are worth another attempt, but all three hold the ring's single
+        link for their whole life, so all three owe the host the same courtesy
+        about retrying and about knowing when to stop.
 
         A session that drops or cannot open is retried with a doubling delay
         (:data:`_STREAM_RETRY_MIN_S` up to :data:`_STREAM_RETRY_MAX_S`) for as

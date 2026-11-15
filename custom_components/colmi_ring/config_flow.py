@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -31,6 +31,11 @@ from .const import (
     CONF_MOTION_SENSOR_UPDATE_S,
     CONF_MOTION_STREAM_TIMEOUT,
     CONF_POLL_MAX_INTERVAL,
+    CONF_PROXIMITY_SAMPLES_N,
+    CONF_PROXIMITY_TOP_K,
+    CONF_PROXIMITY_VOTE_MARGIN,
+    CONF_TOUCH_SLEEP_MINUTES,
+    CONF_TOUCH_TIMEOUT,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
     CONF_WAVE_TIMEOUT,
@@ -42,6 +47,11 @@ from .const import (
     DEFAULT_MOTION_SENSOR_UPDATE_S,
     DEFAULT_MOTION_STREAM_TIMEOUT,
     DEFAULT_POLL_MAX_INTERVAL,
+    DEFAULT_PROXIMITY_SAMPLES_N,
+    DEFAULT_PROXIMITY_TOP_K,
+    DEFAULT_PROXIMITY_VOTE_MARGIN,
+    DEFAULT_TOUCH_SLEEP_MINUTES,
+    DEFAULT_TOUCH_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
     DEFAULT_WAVE_TIMEOUT,
@@ -50,9 +60,12 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     MOTION_HOLE_AXIS_CHOICES,
+    TOUCH_SLEEP_MINUTES_MAX,
+    TOUCH_SLEEP_MINUTES_MIN,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
 )
+from .ring_identity import ring_has_touch
 from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:
@@ -299,6 +312,51 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                             CONF_BACKFILL_ON_RECONNECT, True
                         ),
                     ): selector.BooleanSelector(),
+                    # --- Proximity ("Seen by") vote tunables -----------------
+                    # See const.py for the semantics; the coordinator reads
+                    # and clamps these live, so changes apply on reload.
+                    vol.Optional(
+                        CONF_PROXIMITY_SAMPLES_N,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_SAMPLES_N,
+                            DEFAULT_PROXIMITY_SAMPLES_N,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=10,
+                            max=300,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_PROXIMITY_TOP_K,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_TOP_K,
+                            DEFAULT_PROXIMITY_TOP_K,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=3,
+                            max=100,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_PROXIMITY_VOTE_MARGIN,
+                        default=self.config_entry.options.get(
+                            CONF_PROXIMITY_VOTE_MARGIN,
+                            DEFAULT_PROXIMITY_VOTE_MARGIN,
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=20,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
                     vol.Optional(
                         CONF_GESTURE_HOLD_STILL_S,
                         default=self.config_entry.options.get(
@@ -444,5 +502,43 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                         ),
                     ): selector.BooleanSelector(),
                 }
+                | self._touch_options(),
             ),
         )
+
+    def _touch_options(self) -> dict[vol.Optional, Any]:
+        """Touch-surface options, for rings that have a touch surface."""
+        # The same gate setup used to build (or omit) the TouchManager, so the
+        # options form offers touch settings exactly when some entity reads
+        # them.
+        if not ring_has_touch(self.hass, self.config_entry):
+            return {}
+        return {
+            vol.Optional(
+                CONF_TOUCH_TIMEOUT,
+                default=self.config_entry.options.get(
+                    CONF_TOUCH_TIMEOUT, DEFAULT_TOUCH_TIMEOUT
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    # 0 means "stay on until switched off".
+                    min=0,
+                    max=1440,
+                    step=15,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TOUCH_SLEEP_MINUTES,
+                default=self.config_entry.options.get(
+                    CONF_TOUCH_SLEEP_MINUTES, DEFAULT_TOUCH_SLEEP_MINUTES
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=TOUCH_SLEEP_MINUTES_MIN,
+                    max=TOUCH_SLEEP_MINUTES_MAX,
+                    step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+        }

@@ -1,6 +1,8 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
+MINUTES_PER_DAY = 1440
+
 
 def start_of_day(ts: datetime) -> datetime:
     return ts.replace(hour=0, minute=0, second=0, microsecond=0)

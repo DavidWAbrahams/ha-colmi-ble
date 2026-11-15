@@ -7,15 +7,16 @@ https://github.com/ludeeus/integration_blueprint
 
 from __future__ import annotations
 
+import functools
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.components.bluetooth import (
-    BluetoothScanningMode,
-    async_register_callback,
+    async_register_advertisement_callback,
 )
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import callback
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.loader import async_get_loaded_integration
 
 from .api import ColmiRingApiClient
@@ -35,7 +36,10 @@ from .const import (
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
+from .debug_probe import cancel_probe, register_probe_service, remove_probe_service
 from .motion_manager import MotionManager
+from .ring_identity import remember_advertisement_name, ring_has_touch
+from .touch_manager import TouchManager
 from .ycbt_api import YcbtRingApiClient
 
 if TYPE_CHECKING:
@@ -168,29 +172,51 @@ async def async_setup_entry(
             on_seen=coordinator.async_note_ring_seen,
         )
 
-    # Passive presence: HA's bluetooth stack scans continuously (this
-    # integration's manifest registers matchers, which keeps active scanning
-    # on), so every advertisement from the ring lands here even while no GATT
-    # link is open. Together with the clients' on-seen notifications (inbound
-    # traffic during a link) this drives the last-seen sensor. The callback
-    # fires for every device HA sees (match_dict=None), so it filters by
-    # address itself; ACTIVE mirrors the scanning the manifest matchers
-    # already force on.
-    ring_address_upper = ring_address.upper()
+    # Passive presence: every raw advertisement the ring emits lands here
+    # even while no GATT link is open, driving the last-seen / last-seen-by /
+    # signal-strength sensors together with the clients' on-seen GATT
+    # notifications. This must be async_register_advertisement_callback
+    # (per-packet), NOT the change-driven async_register_callback: rings
+    # advertise a static payload, and the change-driven path deduplicates
+    # identical advertisements, so its callback would (in practice) never
+    # fire. The per-packet path fires for every advertisement from the
+    # subscribed address, once per scanner that heard it, even when the
+    # payload is unchanged -- exactly what per-proxy zoning needs. The
+    # subscription key is matched exactly against ``service_info.address``,
+    # which is always the upper-case colon MAC (BlueZ / ESPHome), so the
+    # stored address is normalised the same way.
+    try:
+        ring_address_key = format_mac(ring_address).upper()
+    except ValueError:
+        ring_address_key = ring_address.upper()
 
     @callback
-    def _async_ring_advertised(service_info: object, _change: object) -> None:
-        if getattr(service_info, "address", "").upper() == ring_address_upper:
-            coordinator.async_note_ring_seen()
+    def _async_ring_advertised(service_info: object) -> None:
+        # ``source`` is the MAC of the adapter that heard this particular
+        # advertisement: the HA host's own adapter, or an ESPHome proxy.
+        # ``rssi`` is that adapter's own measurement of this advertisement
+        # in dBm. The coordinator keeps both as the ring's last known
+        # observer and its signal level (driving the Seen by and
+        # Signal Strength sensors used for zoning).
+        coordinator.async_note_ring_seen(
+            getattr(service_info, "source", None),
+            getattr(service_info, "rssi", None),
+        )
 
     entry.async_on_unload(
-        async_register_callback(
+        async_register_advertisement_callback(
             hass,
             _async_ring_advertised,
-            None,
-            BluetoothScanningMode.ACTIVE,
+            ring_address_key,
         ),
     )
+    # Model-gated features (the R08 touch surface below, the R08 hole axis in
+    # the motion manager) key off the advertisement name, which the entry
+    # title only holds when discovery named the entry. Stamp the name into
+    # entry data - no UI edits data - while the ring is in range, so no later
+    # rename can take a capability away. Runs before the gate below so even
+    # the first setup reads the model name from durable storage.
+    remember_advertisement_name(hass, entry)
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
     # is a Colmi command): YCBT rings have no equivalent, so the family gate
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
@@ -204,17 +230,36 @@ async def async_setup_entry(
         else None
     )
     coordinator.motion = motion
+    # Touch is gated one level finer than motion: it is Colmi *and* model
+    # specific, because the touch surface is physical and the R07 (same
+    # protocol family) has none. A None here is the whole integration's answer
+    # to "does this ring have touch" - the switch, the event entities and the
+    # options flow all check it rather than re-deriving it.
+    touch = (
+        TouchManager(hass, entry, client, coordinator)
+        if family == FAMILY_COLMI and ring_has_touch(hass, entry)
+        else None
+    )
+    coordinator.touch = touch
     entry.runtime_data = ColmiRingData(
         client=client,
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,
         motion=motion,
+        touch=touch,
     )
 
     # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
     # TODO: When code is stable, this could become coordinator.async_refresh()
     # which ignores errors from the first refresh.
     await coordinator.async_config_entry_first_refresh()
+
+    # Dev-only raw-packet capture service (see debug_probe.py), shown in
+    # Developer Actions as colmi_ring.debug_packet_probe. Registered per
+    # entry and reference counted, so one entry unloading keeps the service
+    # for the others.
+    register_probe_service(hass)
+    entry.async_on_unload(functools.partial(remove_probe_service, hass))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
@@ -227,12 +272,20 @@ async def async_unload_entry(
     entry: ColmiRingConfigEntry,
 ) -> bool:
     """Handle removal of an entry."""
+    # A running dev probe holds the link and has polling paused; end it
+    # before anything else goes away so its cleanup sees a live coordinator.
+    await cancel_probe(entry.entry_id)
     # Close a live stream before its entities disappear, and before the
     # coordinator stops: otherwise the stream task is left holding a connection
     # nobody owns any more.
     motion = entry.runtime_data.motion
     if motion is not None:
         await motion.async_shutdown()
+    # The touch session has to end before the link closes: its teardown is the
+    # write that stops the ring powering a capacitive surface we asked for.
+    touch = entry.runtime_data.touch
+    if touch is not None:
+        await touch.async_shutdown()
     # The Colmi client keeps its shared link open after its last user leaves
     # (the sessions above are gone by now); close it rather than let the idle
     # timer hold a GATT connection for a dead entry.
