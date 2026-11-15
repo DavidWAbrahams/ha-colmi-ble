@@ -53,6 +53,7 @@ _KIND_UNIQUE_SUFFIX: dict[str, str | None] = {
     "steps": "steps",
     "distance": "distance",
     "calories": "calories",
+    "hrv": "hrv",
 }
 
 # Index of each sport metric within an api.py ``sport_bins`` row
@@ -170,6 +171,7 @@ class BackfillManager:
         *,
         hr_enabled: bool,
         steps_enabled: bool,
+        hrv_enabled: bool = True,
         retry_day: str | None = None,
     ) -> None:
         """Import any backlog from this poll's ring logs for enabled metrics."""
@@ -187,8 +189,8 @@ class BackfillManager:
                 len(data.get("hr_entries") or []),
                 len(data.get("sport_bins") or []),
             )
-        if not hr_enabled and not steps_enabled:
-            LOGGER.warning("Colmi backfill: both metrics disabled; skipping")
+        if not hr_enabled and not steps_enabled and not hrv_enabled:
+            LOGGER.warning("Colmi backfill: all metrics disabled; skipping")
             return
         try:
             recorder = get_instance(self._hass)
@@ -200,7 +202,8 @@ class BackfillManager:
             return
         hr_entries = data.get("hr_entries") or []
         sport_bins = data.get("sport_bins") or []
-        if not hr_entries and not sport_bins:
+        hrv_entries = data.get("hrv_entries") or []
+        if not hr_entries and not sport_bins and not hrv_entries:
             # Nothing to import this poll; watermarks stay as they are so the
             # first non-empty batch still imports the whole backlog.
             # WARNING (diagnostic): if this repeats all day, the ring log
@@ -219,22 +222,23 @@ class BackfillManager:
             return
         async with self._lock:
             await self._async_ensure_loaded()
-            kind_results: dict[str, tuple[bool, bool]] = {}
+            # Each enabled metric contributes one (kind, series) job. An empty
+            # series means there is nothing to import for that metric (no
+            # history at all), so it is skipped without touching the had_day /
+            # scanned bookkeeping - only kinds that actually ran get a result.
+            # HRV history only exists when the ring's all-day HRV monitoring is
+            # on; an unanswered 0x39 simply yields no series, so gate on data.
+            jobs: list[tuple[str, list[tuple[datetime, Any]]]] = []
             if hr_enabled:
-                kind_results["heart_rate"] = await self._async_sync_kind(
-                    recorder,
-                    "heart_rate",
-                    hr_entries,
-                    retry_day=retry_day,
-                )
+                jobs.append(("heart_rate", hr_entries))
+            if hrv_enabled and hrv_entries:
+                jobs.append(("hrv", hrv_entries))
             if steps_enabled and sport_bins:
-                for kind, index in _SPORT_INDEX.items():
-                    kind_results[kind] = await self._async_sync_kind(
-                        recorder,
-                        kind,
-                        _cumulative_sport_series(sport_bins, index),
-                        retry_day=retry_day,
-                    )
+                jobs.extend(
+                    (kind, _cumulative_sport_series(sport_bins, index))
+                    for kind, index in _SPORT_INDEX.items()
+                )
+            kind_results = await self._async_sync_kinds(recorder, jobs, retry_day)
             changed = any(ok for ok, _ in kind_results.values())
             if retry_day is not None:
                 deferred = [
@@ -273,6 +277,23 @@ class BackfillManager:
                         for kind, ts in self._watermarks.items()
                     }
                 )
+
+    async def _async_sync_kinds(
+        self,
+        recorder: Recorder,
+        jobs: list[tuple[str, list[tuple[datetime, Any]]]],
+        retry_day: str | None,
+    ) -> dict[str, tuple[bool, bool]]:
+        """Import each queued metric's series; return per-kind results."""
+        return {
+            kind: await self._async_sync_kind(
+                recorder,
+                kind,
+                series,
+                retry_day=retry_day,
+            )
+            for kind, series in jobs
+        }
 
     async def async_needs_day(
         self, day: str, *, hr_enabled: bool, steps_enabled: bool

@@ -36,6 +36,7 @@ from .colmi_codec import (
     date_utils,
     hr,
     hr_settings,
+    hrv_history,
     motion,
     r08,
     real_time,
@@ -47,6 +48,7 @@ from .colmi_codec import (
     set_time as set_time_mod,
 )
 from .colmi_codec.hr import HeartRateLogParser
+from .colmi_codec.hrv_history import HrvLogParser
 from .colmi_codec.steps import SportDetailParser
 from .colmi_codec.stress import StressLogParser
 from .const import (
@@ -207,6 +209,9 @@ LINK_IDLE_DISCONNECT_S = 10.0
 # The ring records one stress score per 30-minute slot of its (UTC-synced)
 # day, so the stress log only needs re-reading when that slot number changes.
 STRESS_SLOT_S = 30 * 60
+# The HRV history log (command 0x39) fills one 30-minute slot the same way,
+# so its re-read cadence follows the same slot boundary.
+HRV_SLOT_S = 30 * 60
 
 
 def _latest_sample_is_zero(
@@ -444,11 +449,13 @@ class _RingConnection:
             hr_settings.CMD_HEART_RATE_LOG_SETTINGS: (
                 hr_settings.parse_heart_rate_log_settings
             ),
+            hrv_history.CMD_AUTO_HRV_PREF: hrv_history.parse_hrv_pref_reply,
             real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
             real_time.CMD_STOP_REAL_TIME: real_time.parse_stop_reading,
             set_time_mod.CMD_SET_TIME: set_time_mod.parse_set_time_packet,
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
             stress.CMD_READ_STRESS: StressLogParser().parse,
+            hrv_history.CMD_SYNC_HRV: HrvLogParser().parse,
         }
         self._queues = {cmd: asyncio.Queue() for cmd in self._handlers}
 
@@ -909,6 +916,31 @@ class _RingConnection:
     async def get_stress_log(self) -> stress.StressLog | stress.NoData:
         """Read today's stress log (one value per 30-minute slot)."""
         return await self._command(stress.read_stress_packet(), stress.CMD_READ_STRESS)
+
+    async def get_hrv_log(
+        self, days_ago: int = 0
+    ) -> hrv_history.HrvLog | hrv_history.NoData:
+        """Read one day's HRV history (``days_ago`` days before today)."""
+        return await self._command(
+            hrv_history.read_hrv_packet(days_ago), hrv_history.CMD_SYNC_HRV
+        )
+
+    async def get_hrv_pref(self) -> bool:
+        """Read whether the ring's all-day HRV monitoring is enabled."""
+        return await self._command(
+            hrv_history.read_hrv_pref_packet(), hrv_history.CMD_AUTO_HRV_PREF
+        )
+
+    async def set_hrv_pref(self, enabled: bool) -> bool:
+        """
+        Write the all-day HRV monitoring flag; returns the ring's echo.
+
+        The ring answers the write with the same 0x38 frame as a read, so the
+        return value is the ring's own confirmation of the new state.
+        """
+        return await self._command(
+            hrv_history.write_hrv_pref_packet(enabled), hrv_history.CMD_AUTO_HRV_PREF
+        )
 
     async def get_steps(
         self, target: datetime, today: datetime | None = None
@@ -1967,6 +1999,22 @@ class _SessionKind[SessionT: _LinkSession]:
     retry_reasons: tuple[str, ...]
 
 
+@dataclass(slots=True)
+class _DaySeries:
+    """
+    The per-poll backfill time series, passed through the previous-day merge.
+
+    Carried as one object so ``_async_extend_previous_day`` can extend all
+    three metrics without tripping the argument-count lint: hr is
+    (timestamp, bpm), sport_bins is (timestamp, steps, meters, kcal), hrv is
+    (timestamp, ms).
+    """
+
+    hr: list[tuple[datetime, int]]
+    sport_bins: list[tuple[datetime, int, int, float]]
+    hrv: list[tuple[datetime, int]]
+
+
 class ColmiRingApiClient:
     """High level client for a Colmi ring, using HA-managed BLE connections."""
 
@@ -2001,6 +2049,17 @@ class ColmiRingApiClient:
         # is reported on every poll in between.
         self._stress_reading: dict[str, Any] | None = None
         self._stress_slot: int | None = None
+        # Today's HRV history log (command 0x39) and the 30-min slot it was
+        # read for. When the ring's all-day HRV monitoring is on it fills one
+        # slot per 30 minutes, so the log is re-read at most once per slot;
+        # the cached day feeds both the HRV sensor and the history backfill
+        # on every poll in between.
+        self._hrv_log: hrv_history.HrvLog | None = None
+        self._hrv_slot: int | None = None
+        # DIAGNOSTIC (HRV history, temporary): UTC date for which the
+        # "empty HRV history" WARNING was already emitted, so it stays
+        # once-per-day at any poll rate.
+        self._hrv_diag_day: str | None = None
         # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date of the day
         # whose "no HR" condition was already reported at WARNING, so the
         # once-per-day diagnostics below stay once-per-day at any poll rate.
@@ -2076,6 +2135,11 @@ class ColmiRingApiClient:
         # ring has answered command 1, None while unknown. None keeps the HRV
         # button available (no false negatives); a definite False disables it.
         supports_hrv: bool | None = None
+        # The ring's all-day HRV monitoring preference (0x38): what decides
+        # whether any 0x39 history exists at all. None = not asked (ring has no
+        # HRV) or it did not answer; the HRV Monitoring switch shows state only
+        # when this is a definite bool.
+        hrv_monitoring: bool | None = None
         async with self._link.acquire("poll", POLL_LOCK_WAIT_S) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
@@ -2242,6 +2306,20 @@ class ColmiRingApiClient:
                             settings,
                         )
 
+            # Ask the ring whether all-day HRV monitoring is on, so the HRV
+            # Monitoring switch shows the ring's real state and an empty 0x39
+            # history is explainable from the device page. Rings whose
+            # capability bit rules out HRV are never asked (a 0x38 there would
+            # just sit out the reply timeout).
+            if supports_hrv is not False:
+                try:
+                    hrv_monitoring = await conn.get_hrv_pref()
+                except ColmiRingApiClientError:
+                    LOGGER.debug(
+                        "Colmi ring %s did not answer HRV preference query",
+                        self._ring_address,
+                    )
+
             # Stress is logged one value per 30-min slot of the ring's day,
             # so the log is re-read only when that slot changes and the
             # cached newest sample is reported in between. This stays after
@@ -2249,12 +2327,30 @@ class ColmiRingApiClient:
             # its own, so its slots are anchored to UTC midnight.
             stress_value, stress_timestamp = await self._async_stress_reading(conn)
 
+            # The HRV history log rides the same 30-min slot grid, and when
+            # the ring's all-day HRV monitoring is on its newest sample is
+            # the freshest HRV the ring has - so it also feeds the HRV
+            # sensor, with the Read HRV button reading kept only while it is
+            # newer (see the coordinator's overlay precedence). Rings whose
+            # capability bit says they have no HRV are never probed.
+            hrv_value, hrv_timestamp, hrv_entries = await self._async_hrv_reading(
+                conn, enabled=supports_hrv is not False
+            )
+
             # Yesterday's ring logs extend the backfill time series only;
             # every live sensor value above stays strictly today-based.
             # ``prev_day`` reports which earlier day was answered this poll so
             # the backfill manager can stop asking for it (see async_sync).
-            hr_entries, sport_bins, prev_day = await self._async_extend_previous_day(
-                conn, include_previous_day, hr_entries, sport_bins
+            series, prev_day = await self._async_extend_previous_day(
+                conn,
+                include_previous_day,
+                _DaySeries(hr=hr_entries, sport_bins=sport_bins, hrv=hrv_entries),
+                hrv_enabled=supports_hrv is not False,
+            )
+            hr_entries, sport_bins, hrv_entries = (
+                series.hr,
+                series.sport_bins,
+                series.hrv,
             )
 
         return {
@@ -2270,6 +2366,11 @@ class ColmiRingApiClient:
             "calories": calories_total,
             "stress": stress_value,
             "stress_timestamp": stress_timestamp,
+            "hrv": hrv_value,
+            "hrv_timestamp": hrv_timestamp,
+            "hrv_monitoring": hrv_monitoring,
+            # Whole-day (timestamp, ms) series for the backfill manager.
+            "hrv_entries": hrv_entries,
             "hr_entries": hr_entries,
             "sport_bins": sport_bins,
             # ISO date of a previous-day log query the ring ANSWERED this
@@ -2328,17 +2429,83 @@ class ColmiRingApiClient:
         value, ts = max(samples, key=lambda s: s[1])
         return {"value": value, "timestamp": ts}
 
+    async def _async_hrv_reading(
+        self, conn: _RingConnection, *, enabled: bool
+    ) -> tuple[int | None, datetime | None, list[tuple[datetime, int]]]:
+        """
+        Return (newest HRV, timestamp, whole-day series), refetched per slot.
+
+        The ring fills one HRV slot per 30 minutes (when its all-day HRV
+        monitoring is on), so the log is re-read only when the current slot
+        number changes; between slots the cached day feeds both the sensor
+        and the backfill series. Rings whose capability bitmap rules out HRV
+        are never probed at all.
+        """
+        if not enabled:
+            return None, None, []
+        slot = int(date_utils.now().timestamp()) // HRV_SLOT_S
+        if slot != self._hrv_slot:
+            self._hrv_slot = slot
+            self._hrv_log = await self._async_read_hrv(conn)
+        log = self._hrv_log
+        if log is None:
+            return None, None, []
+        now = date_utils.now()
+        # Same future-slot guard as stress: anchor the slots to the real UTC
+        # day and drop anything the ring clock could place after now.
+        entries = sorted(
+            ((ts, value) for value, ts in log.samples_with_times() if ts <= now),
+            key=lambda row: row[0],
+        )
+        if not entries:
+            return None, None, []
+        return entries[-1][1], entries[-1][0], entries
+
+    async def _async_read_hrv(self, conn: _RingConnection) -> hrv_history.HrvLog | None:
+        """
+        Read today's HRV history log, or None when the ring has nothing.
+
+        Rings without all-day HRV monitoring answer empty (or not at all);
+        that clears the cached day, and the next attempt waits for the next
+        30-minute slot rather than re-probing every poll.
+        """
+        try:
+            log = await conn.get_hrv_log()
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Colmi ring %s did not answer HRV history query",
+                self._ring_address,
+            )
+            return self._hrv_log  # a failed fetch keeps the cached day
+        if not isinstance(log, hrv_history.HrvLog):
+            LOGGER.debug(
+                "Colmi ring %s reported an empty HRV history",
+                self._ring_address,
+            )
+            # DIAGNOSTIC (HRV history, temporary, WARNING once/day): an empty
+            # answer is what an R06/R08 with all-day HRV monitoring switched
+            # off looks like from here; the HRV Monitoring switch (0x38) turns
+            # it on.
+            today_iso = date_utils.start_of_day(date_utils.now()).isoformat()
+            if self._hrv_diag_day != today_iso:
+                self._hrv_diag_day = today_iso
+                LOGGER.warning(
+                    "Colmi ring %s HRV history (0x39) answered empty today -"
+                    " all-day HRV monitoring likely disabled on the ring"
+                    " (enable the 'HRV Monitoring' switch)",
+                    self._ring_address,
+                )
+            return None
+        return log
+
     async def _async_extend_previous_day(
         self,
         conn: _RingConnection,
         include_previous_day: bool,
-        hr_entries: list[tuple[datetime, int]],
-        sport_bins: list[tuple[datetime, int, int, float]],
-    ) -> tuple[
-        list[tuple[datetime, int]],
-        list[tuple[datetime, int, int, float]],
-        str | None,
-    ]:
+        series: _DaySeries,
+        *,
+        hrv_enabled: bool,
+    ) -> tuple[_DaySeries, str | None]:
         """
         Merge yesterday's UTC-day ring logs into the backfill series.
 
@@ -2352,17 +2519,20 @@ class ColmiRingApiClient:
 
         Returns the merged series plus the ISO date of a day whose HR log the
         ring actually ANSWERED (None when not requested or answered with no
-        data), so the manager only stops asking once, not on refusals.
+        data), so the manager only stops asking once, not on refusals. The
+        HRV history is fetched for the same offset but stays best-effort
+        either way: a ring without all-day HRV monitoring should not keep the
+        shared previous-day fetch alive forever.
         """
         if not include_previous_day:
-            return hr_entries, sport_bins, None
+            return series, None
         prev_day = date_utils.start_of_day(date_utils.now()) - timedelta(days=1)
         answered: str | None = None
         try:
             log = await conn.get_heart_rate_log(prev_day)
             if isinstance(log, hr.HeartRateLog):
                 answered = prev_day.date().isoformat()
-                hr_entries = hr_entries + [
+                series.hr = series.hr + [
                     (ts, bpm) for bpm, ts in log.heart_rates_with_times() if bpm > 0
                 ]
             else:
@@ -2398,7 +2568,7 @@ class ColmiRingApiClient:
         try:
             sport = await conn.get_steps(prev_day)
             if isinstance(sport, list):
-                sport_bins = sport_bins + [
+                series.sport_bins = series.sport_bins + [
                     (d.timestamp, d.steps, d.distance, d.calories / 1000) for d in sport
                 ]
         except ColmiRingApiClientError:
@@ -2406,11 +2576,25 @@ class ColmiRingApiClient:
                 "Colmi ring %s did not answer previous-day steps query",
                 self._ring_address,
             )
-        return (
-            sorted(hr_entries, key=lambda row: row[0]),
-            sorted(sport_bins, key=lambda row: row[0]),
-            answered,
-        )
+        if hrv_enabled:
+            # One day back, matching prev_day's offset; the parser anchors a
+            # log to the current UTC day, so rebase it before merging.
+            try:
+                hrv_log = await conn.get_hrv_log(days_ago=1)
+                if isinstance(hrv_log, hrv_history.HrvLog):
+                    series.hrv = series.hrv + [
+                        (ts, value)
+                        for value, ts in hrv_log.day_shifted(1).samples_with_times()
+                    ]
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not answer previous-day HRV query",
+                    self._ring_address,
+                )
+        series.hr.sort(key=lambda row: row[0])
+        series.sport_bins.sort(key=lambda row: row[0])
+        series.hrv.sort(key=lambda row: row[0])
+        return series, answered
 
     async def async_get_hr_settings(self) -> hr_settings.HeartRateLogSettings:
         """Read the ring's heart-rate logging settings."""
@@ -2429,6 +2613,23 @@ class ColmiRingApiClient:
             await conn.set_hr_log_settings(settings)
             await asyncio.sleep(0.5)
             return await conn.get_hr_log_settings()
+
+    async def async_set_hrv_monitoring(self, enabled: bool) -> bool:
+        """
+        Write the all-day HRV monitoring preference, then read it back.
+
+        Unlike the fire-and-forget 0x16 write, the ring answers the 0x38 write
+        with the preference frame itself, so the write doubles as the
+        confirmation; the read after it is the belt-and-braces check the HR
+        logging path also uses. Returns the state the ring reports.
+        """
+        async with self._link.acquire("settings", USER_LOCK_WAIT_S) as conn:
+            echoed = await conn.set_hrv_pref(enabled)
+            await asyncio.sleep(0.5)
+            try:
+                return await conn.get_hrv_pref()
+            except ColmiRingApiClientError:
+                return echoed
 
     async def async_get_battery(self) -> dict[str, Any]:
         """Return battery level + charging state."""

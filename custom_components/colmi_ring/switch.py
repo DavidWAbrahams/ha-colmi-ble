@@ -26,8 +26,8 @@ All three report the state of their session rather than the last request, so if
 the ring refuses to connect, or an auto-off timer fires, or a reload shuts a
 session down, the switch settles back to off instead of lying.
 
-``Heart Rate Logging`` is different: it holds nothing and costs nothing. It is
-the UI for the ``enabled`` byte of the ring's ``0x16`` heart-rate logging
+``Heart Rate Monitoring`` is different: it holds nothing and costs nothing. It
+is the UI for the ``enabled`` byte of the ring's ``0x16`` heart-rate logging
 settings - the flag that decides whether the ring samples heart rate at all.
 A ring can sit with it off (its own firmware default, an OEM app, or an old
 integration write) and then answer every daily-log query with "no data" no
@@ -35,6 +35,15 @@ matter what the sampling interval says, and until now nothing in this
 integration could read it back *and* change it. It is offered to every Colmi
 family ring - the ``0x16`` command predates the R08 - and its state comes from
 the settings answer on the last poll.
+
+``HRV Monitoring`` is its ``0x38`` twin for rings that have HRV: the flag that
+decides whether the ring records an HRV value every 30 minutes at all, which
+is what decides whether any ``0x39`` history (and so any backfill) exists. It
+is deliberately *not* offered an interval knob: unlike the ``0x16`` settings,
+every verified ``0x38`` frame carries only the enable byte - the HRV sampling
+grid is fixed at the firmware's 30-minute slot. Its state comes from the
+preference answer on the last poll, so a change made in a vendor app shows up
+here too.
 """
 
 from __future__ import annotations
@@ -63,6 +72,7 @@ STREAM_UNIQUE_ID_SUFFIX = "colmi_ring_motion_stream"
 WAVE_UNIQUE_ID_SUFFIX = "colmi_ring_wave_detection"
 TOUCH_UNIQUE_ID_SUFFIX = "colmi_ring_touch_control"
 HR_LOGGING_UNIQUE_ID_SUFFIX = "colmi_ring_hr_logging"
+HRV_MONITORING_UNIQUE_ID_SUFFIX = "colmi_ring_hrv_monitoring"
 
 # Kept as the stream's suffix so existing entities keep their unique ids.
 UNIQUE_ID_SUFFIX = STREAM_UNIQUE_ID_SUFFIX
@@ -87,7 +97,11 @@ async def async_setup_entry(
     entities: list[ColmiRingEntity] = [
         ColmiRingWaveDetectionSwitch(coordinator=entry.runtime_data.coordinator),
         ColmiRingMotionStreamSwitch(coordinator=entry.runtime_data.coordinator),
-        ColmiRingHrLoggingSwitch(coordinator=entry.runtime_data.coordinator),
+        ColmiRingHrMonitoringSwitch(coordinator=entry.runtime_data.coordinator),
+        # Registered for every Colmi-family ring like the HR switch, but
+        # self-grades to unavailable on rings whose capability bit rules out
+        # HRV (they are never queried, so the state stays unknown).
+        ColmiRingHrvMonitoringSwitch(coordinator=entry.runtime_data.coordinator),
     ]
     # The touch switch follows the manager rather than the model name, so there
     # is one source for "this ring has a touch surface" (see __init__).
@@ -329,7 +343,7 @@ class ColmiRingTouchControlSwitch(ColmiRingEntity, SwitchEntity):
         self.async_write_ha_state()
 
 
-class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
+class ColmiRingHrMonitoringSwitch(ColmiRingEntity, SwitchEntity):
     """
     Turn the ring's periodic heart-rate recording on and off.
 
@@ -342,7 +356,7 @@ class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Heart Rate Logging"
+    _attr_name = "Heart Rate Monitoring"
     _attr_icon = "mdi:heart-plus"
     # Deliberately not entity_category=CONFIG, unlike it might seem: CONFIG
     # pushes the entity into a collapsed "Configuration" section on the device
@@ -367,7 +381,7 @@ class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        """Whether the ring reported heart-rate logging enabled."""
+        """Whether the ring reported heart-rate monitoring enabled."""
         settings = self._current_settings()
         return settings.enabled if settings else False
 
@@ -393,15 +407,15 @@ class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
             )
         except ColmiRingApiClientError as err:
             LOGGER.warning(
-                "Failed to set Colmi ring HR logging to %s: %s",
+                "Failed to set Colmi ring HR monitoring to %s: %s",
                 "on" if enabled else "off",
                 err,
             )
             raise HomeAssistantError(
-                f"Could not change heart-rate logging on the ring: {err}"
+                f"Could not change heart-rate monitoring on the ring: {err}"
             ) from err
         LOGGER.warning(
-            "Colmi ring HR logging set to %s, ring now reports: %s",
+            "Colmi ring HR monitoring set to %s, ring now reports: %s",
             "on" if enabled else "off",
             result,
         )
@@ -414,3 +428,86 @@ class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
     async def async_turn_off(self, **_kwargs: object) -> None:
         """Tell the ring to stop recording heart rate."""
         await self._async_set_logging(False)
+
+
+class ColmiRingHrvMonitoringSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Turn the ring's all-day HRV monitoring on and off.
+
+    This is the ``0x38`` preference: with it off the ring never samples HRV
+    and answers every ``0x39`` history query with "no data", so neither the
+    HRV history sensor's long-term graph nor the backfill has anything to
+    work with. Unlike the ``0x16`` heart-rate settings there is no interval
+    to expose: every verified ``0x38`` frame carries only the enable byte,
+    and the ring's HRV grid is fixed at one value per 30 minutes. The state
+    shown is the ring's answer on the last poll, not the last request.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "HRV Monitoring"
+    _attr_icon = "mdi:heart-multiple"
+    # Same reasoning as the HR monitoring switch: this is the entity whose
+    # state explains an empty HRV history, so it belongs under Controls, not in
+    # a collapsed Configuration section.
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{HRV_MONITORING_UNIQUE_ID_SUFFIX}"
+        )
+
+    def _current_state(self) -> bool | None:
+        """The ring's last reported preference, or None when unknown."""
+        data = self.coordinator.data
+        if not data:
+            return None
+        value = data.get("hrv_monitoring")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def is_on(self) -> bool:
+        """Whether the ring reported all-day HRV monitoring enabled."""
+        return self._current_state() is True
+
+    @property
+    def available(self) -> bool:
+        """
+        Available when the ring has answered the 0x38 query.
+
+        Rings whose capability bit rules out HRV are never asked, so their
+        state stays unknown and the switch stays greyed out rather than
+        pretending to control something the firmware does not have.
+        """
+        return super().available and self._current_state() is not None
+
+    async def _async_set_monitoring(self, enabled: bool) -> None:
+        """Write the preference and refresh so the state shows the ring's."""
+        self._assert_ring_free()
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            result = await client.async_set_hrv_monitoring(enabled)
+        except ColmiRingApiClientError as err:
+            LOGGER.warning(
+                "Failed to set Colmi ring HRV monitoring to %s: %s",
+                "on" if enabled else "off",
+                err,
+            )
+            raise HomeAssistantError(
+                f"Could not change HRV monitoring on the ring: {err}"
+            ) from err
+        LOGGER.warning(
+            "Colmi ring HRV monitoring set to %s, ring now reports: %s",
+            "on" if enabled else "off",
+            result,
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """Tell the ring to start recording HRV all day."""
+        await self._async_set_monitoring(True)
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop recording HRV all day."""
+        await self._async_set_monitoring(False)

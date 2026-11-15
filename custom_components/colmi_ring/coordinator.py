@@ -362,24 +362,36 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     @staticmethod
     def _prefer_newer_hr(data: dict[str, Any], live: dict[str, Any]) -> bool:
         """True if the live reading is usable and at least as new as logged."""
-        live_hr = live.get("heart_rate")
-        if live_hr is None:
+        return ColmiRingDataUpdateCoordinator._prefer_newer(
+            data, live, "heart_rate", "heart_rate_timestamp"
+        )
+
+    @staticmethod
+    def _prefer_newer(
+        data: dict[str, Any],
+        live: dict[str, Any],
+        value_key: str,
+        ts_key: str,
+    ) -> bool:
+        """True if the on-demand reading is usable and at least as new as polled."""
+        live_value = live.get(value_key)
+        if live_value is None:
             return False
-        live_ts = live.get("heart_rate_timestamp")
-        logged_ts = data.get("heart_rate_timestamp")
+        live_ts = live.get(ts_key)
+        logged_ts = data.get(ts_key)
         if live_ts is None:
             return logged_ts is None
         if logged_ts is None:
             return True
         return live_ts >= logged_ts
 
-    async def _async_backfill_flags(self) -> tuple[bool, bool, bool]:
+    async def _async_backfill_flags(self) -> tuple[bool, bool, bool, bool]:
         """
-        (hr_enabled, steps_enabled, include_previous_day) for this poll.
+        (hr_enabled, steps_enabled, hrv_enabled, include_previous_day) per poll.
 
-        A single option now drives both metrics: when backfill is on, the
-        ring's whole out-of-range backlog (heart rate and steps alike) is
-        recovered; when off, nothing is imported.
+        A single option now drives every metric: when backfill is on, the
+        ring's whole out-of-range backlog (heart rate, steps and HRV alike)
+        is recovered; when off, nothing is imported.
 
         Ask the API client for yesterday's UTC-day ring log until the
         backfill manager records that day as fetched-and-imported: the ring
@@ -389,7 +401,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         never surface them.
         """
         enabled = bool(self.config_entry.options.get(CONF_BACKFILL_ON_RECONNECT, True))
-        hr_enabled = steps_enabled = enabled
+        hr_enabled = steps_enabled = hrv_enabled = enabled
         include_previous_day = False
         if self.backfill is not None:
             prev_day = (
@@ -400,7 +412,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             include_previous_day = await self.backfill.async_needs_day(
                 prev_day, hr_enabled=hr_enabled, steps_enabled=steps_enabled
             )
-        return hr_enabled, steps_enabled, include_previous_day
+        return hr_enabled, steps_enabled, hrv_enabled, include_previous_day
 
     async def _async_try_poll(self, *, include_previous_day: bool) -> Any:
         """
@@ -466,6 +478,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         (
             hr_enabled,
             steps_enabled,
+            hrv_enabled,
             include_previous_day,
         ) = await self._async_backfill_flags()
         data = await self._async_try_poll(include_previous_day=include_previous_day)
@@ -541,6 +554,7 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
                     data,
                     hr_enabled=hr_enabled,
                     steps_enabled=steps_enabled,
+                    hrv_enabled=hrv_enabled,
                     retry_day=data.get("prev_day"),
                 )
             except Exception:  # noqa: BLE001
@@ -575,18 +589,22 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
 
     def _apply_hrv_reading(self, data: dict[str, Any]) -> None:
         """
-        Overlay the persisted on-demand HRV reading, if any.
+        Overlay the persisted on-demand HRV reading while it is the fresher one.
 
-        Yucheng polls already carry their own hrv keys (the client persists
-        history-derived HRV itself), and the coordinator's ``hrv_reading``
-        stays unset for those entries, so ``setdefault`` leaves them alone.
+        Polls carry history-derived hrv keys on both families now (the Yucheng
+        all-metrics stream, and the Colmi 0x39 HRV log). The Read-HRV-button
+        reading in ``hrv_reading`` therefore wins only while it is at least as
+        new as the polled sample, exactly like the live heart rate does
+        against the ring's HR log; once history overtakes it, it is dropped.
         """
         if self.hrv_reading is not None:
-            data["hrv"] = self.hrv_reading.get("hrv")
-            data["hrv_timestamp"] = self.hrv_reading.get("hrv_timestamp")
-        else:
-            data.setdefault("hrv", None)
-            data.setdefault("hrv_timestamp", None)
+            if self._prefer_newer(data, self.hrv_reading, "hrv", "hrv_timestamp"):
+                data["hrv"] = self.hrv_reading.get("hrv")
+                data["hrv_timestamp"] = self.hrv_reading.get("hrv_timestamp")
+            else:
+                self.hrv_reading = None
+        data.setdefault("hrv", None)
+        data.setdefault("hrv_timestamp", None)
 
     # Floor for the adaptive poll interval (Colmi family). The ring's HR log
     # is a 5-min slot grid, so polling faster than that can never reveal a
