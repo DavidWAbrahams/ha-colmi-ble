@@ -42,7 +42,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.const import EntityCategory
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
@@ -343,11 +342,11 @@ class ColmiRingHrLoggingSwitch(ColmiRingEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Heart Rate Logging"
     _attr_icon = "mdi:heart-plus"
-    # CONFIG rather than operational: this is a firmware setting, not a
-    # session, and no automation should be toggling it on a timer. Even so,
-    # enabled by default in the registry - a ring silently not recording is
-    # exactly the case this entity exists to surface.
-    _attr_entity_category = EntityCategory.CONFIG
+    # Deliberately not entity_category=CONFIG, unlike it might seem: CONFIG
+    # pushes the entity into a collapsed "Configuration" section on the device
+    # page and out of auto-populated dashboard cards. This is the one switch
+    # whose state explains a silent no-data sensor, so it belongs where the
+    # other switches are, under Controls, enabled by default in the registry.
     _attr_entity_registry_enabled_default = True
 
     def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
