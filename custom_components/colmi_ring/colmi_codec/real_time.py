@@ -69,8 +69,25 @@ class ReadingError:
     code: int
 
 
+#: Start-frame sub-byte the vendor phone apps send for the long-lived
+#: measurements. R08-Access-Bridge mirrors what the Colmi/QRing app
+#: transmits on the wire: heart rate starts with a plain action byte, but
+#: SpO2, stress and HRV start with 0x25.
+VENDOR_START_SUBTYPE = 0x25
+
+#: Readings whose start frame uses ``VENDOR_START_SUBTYPE`` instead of
+#: ``Action.START``. Heart rate is deliberately absent: 0x01 is what every
+#: supported ring (R02/R06/R08) has been measured to answer correctly.
+_VENDOR_START_READINGS = frozenset(
+    {RealTimeReading.SPO2, RealTimeReading.PRESSURE, RealTimeReading.HRV}
+)
+
+
 def get_start_packet(reading_type: RealTimeReading) -> bytearray:
-    return make_packet(CMD_START_REAL_TIME, bytearray([reading_type, Action.START]))
+    subtype = (
+        VENDOR_START_SUBTYPE if reading_type in _VENDOR_START_READINGS else Action.START
+    )
+    return make_packet(CMD_START_REAL_TIME, bytearray([reading_type, subtype]))
 
 
 def get_continue_packet(reading_type: RealTimeReading) -> bytearray:
@@ -90,3 +107,32 @@ def parse_real_time_reading(packet: bytearray) -> Reading | ReadingError:
         return ReadingError(kind=kind, code=error_code)
 
     return Reading(kind=kind, value=packet[3])
+
+
+def parse_stop_reading(packet: bytearray) -> Reading | ReadingError | None:
+    """
+    Decode the reply to a ``get_stop_packet`` STOP frame (command 0x6A).
+
+    Field-tested on an R08 by R08-Access-Bridge: this firmware returns the
+    *final* measurement only in this reply, as ``[0x6A, kind, value, error]``
+    - the value and error bytes are swapped relative to the 0x69 progress
+    frames ``parse_real_time_reading`` decodes. Rings that instead answer
+    STOP with zeros simply yield a ``Reading`` of 0, which callers treat as
+    "no value", exactly like a zero progress frame.
+
+    Returns ``None`` (packet ignored) if the kind byte names a reading we do
+    not know, so a stray 0x6A frame cannot raise out of the dispatch path.
+    """
+    assert packet[0] == CMD_STOP_REAL_TIME
+
+    try:
+        kind = RealTimeReading(packet[1])
+    except ValueError:
+        return None
+
+    value = packet[2]
+    error_code = packet[3]
+    if error_code != 0:
+        return ReadingError(kind=kind, code=error_code)
+
+    return Reading(kind=kind, value=value)

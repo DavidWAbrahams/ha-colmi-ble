@@ -133,6 +133,19 @@ REPLY_TIMEOUT = 10.0
 # some bound the loop never reaches STOP and leaves the sensor light blinking
 # and the shared link held indefinitely.
 REALTIME_FIRST_SAMPLE_S = 60.0
+# ...except HRV: measured on an R08 (and documented by R08-Access-Bridge for
+# the same QRing firmware), HRV answers with zero progress frames for the
+# whole measurement - the reference implementation lets it run 80 s - so the
+# generic first-sample deadline cuts it off before the ring ever produces a
+# value, in the stream or in the 0x6A stop reply that carries it.
+REALTIME_FIRST_SAMPLE_S_BY_KIND: dict[real_time.RealTimeReading, float] = {
+    real_time.RealTimeReading.HRV: 90.0,
+}
+# How long to wait for the reply to the STOP frame. On the R08 this is not a
+# mere acknowledgement: the final measurement arrives only inside it
+# ([0x6A, kind, value, error]). Generous for proxy latency; reference
+# implementations allow 3 s plus retries.
+REALTIME_STOP_REPLY_TIMEOUT_S = 5.0
 # Consecutive reply timeouts tolerated while streaming (upstream tolerates
 # many; we cap them so a button press finishes in bounded time even when the
 # ring never streams at all - per-sample timeout stays generous for proxy
@@ -418,6 +431,7 @@ class _RingConnection:
                 hr_settings.parse_heart_rate_log_settings
             ),
             real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
+            real_time.CMD_STOP_REAL_TIME: real_time.parse_stop_reading,
             set_time_mod.CMD_SET_TIME: set_time_mod.parse_set_time_packet,
             steps.CMD_GET_STEP_SOMEDAY: SportDetailParser().parse,
             stress.CMD_READ_STRESS: StressLogParser().parse,
@@ -1277,10 +1291,9 @@ class _RingConnection:
 
         start_packet = real_time.get_start_packet(reading_type)
         # DIAGNOSTIC (R08 real-time, temporary, WARNING for the HA UI): name the
-        # exact start frame sent. R08-Access-Bridge starts HRV with `69 0A 25`
-        # (sub-byte 0x25 rather than our Action.START 0x01) and comments that
-        # this R08 firmware returns the final HRV value only in the 0x6A *stop*
-        # reply; which hypothesis holds starts with this line.
+        # exact start frame sent, so a field test shows whether the vendor
+        # sub-byte (0x25 for SpO2/stress/HRV, matching what the phone apps
+        # transmit) is on the wire.
         LOGGER.warning(
             "Colmi ring %s starting real-time %s measurement: %s",
             self._address,
@@ -1306,8 +1319,14 @@ class _RingConnection:
         # finally block never clearing the ring's busy flag. The stall
         # deadline re-arms on every usable sample, so a supported reading may
         # take its time warming up (or pause mid-stream) without being cut
-        # off, while a perpetual-zero firmware gives up in ~a minute.
-        stalled_deadline = time.monotonic() + REALTIME_FIRST_SAMPLE_S
+        # off, while a perpetual-zero firmware gives up in ~a minute - except
+        # for HRV, which gets the longer per-kind deadline above because the
+        # R08's QRing firmware streams zeros for the whole ~80 s measurement
+        # and reports the value only in the 0x6A stop reply.
+        first_sample_s = REALTIME_FIRST_SAMPLE_S_BY_KIND.get(
+            reading_type, REALTIME_FIRST_SAMPLE_S
+        )
+        stalled_deadline = time.monotonic() + first_sample_s
         while len(valid) < 6 and empty_waits < REALTIME_EMPTY_WAITS_MAX:
             remaining = stalled_deadline - time.monotonic()
             if remaining <= 0:
@@ -1335,6 +1354,11 @@ class _RingConnection:
                     f"Ring returned error code {data.code} for real-time "
                     f"reading {reading_type.name}"
                 )
+            # A progress frame's kind should match what we asked for; a mismatch
+            # means a stale frame from some other exchange - ignore it rather
+            # than mixing it into this measurement's samples.
+            if data.kind != reading_type:
+                continue
             if data.value == 0:
                 # Alive but not yet measured: clears the timeout streak (the
                 # ring answered) without extending the stall deadline.
@@ -1366,15 +1390,8 @@ class _RingConnection:
                 )
             valid.append(data.value)
             empty_waits = 0
-            stalled_deadline = time.monotonic() + REALTIME_FIRST_SAMPLE_S
+            stalled_deadline = time.monotonic() + first_sample_s
 
-        # DIAGNOSTIC (R08 real-time, temporary): how the loop ended decides
-        # between the live hypotheses. "first-sample stall deadline" with many
-        # zero frames means the 0x69 stream never carries a value - matching
-        # Access Bridge's note that on this firmware it arrives only in the
-        # 0x6A stop reply (which we do not parse; it surfaces as "Unexpected
-        # packet type 106"). "reply-timeout cap" means the ring answered
-        # nothing at all, pointing at the start frame's sub-byte instead.
         reason = (
             "collected"
             if len(valid) >= 6
@@ -1382,22 +1399,74 @@ class _RingConnection:
             if empty_waits >= REALTIME_EMPTY_WAITS_MAX
             else "first-sample stall deadline"
         )
-        stop_packet = real_time.get_stop_packet(reading_type)
+
+        # Send STOP, and when the stream produced nothing, read its reply too:
+        # on most rings the STOP reply is a bare acknowledgement, but
+        # R08-Access-Bridge field-tested that the R08's QRing firmware
+        # returns the *final* measurement only there - the sole place its HRV
+        # value ever appears (confirmed on the user's ring: 120 zero progress
+        # frames, then a `6a 0a ...` reply discarded as an unexpected packet).
+        stop_value = await self._send_stop_and_read_final_value(
+            reading_type, listen=not valid
+        )
+        if stop_value is not None:
+            valid.append(stop_value)
+
+        # DIAGNOSTIC (R08 real-time, temporary): one line per measurement so a
+        # field test shows the whole story - how long it ran, why the stream
+        # ended, and what the 0x6A stop reply carried.
         LOGGER.warning(
             "Colmi ring %s real-time %s measurement ending after %.1fs"
-            " (%s): %d valid %s, %d zero frames, %d empty waits; stop %s",
+            " (%s): %d stream %s, %d zero frames, %d empty waits, stop reply"
+            " value %s",
             self._address,
             reading_type.name,
             time.monotonic() - started_at,
             reason,
-            len(valid),
+            len(valid) - (1 if stop_value is not None else 0),
             valid[:12],
             zero_frames,
             empty_waits,
-            stop_packet.hex(" "),
+            stop_value,
         )
-        await self._send(stop_packet)
         return valid
+
+    async def _send_stop_and_read_final_value(
+        self, reading_type: real_time.RealTimeReading, *, listen: bool
+    ) -> int | None:
+        """
+        End a real-time measurement; return the value its STOP reply carries.
+
+        Sends the STOP frame and, when ``listen``, awaits the reply on the
+        0x6A queue. That reply is usually a bare zero-filled ack worth
+        ignoring, but R08-Access-Bridge field-tested that the R08's QRing
+        firmware reports the *final* measurement only inside it, as
+        ``[0x6A, kind, value, error]`` (``real_time.parse_stop_reading``).
+        A missing, zero, or unknown-kind reply means "no value": ``None``.
+        """
+        stop_queue = self._queues[real_time.CMD_STOP_REAL_TIME]
+        # Drain before sending so what we (might) read is this STOP's reply.
+        while not stop_queue.empty():
+            stop_queue.get_nowait()
+        await self._send(real_time.get_stop_packet(reading_type))
+        if not listen:
+            return None
+        try:
+            data: (
+                real_time.Reading | real_time.ReadingError | None
+            ) = await asyncio.wait_for(
+                stop_queue.get(), timeout=REALTIME_STOP_REPLY_TIMEOUT_S
+            )
+        except TimeoutError:
+            return None
+        if isinstance(data, real_time.ReadingError):
+            raise ColmiRingApiClientError(
+                f"Ring returned error code {data.code} when stopping"
+                f" real-time reading {reading_type.name}"
+            )
+        if isinstance(data, real_time.Reading) and data.value != 0:
+            return data.value
+        return None
 
 
 class SharedLink:
