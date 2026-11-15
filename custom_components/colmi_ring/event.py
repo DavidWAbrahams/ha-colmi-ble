@@ -75,8 +75,9 @@ ENTITY_DESCRIPTIONS = (
         name="Wave",
         # mdi:hand-waving postdates the Material Design Icons set this HA
         # version ships, so it renders as no icon at all; mdi:motion-sensor
-        # (already used by the Motion Stream switch) reads as "hand moving".
-        icon="mdi:motion-sensor",
+        # reads as a walking person, so use the same hand as the "Raised
+        # hand" event below, which is known to render.
+        icon="mdi:hand-back-right",
     ),
     EventEntityDescription(
         key=GESTURE_STILL,

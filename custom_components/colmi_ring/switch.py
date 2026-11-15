@@ -189,8 +189,10 @@ class ColmiRingWaveDetectionSwitch(ColmiRingEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Wave Detection"
     # Not mdi:hand-waving: that name postdates the Material Design Icons set
-    # this HA version ships, so it renders as no icon at all.
-    _attr_icon = "mdi:motion-sensor"
+    # this HA version ships, so it renders as no icon at all. The previous
+    # mdi:motion-sensor reads as a walking person, so use the same hand as the
+    # "Raised hand" event, which is known to render.
+    _attr_icon = "mdi:hand-back-right"
     # Same reasoning as the stream switch: an operational toggle automations
     # may switch, not a settings knob, and no translation entry is needed.
 
