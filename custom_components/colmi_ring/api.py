@@ -288,6 +288,11 @@ class _RingConnection:
         # since a stream repeats its frames every second, so each one is named
         # at most once per connection.
         self._logged_unexpected: set[int] = set()
+        # DIAGNOSTIC (R08 heart-rate log, temporary): count of sampled 0x15
+        # frame dumps already emitted on this link, so the WARNING-level
+        # capture below stays bounded even on links that survive many polls.
+        self._hr_frame_dumps = 0
+        self._len_drop_dumps = 0
         # Monotonic time the link came up, so a disconnect can be reported with
         # how long it lasted: "the stream died 29 ms after opening" and "the
         # stream died after 20 minutes" are completely different bugs, and
@@ -733,8 +738,40 @@ class _RingConnection:
                     getattr(char, "handle", "?"),
                     packet.hex(" "),
                 )
+                # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING so the
+                # user's HA UI shows it): if a firmware ever answers a log
+                # query with the newer variable-length 0xBC history frames,
+                # they land on this drop path and used to vanish at DEBUG.
+                if self._len_drop_dumps < 8:
+                    self._len_drop_dumps += 1
+                    LOGGER.warning(
+                        "Colmi ring %s frame dropped during %s (length %d,"
+                        " expected 16) from char %s: %s",
+                        self._address,
+                        self.purpose,
+                        len(packet),
+                        getattr(char, "handle", "?"),
+                        packet.hex(" "),
+                    )
             return
         cmd = packet[0]
+        # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING for the same
+        # reason): the raw 0x15 answer bytes are the only way to tell "the
+        # firmware says no data" (sub_type ff) from "the header promises N
+        # packets but the slots are all zero" from "the parser finished the
+        # log early". Dump the framing-decisive sub_types (header, timestamp,
+        # the sub_type-23 early-complete quirk, no-data) plus every eighth
+        # data packet, capped per link.
+        if cmd == hr.CMD_READ_HEART_RATE and self._hr_frame_dumps < 30:
+            sub = packet[1]
+            if sub in (0, 1, 23, 255) or sub % 8 == 0:
+                self._hr_frame_dumps += 1
+                LOGGER.warning(
+                    "Colmi ring %s 0x15 frame during %s: %s",
+                    self._address,
+                    self.purpose,
+                    packet.hex(" "),
+                )
         if self.observer is not None:
             # Counted before dispatch so the tally covers bytes no listener on
             # this session was registered for.
@@ -766,12 +803,15 @@ class _RingConnection:
             # arrived - the deciding detail when a stream and a poll overlap.
             if not listeners and cmd not in self._logged_unexpected:
                 self._logged_unexpected.add(cmd)
-                LOGGER.debug(
+                # DIAGNOSTIC (R08 heart-rate log, temporary): WARNING so this
+                # surfaces in the user's HA log; if the ring answers a query
+                # under a command byte we do not parse, this is the only trace.
+                LOGGER.warning(
                     "Unexpected packet type %s (0x%02X) from ring during %s: %s",
                     cmd,
                     cmd,
                     self.purpose,
-                    packet.hex(),
+                    packet.hex(" "),
                 )
             return
         result = handler(packet)
@@ -1794,6 +1834,12 @@ class ColmiRingApiClient:
         # is reported on every poll in between.
         self._stress_reading: dict[str, Any] | None = None
         self._stress_slot: int | None = None
+        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date of the day
+        # whose "no HR" condition was already reported at WARNING, so the
+        # once-per-day diagnostics below stay once-per-day at any poll rate.
+        self._hr_diag_day: str | None = None
+        self._hr_settings_diag_day: str | None = None
+        self._hr_prev_day_diag: str | None = None
         # The ``3B 02`` enable the most recent touch session armed with, as
         # ``(app_type, sleep_minutes)``, or None if none ever went out. The
         # watchdog may need to re-send that same frame after the ring's own
@@ -1831,8 +1877,10 @@ class ColmiRingApiClient:
             raise ColmiRingApiClientBusyError(measurement_busy_message(self._measuring))
         self._measuring = name
 
-    async def async_get_data(  # noqa: PLR0915 - one straight-line poll of every capability
-        self, include_previous_day: bool = False
+    async def async_get_data(  # noqa: PLR0912, PLR0915 - one straight-line poll of
+        # every capability; extra branches are temporary R08 HR diagnostics
+        self,
+        include_previous_day: bool = False,
     ) -> dict[str, Any]:
         """
         Return the latest heart rate plus the ring's HR logging settings.
@@ -1868,6 +1916,19 @@ class ColmiRingApiClient:
                 LOGGER.debug(
                     "Colmi ring %s did not answer heart-rate settings query",
                     self._ring_address,
+                )
+            # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING, once/day):
+            # the settings answer decides everything about the daily log -
+            # enabled=0 means the ring itself is not recording, and the
+            # interval drives the expected sample cadence. A missing answer
+            # also silently changes the staleness threshold upstream.
+            today_iso = date_utils.start_of_day(date_utils.now()).isoformat()
+            if self._hr_settings_diag_day != today_iso:
+                self._hr_settings_diag_day = today_iso
+                LOGGER.warning(
+                    "Colmi ring %s HR settings this poll: %s",
+                    self._ring_address,
+                    settings if settings is not None else "NO ANSWER (query timed out)",
                 )
 
             battery_level: int | None = None
@@ -1933,12 +1994,18 @@ class ColmiRingApiClient:
             await asyncio.sleep(0.5)
             log = await conn.get_heart_rate_log()
             if not isinstance(log, hr.HeartRateLog):
-                LOGGER.info(
-                    "Colmi ring %s returned no heart-rate log (NoData) for "
-                    "requested UTC day %s - ring clock/day mismatch?",
-                    self._ring_address,
-                    date_utils.start_of_day(date_utils.now()).isoformat(),
-                )
+                # DIAGNOSTIC (R08 heart-rate log, temporary): WARNING once/day
+                # so it survives the user's WARNING-only log view; the raw
+                # frames the parser saw are dumped separately in _handle_tx.
+                if self._hr_diag_day != today_iso:
+                    self._hr_diag_day = today_iso
+                    LOGGER.warning(
+                        "Colmi ring %s returned NO heart-rate log (NoData/error"
+                        " sub_type ff) for requested UTC day %s - ring not"
+                        " recording, or clock/day mismatch?",
+                        self._ring_address,
+                        today_iso,
+                    )
             else:
                 # Heart rate is logged on the ring's own slot grid (5-min
                 # slots on R02-class firmware; the sampling interval itself
@@ -1969,17 +2036,44 @@ class ColmiRingApiClient:
                     all_slots, entries, filled, interval, slot_range
                 )
                 if not entries:
-                    LOGGER.info(
-                        "Colmi ring %s returned a heart-rate log but every slot "
-                        "was 0/empty (log day=%s, raw slots=%d, filled=%d) - ring "
-                        "has not recorded HR today or its clock is off",
-                        self._ring_address,
-                        log.timestamp.isoformat(),
-                        len(log.heart_rates),
-                        log.index,
-                    )
+                    # DIAGNOSTIC (R08 heart-rate log, temporary): this is the
+                    # state behind an hours-long Unknown sensor on a ring that
+                    # answers the log query: a complete, well-formed day whose
+                    # every slot reads 0. WARNING once/day.
+                    if self._hr_diag_day != today_iso:
+                        self._hr_diag_day = today_iso
+                        LOGGER.warning(
+                            "Colmi ring %s returned a heart-rate log but EVERY"
+                            " SLOT WAS 0 (log day=%s, grid=%d min, packets=%d,"
+                            " slots=%d, filled=%d, off-finger=%s) - ring"
+                            " answered but recorded nothing today",
+                            self._ring_address,
+                            log.timestamp.isoformat(),
+                            log.range,
+                            log.size,
+                            len(log.heart_rates),
+                            log.index,
+                            hr_zero_reading,
+                        )
                 else:
                     heart_rate, heart_rate_timestamp = max(entries, key=lambda x: x[1])
+                    # DIAGNOSTIC (R08 heart-rate log, temporary): once/day, the
+                    # healthy path's key numbers, so a later "Unknown" can be
+                    # compared against the last known-good log state.
+                    if self._hr_diag_day != today_iso:
+                        self._hr_diag_day = today_iso
+                        LOGGER.warning(
+                            "Colmi ring %s HR log ok: samples=%d grid=%d min"
+                            " filled=%d/%d newest=%s@%s settings=%s",
+                            self._ring_address,
+                            len(entries),
+                            log.range,
+                            filled,
+                            len(all_slots),
+                            heart_rate,
+                            heart_rate_timestamp.isoformat(),
+                            settings,
+                        )
 
             # Stress is logged one value per 30-min slot of the ring's day,
             # so the log is re-read only when that slot changes and the
@@ -2104,11 +2198,36 @@ class ColmiRingApiClient:
                 hr_entries = hr_entries + [
                     (ts, bpm) for bpm, ts in log.heart_rates_with_times() if bpm > 0
                 ]
+            else:
+                # DIAGNOSTIC (R08 heart-rate log, temporary, WARNING once per
+                # day): NoData for yesterday's query is the exact condition the
+                # "no hr_entries ... ring log query returned empty" backfill
+                # warning reports; say which day and which outcome.
+                diag_key = prev_day.date().isoformat()
+                if self._hr_prev_day_diag != diag_key:
+                    self._hr_prev_day_diag = diag_key
+                    LOGGER.warning(
+                        "Colmi ring %s previous-day (%s) HR log query answered"
+                        " with NoData - backfill has no yesterday history",
+                        self._ring_address,
+                        diag_key,
+                    )
         except ColmiRingApiClientError:
             LOGGER.debug(
                 "Colmi ring %s did not answer previous-day heart-rate query",
                 self._ring_address,
             )
+            # DIAGNOSTIC (R08, temporary): name the timeout/refusal too, since
+            # it is indistinguishable from NoData in the backfill warning.
+            diag_key = prev_day.date().isoformat()
+            if self._hr_prev_day_diag != diag_key:
+                self._hr_prev_day_diag = diag_key
+                LOGGER.warning(
+                    "Colmi ring %s previous-day (%s) HR log query failed: %s",
+                    self._ring_address,
+                    diag_key,
+                    "no answer / refused",
+                )
         try:
             sport = await conn.get_steps(prev_day)
             if isinstance(sport, list):

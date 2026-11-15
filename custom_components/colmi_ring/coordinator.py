@@ -149,6 +149,10 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # for the age/size limits).
         self._sightings: deque[_Sighting] = deque()
         self._seen_listeners: list[Callable[[datetime], None]] = []
+        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date for which the
+        # staleness-clear WARNING was already emitted, so an hours-long
+        # Unknown sensor warns once a day rather than once a poll.
+        self._hr_stale_diag_day: str | None = None
 
     # Throttle for the seen signal: the timestamp is floored to whole
     # seconds, so every advertisement/notification within the same second is
@@ -428,7 +432,11 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             except ColmiRingApiClientAuthenticationError as exception:
                 raise ConfigEntryAuthFailed(exception) from exception
             except ColmiRingApiClientError as exception:
-                LOGGER.debug(
+                # WARNING (diagnostic, R08): the user's HA log only shows
+                # WARNING+, and "the R08 shows nothing" needs to distinguish
+                # a failing poll from a poll that succeeds but finds an empty
+                # ring log. Capped at the attempt count per cycle.
+                LOGGER.warning(
                     "Colmi ring poll attempt %s/%s failed: %s",
                     attempt + 1,
                     self._POLL_ATTEMPTS,
@@ -502,9 +510,25 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
             # The newest sample is old enough that the ring is almost certainly
             # off the finger; report "unknown" instead of a stale value.
             if data.get("heart_rate") is not None:
-                LOGGER.debug(
-                    "Colmi ring heart-rate sample is stale; clearing heart rate"
-                )
+                # DIAGNOSTIC (R08, temporary): WARNING once per UTC day so a
+                # "sensor is Unknown" bug can be told apart from an ordinary
+                # off-finger clear - the age-vs-threshold numbers are the
+                # whole diagnosis.
+                today = datetime.now(tz=UTC).date().isoformat()
+                if self._hr_stale_diag_day != today:
+                    self._hr_stale_diag_day = today
+                    ts = data.get("heart_rate_timestamp")
+                    age_min = (
+                        (datetime.now(tz=UTC) - ts).total_seconds() / 60
+                        if isinstance(ts, datetime)
+                        else -1.0
+                    )
+                    LOGGER.warning(
+                        "Colmi ring heart-rate sample is stale; clearing heart"
+                        " rate (sample age %.0f min, hr_zero_reading=%s)",
+                        age_min,
+                        data.get("hr_zero_reading"),
+                    )
             data["heart_rate"] = None
             data["heart_rate_timestamp"] = None
             self.hr_live = None
