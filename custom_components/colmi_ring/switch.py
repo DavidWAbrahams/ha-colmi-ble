@@ -414,7 +414,7 @@ class ColmiRingHrMonitoringSwitch(ColmiRingEntity, SwitchEntity):
             raise HomeAssistantError(
                 f"Could not change heart-rate monitoring on the ring: {err}"
             ) from err
-        LOGGER.warning(
+        LOGGER.debug(
             "Colmi ring HR monitoring set to %s, ring now reports: %s",
             "on" if enabled else "off",
             result,
@@ -497,7 +497,7 @@ class ColmiRingHrvMonitoringSwitch(ColmiRingEntity, SwitchEntity):
             raise HomeAssistantError(
                 f"Could not change HRV monitoring on the ring: {err}"
             ) from err
-        LOGGER.warning(
+        LOGGER.debug(
             "Colmi ring HRV monitoring set to %s, ring now reports: %s",
             "on" if enabled else "off",
             result,

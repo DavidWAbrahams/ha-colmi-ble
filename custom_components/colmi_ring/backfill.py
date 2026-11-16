@@ -159,11 +159,6 @@ class BackfillManager:
         self._scanned: set[str] = set()
         self._loaded = False
         self._lock = asyncio.Lock()
-        self._gates_logged = False
-        # DIAGNOSTIC (R08 heart-rate log, temporary): UTC date for which the
-        # "nothing to import" condition was already reported, so a ring whose
-        # log query answers empty warns once a day, not once a poll.
-        self._empty_diag_day: str | None = None
 
     async def async_sync(
         self,
@@ -175,50 +170,25 @@ class BackfillManager:
         retry_day: str | None = None,
     ) -> None:
         """Import any backlog from this poll's ring logs for enabled metrics."""
-        # DIAGNOSTIC (one-shot): proves the new backfill.py is deployed and
-        # shows which gate would silently disable imports.
-        if not self._gates_logged:
-            self._gates_logged = True
-            # WARNING on purpose: this user's HA log only keeps WARNING+,
-            # and INFO diagnostics are invisible there.
-            LOGGER.warning(
-                "Colmi backfill: sync called (hr_enabled=%s steps_enabled=%s "
-                "hr_entries=%d sport_bins=%d)",
-                hr_enabled,
-                steps_enabled,
-                len(data.get("hr_entries") or []),
-                len(data.get("sport_bins") or []),
-            )
         if not hr_enabled and not steps_enabled and not hrv_enabled:
-            LOGGER.warning("Colmi backfill: all metrics disabled; skipping")
+            LOGGER.debug("Colmi backfill: all metrics disabled; skipping")
             return
         try:
             recorder = get_instance(self._hass)
         except (KeyError, RuntimeError):
             # Recorder not set up (hass.data key missing) or unavailable:
             # nowhere to import history into. Watermarks stay put so the
-            # backlog imports once the recorder is up.
-            LOGGER.warning("Colmi backfill: recorder unavailable; skipping")
+            # backlog imports once the recorder is up. Normal during startup.
+            LOGGER.debug("Colmi backfill: recorder unavailable; skipping")
             return
         hr_entries = data.get("hr_entries") or []
         sport_bins = data.get("sport_bins") or []
         hrv_entries = data.get("hrv_entries") or []
         if not hr_entries and not sport_bins and not hrv_entries:
             # Nothing to import this poll; watermarks stay as they are so the
-            # first non-empty batch still imports the whole backlog.
-            # WARNING (diagnostic): if this repeats all day, the ring log
-            # queries are returning empty and backfill can never see data.
-            # Throttled to once per UTC day: at a 5-minute poll this fired
-            # ~300x/day and buried everything else in the log.
-            today = datetime.now(tz=UTC).date().isoformat()
-            if self._empty_diag_day != today:
-                self._empty_diag_day = today
-                LOGGER.warning(
-                    "Colmi backfill: no hr_entries/sport_bins in poll data; nothing"
-                    " to import (today's and yesterday's ring log queries both came"
-                    " back empty/zero) - see the 'Colmi ring ... HR' warnings for the"
-                    " ring's actual log answer"
-                )
+            # first non-empty batch still imports the whole backlog. Normal
+            # for a ring whose logging switches are off.
+            LOGGER.debug("Colmi backfill: no history in poll data; nothing to import")
             return
         async with self._lock:
             await self._async_ensure_loaded()
@@ -416,10 +386,7 @@ class BackfillManager:
         new_wm = pending[-1][0]
         if watermark is None or new_wm > watermark:
             self._watermarks[kind] = new_wm
-        # WARNING (diagnostic): these lines prove the import path is running;
-        # if they appear but the Lovelace graph stays empty, the rows are
-        # landing with wrong timestamps (timezone handling suspect).
-        LOGGER.warning(
+        LOGGER.debug(
             "Colmi ring backfilled %d %s history rows (%s .. %s)",
             inserted,
             kind,
