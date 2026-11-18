@@ -31,6 +31,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
@@ -577,9 +578,16 @@ class MotionManager:
         )
         self._schedule_wave_auto_off()
 
+    @callback
     def _async_check_rate(self, _now: Any) -> None:
         """
         Report once per session what the stream actually looks like.
+
+        The ``@callback`` marker is load-bearing, not decoration:
+        ``async_call_later`` wraps the listener in a ``HassJob`` whose type is
+        inferred from the ``_hass_callback`` attribute this decorator sets.
+        Undecorated, Home Assistant infers an Executor job and runs the
+        callback on a worker thread.
 
         This is the only place the measured sample rate reaches the log, and the
         natural place to sanity-check the decode: an accelerometer at rest reads
@@ -798,7 +806,11 @@ class MotionManager:
             self._hass, minutes * 60.0, self._async_stream_auto_off
         )
 
+    @callback
     def _async_stream_auto_off(self, _now: Any) -> None:
+        # Undecorated this would be an Executor job like the rate probe above:
+        # async_stop ends with a coordinator refresh on the event loop, and
+        # firing one from a worker thread is a thread-safety violation.
         self._stream_timer = None
         if not self._want_stream:
             return
@@ -830,7 +842,9 @@ class MotionManager:
             self._hass, minutes * 60.0, self._async_wave_auto_off
         )
 
+    @callback
     def _async_wave_auto_off(self, _now: Any) -> None:
+        # Executor-job risk as in _async_stream_auto_off above.
         self._wave_timer = None
         if not self._want_wave:
             return

@@ -34,6 +34,7 @@ import asyncio
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
@@ -400,8 +401,19 @@ class TouchManager:
             self._hass, self._multi_tap_window(), self._on_tap_window_expired
         )
 
+    @callback
     def _on_tap_window_expired(self, _now: Any) -> None:
-        """No tap arrived within the window: the chain is done, announce it."""
+        """
+        No tap arrived within the window: the chain is done, announce it.
+
+        The ``@callback`` marker is load-bearing, not decoration:
+        ``async_call_later`` wraps the listener in a ``HassJob`` whose type is
+        inferred from the ``_hass_callback`` attribute this decorator sets.
+        Undecorated, Home Assistant infers an Executor job and runs this on a
+        worker thread, where the ``hass.bus.async_fire`` below (and the event
+        entities' ``async_write_ha_state`` behind it) corrupts state - recent
+        releases raise the thread-safety guard instead.
+        """
         self._tap_timer = None
         self._flush_pending_tap()
 
@@ -480,7 +492,12 @@ class TouchManager:
             return
         self._timer = async_call_later(self._hass, minutes * 60.0, self._auto_off)
 
+    @callback
     def _auto_off(self, _now: Any) -> None:
+        # Undecorated this would be an Executor job like the tap timer above:
+        # async_stop reaches _request_refresh, which calls async_create_task,
+        # and a session-end refresh from a worker thread is the same
+        # thread-safety violation one tap-event away.
         self._timer = None
         if not self._want_touch:
             return
