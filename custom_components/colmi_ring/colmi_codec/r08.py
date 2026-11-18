@@ -221,11 +221,19 @@ class TouchEvent:
     future combo (two bits at once) cannot be mistranslated into a single
     gesture. ``gestures`` is the usable projection of that onto the gesture
     keys this integration offers.
+
+    ``tap_count`` is always 1 on a freshly decoded report: the ring reports
+    every press on its own, so a raw report is one tap by definition. It is
+    only ever greater than 1 on an event ``TouchManager`` has coalesced from a
+    multi-tap chain (``dataclasses.replace`` on the pending report when the
+    chain's window lapses), and it rides along in the event data so an
+    automation can branch on single vs. double vs. triple tap.
     """
 
     usages: frozenset[str]
     gestures: frozenset[str]
     raw: int
+    tap_count: int = 1
 
     def as_event_data(self) -> dict[str, Any]:
         """Flat payload for a Home Assistant event."""
@@ -234,6 +242,7 @@ class TouchEvent:
             "gestures": sorted(self.gestures),
             "usages": sorted(self.usages),
             "raw": f"0x{self.raw:06X}",
+            "tap_count": self.tap_count,
             "source": "touch",
         }
 

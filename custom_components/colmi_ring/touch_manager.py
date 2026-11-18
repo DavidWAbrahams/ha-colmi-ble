@@ -31,6 +31,7 @@ listeners are plain callbacks.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.exceptions import HomeAssistantError
@@ -39,12 +40,16 @@ from homeassistant.helpers.event import async_call_later
 from .colmi_codec import r08
 from .const import (
     CONF_TOUCH_APP_TYPE,
+    CONF_TOUCH_MULTI_TAP_WINDOW,
     CONF_TOUCH_SLEEP_MINUTES,
     CONF_TOUCH_TIMEOUT,
     DEFAULT_TOUCH_APP_TYPE,
+    DEFAULT_TOUCH_MULTI_TAP_WINDOW,
     DEFAULT_TOUCH_SLEEP_MINUTES,
     DEFAULT_TOUCH_TIMEOUT,
     LOGGER,
+    MULTI_TAP_WINDOW_MAX,
+    MULTI_TAP_WINDOW_MIN,
     STREAM_BUSY_MESSAGE,
     TOUCH_EVENT_TYPE,
     TOUCH_SLEEP_MINUTES_MAX,
@@ -93,6 +98,15 @@ class TouchManager:
         # The unverified-swipe notice belongs to the instance, not the session:
         # a retry-looped reopen should not spam the warning.
         self._warned_unverified = False
+
+        # Tap-chain coalescing. The ring reports every press as its own HID
+        # report and cannot tell a double tap from two single taps, so the
+        # chain lives here: the first tap parks the report and starts a window,
+        # each further tap restarts the window, and only an expired window
+        # announces the chain - as one tap event carrying ``tap_count``.
+        self._pending_tap: r08.TouchEvent | None = None
+        self._pending_tap_count = 0
+        self._tap_timer: Callable[[], None] | None = None
 
         # True while the touch listener holds its shared lease.
         self.is_listening = False
@@ -143,6 +157,25 @@ class TouchManager:
         except (TypeError, ValueError):
             value = float(DEFAULT_TOUCH_TIMEOUT)
         return value if value > 0 else 0.0
+
+    def _multi_tap_window(self) -> float:
+        """
+        Seconds a tap chain stays open after each tap; 0 means never chain.
+
+        Read per tap rather than cached, like the auto-off timeout: it is a
+        cheap options lookup, and 0 deliberately disables coalescing so every
+        press fires as its own single-tap event, as this manager did before
+        multi-taps existed. Clamped because a window long enough to feel like
+        lag would just make single taps look broken.
+        """
+        raw = self._entry.options.get(
+            CONF_TOUCH_MULTI_TAP_WINDOW, DEFAULT_TOUCH_MULTI_TAP_WINDOW
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(DEFAULT_TOUCH_MULTI_TAP_WINDOW)
+        return max(MULTI_TAP_WINDOW_MIN, min(MULTI_TAP_WINDOW_MAX, value))
 
     # -- listeners ----------------------------------------------------------
 
@@ -247,6 +280,11 @@ class TouchManager:
             return
         self._want_touch = False
         self._cancel_auto_off()
+        # The taps behind any open chain did happen; the task's teardown path
+        # (async_notify_touch_finished) normally flushes them a moment later,
+        # but a stop that arrives while still connecting never reaches that
+        # path's session, so flush here too. Flushing twice is a no-op.
+        self._flush_pending_tap()
         session = self._session
         if session is None:
             # Still connecting: finish now so the switch reflects reality, and
@@ -260,6 +298,11 @@ class TouchManager:
         """Stop the listener on unload/reload and wait briefly for it."""
         self._want_touch = False
         self._cancel_auto_off()
+        # Belt and braces: normally the task's own teardown path flushes the
+        # open chain, but a task cancelled hard below may never reach it, and
+        # a timer left running into an unload would fire against a half-torn-
+        # down entry. Flushing an already-flushed chain is a no-op.
+        self._flush_pending_tap()
         if self._session is not None:
             self._session.request_stop("shutdown")
         task = self._task
@@ -316,7 +359,7 @@ class TouchManager:
 
     def _on_packet(self, packet: bytearray) -> None:
         """
-        Publish one touch report; everything else is dropped silently.
+        Route one touch report; everything else is dropped silently.
 
         All-zero is the ring's release frame, not a gesture, and anything the
         report decoder rejects is either that or a frame the session's own tally
@@ -329,7 +372,61 @@ class TouchManager:
         if not event.gestures:
             self._log_unnamed_usages(event)
             return
+        # A report whose only gesture is a tap joins (or opens) the tap chain
+        # instead of announcing at once; anything else - a swipe, or a combo
+        # report no chain interpretation could honestly claim - is not part of
+        # a tap chain, so whatever chain is open belongs to an earlier action
+        # and is announced first to keep the events in order.
+        if self._multi_tap_window() > 0 and event.gestures == frozenset(
+            {r08.GESTURE_TAP}
+        ):
+            self._queue_tap(event)
+            return
+        self._flush_pending_tap()
         self._announce(event)
+
+    def _queue_tap(self, event: r08.TouchEvent) -> None:
+        """Add one tap report to the open chain and restart its window."""
+        if self._pending_tap is None:
+            self._pending_tap = event
+            self._pending_tap_count = 1
+        else:
+            self._pending_tap_count += 1
+        # The window is *between* taps, so it restarts with every press: a
+        # chain is done only once the ring has been quiet for the full window,
+        # no matter how many taps came before.
+        self._cancel_tap_timer()
+        self._tap_timer = async_call_later(
+            self._hass, self._multi_tap_window(), self._on_tap_window_expired
+        )
+
+    def _on_tap_window_expired(self, _now: Any) -> None:
+        """No tap arrived within the window: the chain is done, announce it."""
+        self._tap_timer = None
+        self._flush_pending_tap()
+
+    def _flush_pending_tap(self) -> None:
+        """
+        Announce the open tap chain, if any, as one tap event with ``tap_count``.
+
+        The report carried by the chain is the last one held (identical to the
+        others for tap purposes), re-stamped with the chain's length; a chain
+        of one is announced untouched, so a lone tap keeps the exact event data
+        it always had except for the always-present ``tap_count: 1``.
+        """
+        self._cancel_tap_timer()
+        event, count = self._pending_tap, self._pending_tap_count
+        self._pending_tap, self._pending_tap_count = None, 0
+        if event is None:
+            return
+        if count > 1:
+            event = replace(event, tap_count=count)
+        self._announce(event)
+
+    def _cancel_tap_timer(self) -> None:
+        if self._tap_timer is not None:
+            self._tap_timer()
+            self._tap_timer = None
 
     def _log_unnamed_usages(self, event: r08.TouchEvent) -> None:
         """Name a bit we have no gesture for once per session, not per tap."""
@@ -346,8 +443,9 @@ class TouchManager:
     def _announce(self, event: r08.TouchEvent) -> None:
         """Put one touch report on the bus and hand it to the event entities."""
         LOGGER.debug(
-            "Colmi ring touch: %s (usages %s, %s)",
+            "Colmi ring touch: %s x%s (usages %s, %s)",
             ", ".join(sorted(event.gestures)),
+            event.tap_count,
             ", ".join(sorted(event.usages)),
             f"0x{event.raw:06X}",
         )
@@ -405,6 +503,10 @@ class TouchManager:
         """Called once the task has returned: restore normal behaviour."""
         self._session = None
         self._cancel_auto_off()
+        # The session is gone but the taps behind an open chain still happened;
+        # announcing them now is more honest than dropping the last chain of a
+        # disconnect, and the window's worth of delay is already spent anyway.
+        self._flush_pending_tap()
         if self._want_touch:
             # The client gave up on its own, so the switch must not stay on.
             self._want_touch = False

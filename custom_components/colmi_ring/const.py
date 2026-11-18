@@ -569,3 +569,13 @@ TOUCH_SLEEP_MINUTES_MAX = 255
 # already produces the reports, so there is no user-visible reason to choose.
 CONF_TOUCH_APP_TYPE = "touch_app_type"
 DEFAULT_TOUCH_APP_TYPE = 1
+
+# Seconds a tap chain stays open: each tap restarts the timer, and the Tap event
+# fires only once the window lapses, carrying ``tap_count`` so an automation can
+# tell one tap from two or three. The ring itself cannot tell - it reports every
+# press separately - so the coalescing is ours, in ``TouchManager``. 0 disables
+# it: every tap fires immediately as its own single-tap event.
+CONF_TOUCH_MULTI_TAP_WINDOW = "touch_multi_tap_window"
+DEFAULT_TOUCH_MULTI_TAP_WINDOW = 0.3
+MULTI_TAP_WINDOW_MIN = 0.0
+MULTI_TAP_WINDOW_MAX = 2.0

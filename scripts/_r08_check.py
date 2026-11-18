@@ -28,6 +28,7 @@ self-consistent, since that is what callers warn from.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import types
 from collections import Counter
@@ -318,9 +319,25 @@ def check_report_edge_cases() -> None:
             and data["gestures"] == sorted(combo.gestures)
             and data["usages"] == sorted(combo.usages)
             and data["raw"] == "0x000009"
+            and data["tap_count"] == 1
             and data["source"] == "touch",
             str(data),
         )
+
+    # A raw report is one tap by definition; only TouchManager's coalescing
+    # raises the count, via dataclasses.replace on the held report. Pin the
+    # round trip the manager relies on so a codec refactor cannot silently
+    # drop tap_count from the published event data.
+    chained = dataclasses.replace(tap, tap_count=3)
+    check("a fresh report decodes as one tap", tap is not None and tap.tap_count == 1)
+    check(
+        "a coalesced report keeps its gestures and reports the chain length",
+        chained.gestures == tap.gestures
+        and chained.usages == tap.usages
+        and chained.raw == tap.raw
+        and chained.tap_count == 3
+        and chained.as_event_data()["tap_count"] == 3,
+    )
 
 
 def check_usage_table() -> None:

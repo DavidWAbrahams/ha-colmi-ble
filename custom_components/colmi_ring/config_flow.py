@@ -34,6 +34,7 @@ from .const import (
     CONF_PROXIMITY_SAMPLES_N,
     CONF_PROXIMITY_TOP_K,
     CONF_PROXIMITY_VOTE_MARGIN,
+    CONF_TOUCH_MULTI_TAP_WINDOW,
     CONF_TOUCH_SLEEP_MINUTES,
     CONF_TOUCH_TIMEOUT,
     CONF_VERTICAL_FLAT_DEG,
@@ -50,6 +51,7 @@ from .const import (
     DEFAULT_PROXIMITY_SAMPLES_N,
     DEFAULT_PROXIMITY_TOP_K,
     DEFAULT_PROXIMITY_VOTE_MARGIN,
+    DEFAULT_TOUCH_MULTI_TAP_WINDOW,
     DEFAULT_TOUCH_SLEEP_MINUTES,
     DEFAULT_TOUCH_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
@@ -60,6 +62,8 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     MOTION_HOLE_AXIS_CHOICES,
+    MULTI_TAP_WINDOW_MAX,
+    MULTI_TAP_WINDOW_MIN,
     TOUCH_SLEEP_MINUTES_MAX,
     TOUCH_SLEEP_MINUTES_MIN,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
@@ -538,6 +542,20 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                     min=TOUCH_SLEEP_MINUTES_MIN,
                     max=TOUCH_SLEEP_MINUTES_MAX,
                     step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_TOUCH_MULTI_TAP_WINDOW,
+                default=self.config_entry.options.get(
+                    CONF_TOUCH_MULTI_TAP_WINDOW, DEFAULT_TOUCH_MULTI_TAP_WINDOW
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    # 0 fires every tap as its own single-tap event.
+                    min=MULTI_TAP_WINDOW_MIN,
+                    max=MULTI_TAP_WINDOW_MAX,
+                    step=0.05,
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
