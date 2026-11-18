@@ -23,6 +23,18 @@
     },
     {
       "connectable": true,
+      "local_name": "R09_*"
+    },
+    {
+      "connectable": true,
+      "local_name": "R10_*"
+    },
+    {
+      "connectable": true,
+      "local_name": "R12_*"
+    },
+    {
+      "connectable": true,
       "manufacturer_id": 30768
     },
     {
@@ -62,5 +74,5 @@
   "requirements": [
     "bleak-retry-connector>=4.7.1"
   ],
-  "version": "0.3.3"
+  "version": "0.3.4"
 }
