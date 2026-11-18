@@ -1,7 +1,7 @@
 # What?
 
 Integrate the Colmi line of smart rings with Home Assistant.
-Colmi rings (like the R02, R06, R10 etc) can be found for under $20 on AliExpress.
+Colmi rings (like the R02, R06, R08, R09, R10, R12 etc) can be found for under $20 on AliExpress.
 These can be distiguished because they use QRing as their phone app.
 It will read heart rate, blood oxygen levels, steps, and a few other derived metrics.
 It also supports gestures!
