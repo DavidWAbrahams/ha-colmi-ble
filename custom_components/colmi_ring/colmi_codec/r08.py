@@ -19,6 +19,11 @@ The ring answers by echoing the frame back verbatim on the UART TX
 characteristic, measured in the Phase 0 probe; so ``parse_touch_config_reply``
 is a validity check on opcode and sub-type rather than a parser of anything new.
 
+The same command can in principle also carry the ring's *own* news - the
+surface sleeping or waking, the touch disabled - though no firmware has been
+observed sending one unasked. ``parse_touch_notice`` below classifies such a
+frame anyway, so a caller that hears one can say accurately what it meant.
+
 *The report side is Bluetooth HID, not Colmi.* Once touch is configured and the
 HID layer has been put into Report protocol, gestures arrive as **3-byte
 notifications on the Consumer Control Input report** - on a different
@@ -51,6 +56,11 @@ SUB_TOUCH = 0x02
 SUB_TOUCH_CONFIG = 0x00
 SUB_TOUCH_OFF = 0x01
 SUB_TOUCH_WAKE = 0x02
+
+# Byte 4 of a ``02 02`` frame: the two states the frame names, whether we send
+# it (waking a configured surface) or the ring reports it by itself.
+TOUCH_STATE_ASLEEP = 0x00
+TOUCH_STATE_AWAKE = 0x01
 
 # The documented media-key profile: what the R08 Access Bridge pins, and what
 # the Phase 0 probe captured touch reports under. appType 0..7 are accepted by
@@ -100,7 +110,7 @@ def touch_wake_packet(app_type: int = TOUCH_APP_TYPE_MEDIA) -> bytearray:
     """Frame that wakes an already-configured touch surface."""
     return make_packet(
         CMD_TOUCH_CONTROL,
-        bytearray([SUB_TOUCH, SUB_TOUCH_WAKE, app_type & 0xFF, 0x01]),
+        bytearray([SUB_TOUCH, SUB_TOUCH_WAKE, app_type & 0xFF, TOUCH_STATE_AWAKE]),
     )
 
 
@@ -120,6 +130,59 @@ def parse_touch_config_reply(packet: bytearray) -> bool:
         SUB_TOUCH_OFF,
         SUB_TOUCH_WAKE,
     )
+
+
+# What :func:`parse_touch_notice` returns for each recognised frame the ring
+# pushes by itself, as the strings callers log and branch on.
+TOUCH_NOTICE_OFF = "off"
+TOUCH_NOTICE_SLEEP = "sleep"
+TOUCH_NOTICE_WAKE = "wake"
+
+
+def parse_touch_notice(packet: bytearray) -> str | None:
+    """
+    Classify an unsolicited ``0x3B`` frame the ring pushed on its own.
+
+    Every ``3B 02`` *write* is echo-ACKed verbatim, so a frame that cannot be
+    an echo - one that arrives while a touch session is open, with nothing of
+    ours on the air - is the firmware telling us the touch state changed on
+    the device. Three shapes are recognised:
+
+    =========================================  ==========================
+    ``3B 02 02 <appType> 00``                  surface slept: ``"sleep"``
+    ``3B 02 02 <appType> 01``                  surface woke: ``"wake"``
+    ``3B 02 01 00 00``                         touch disabled: ``"off"``
+    =========================================  ==========================
+
+    Sleep is *not* off. A configured surface idles after its sleep byte and
+    wakes on the next touch, and the enable - and everything built on it -
+    stays in place the whole time, so ``"sleep"``/``"wake"`` describe the
+    surface, not the session, and callers must not read them as a disable.
+
+    ``"off"`` is deliberately the *exact* shape of :func:`touch_off_packet`.
+    QRing's decompiled driver reads ``02 01 <appType> <strength>`` as a
+    gesture-mode write rather than a plain touch-off, so only the all-zero
+    tail - the one shape both readings agree disables touch - classifies as
+    ``"off"``; an ``02 01`` with any other tail returns ``None`` so a caller
+    can log it as unknown instead of acting on it. ``02 00`` is the config
+    frame, always the echo of our own enable, and also ``None``.
+
+    Unlike upstream, no firmware has been *observed* sending these; the
+    classification is what the OEM frames mean, so a caller can at least say
+    accurately what it saw if a ring ever does push one.
+    """
+    if len(packet) < 5 or packet[0] != CMD_TOUCH_CONTROL or packet[1] != SUB_TOUCH:
+        return None
+    if packet[2] == SUB_TOUCH_OFF:
+        if packet[3] == 0 and packet[4] == 0:
+            return TOUCH_NOTICE_OFF
+        return None
+    if packet[2] == SUB_TOUCH_WAKE:
+        if packet[4] == TOUCH_STATE_ASLEEP:
+            return TOUCH_NOTICE_SLEEP
+        if packet[4] == TOUCH_STATE_AWAKE:
+            return TOUCH_NOTICE_WAKE
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -205,6 +205,15 @@ CAPABILITY_REPLY_TIMEOUT_S = 2.0
 # "this firmware accepted the enable and no gesture has been made" from "this
 # firmware ignored the enable and nothing will ever arrive".
 TOUCH_ECHO_TIMEOUT_S = 5.0
+# Command bytes whose frames the ring echo-ACKs, so an echo can legally arrive
+# with no one waiting: the touch-off teardown write is deliberately not
+# awaited (see ``set_touch_control``), and a config echo can turn up after
+# its :data:`TOUCH_ECHO_TIMEOUT_S` wait lapsed on a slow ring. Those frames are
+# known traffic (the ring confirming a frame we ourselves sent), not an
+# unknown protocol, so ``_handle_tx`` names them at debug level rather than
+# WARNING. Verified in the Phase 0 probe and upstream: QRing's R08 driver
+# sends the same ``3B 02`` frames and treats the echo as the only ACK.
+EXPECTED_ECHO_COMMANDS: frozenset[int] = frozenset({r08.CMD_TOUCH_CONTROL})
 
 # How long each kind of caller will wait for the ring's shared link.
 #
@@ -912,13 +921,27 @@ class _RingConnection:
                 self._logged_unexpected.add(cmd)
                 # WARNING on purpose: if the ring answers a query under a
                 # command byte we do not parse, this is the only trace of it.
-                LOGGER.warning(
-                    "Unexpected packet type %s (0x%02X) from ring during %s: %s",
-                    cmd,
-                    cmd,
-                    self.purpose,
-                    packet.hex(" "),
-                )
+                # Echo-ACKed commands are the exception: a late echo of a
+                # frame *we* sent (see EXPECTED_ECHO_COMMANDS) is explained
+                # traffic, and naming it at WARNING just trains everyone to
+                # ignore warnings - it is logged at debug instead.
+                if cmd in EXPECTED_ECHO_COMMANDS:
+                    LOGGER.debug(
+                        "Ignoring echo-ACK packet type %s (0x%02X) from ring"
+                        " during %s: %s",
+                        cmd,
+                        cmd,
+                        self.purpose,
+                        packet.hex(" "),
+                    )
+                else:
+                    LOGGER.warning(
+                        "Unexpected packet type %s (0x%02X) from ring during %s: %s",
+                        cmd,
+                        cmd,
+                        self.purpose,
+                        packet.hex(" "),
+                    )
             return
         result = handler(packet)
         if result is not None:
@@ -2884,6 +2907,18 @@ class ColmiRingApiClient:
 
         No silence timeout, like the wave listener: silence here means the ring
         is in nobody's hand, which is the normal case for hours at a time.
+
+        While the session is open it also listens for the ring's own news on
+        command ``3B`` (see :func:`r08.parse_touch_notice`). A sleep/wake
+        notice is logged and otherwise ignored - an *enabled* surface idling
+        between touches is normal life, not a disable, and the one thing that
+        must never happen is the switch going off because the surface dozed.
+        An unasked ``3B 02 01 00 00`` is the opposite: under both upstream
+        readings of that frame, touch is no longer delivering reports, so the
+        session ends with reason ``"firmware-off"`` (not a retry reason) and
+        the switch stops claiming a touch the ring has given up. The listener
+        comes off before the teardown's own disable write, so the echo of that
+        write is never mistaken for news.
         """
         app_type, sleep_minutes = self._touch_config or (
             r08.TOUCH_APP_TYPE_MEDIA,
@@ -2911,12 +2946,18 @@ class ColmiRingApiClient:
                 if len(packet) == r08.TOUCH_REPORT_LEN:
                     listener(packet)
 
+            notice_listener = self._make_touch_notice_listener(session)
+
             # Everything that can raise from here on runs inside the try below.
             # The observer is already installed by now, so a session that dies
             # part-way through opening - a refused handshake, a busy gate -
             # would otherwise leave its tap attached to a link this session does
             # not own, counting reports for a tally that was never logged.
             conn.touch_observer = on_report
+            # Registered before the enable goes out so no notice can slip
+            # through between arming and listening; the enable's own echo
+            # classifies as a config frame and is ignored by design.
+            conn.add_listener(r08.CMD_TOUCH_CONTROL, notice_listener)
             # Set before anything can raise, so the teardown can always log a
             # real reason rather than tripping over an unbound name.
             armed = "unwritten"
@@ -2947,6 +2988,10 @@ class ColmiRingApiClient:
                     with suppress(asyncio.CancelledError):
                         await watchdog
                 conn.touch_observer = None
+                # Off *before* the disarm write below, so the echo of our own
+                # ``3B 02 01`` can never arrive while this session is still
+                # listening and be read as the firmware disabling touch.
+                conn.remove_listener(r08.CMD_TOUCH_CONTROL, notice_listener)
                 # Only what was actually subscribed gets unsubscribed, and by the
                 # characteristic object rather than the UUID: four declarations
                 # share the UUID, so unsubscribing whichever one the stack finds
@@ -2964,6 +3009,81 @@ class ColmiRingApiClient:
                         "Could not tell ring %s to turn touch control off",
                         self._ring_address,
                     )
+
+    def _make_touch_notice_listener(
+        self, session: TouchSession
+    ) -> Callable[[bytearray], None]:
+        """
+        Build the listener for the ring's own touch-state frames.
+
+        Split out of :meth:`_touch_session` only because that function is a
+        session-opening ritual worth keeping short; everything about the
+        behaviour lives here.
+
+        A ``3B 02`` frame can only be news while a session is open, because the
+        sole ``3B`` write of an open session is the ``02 00`` enable config:
+        anything shaped like a sleep, wake or off notice was not asked for. (The
+        previous session's teardown echo is the one exception, and it can only
+        reach a session in its first seconds - see the grace below.)
+        """
+
+        def on_touch_notice(packet: bytearray) -> None:
+            notice = r08.parse_touch_notice(packet)
+            if notice is None:
+                # ``3B 02 00`` is our own enable echo, expected and dull; any
+                # other unclassifiable touch frame is worth naming.
+                if packet[2] != r08.SUB_TOUCH_CONFIG:
+                    LOGGER.debug(
+                        "Colmi ring %s sent a touch frame this session cannot"
+                        " classify: %s",
+                        self._ring_address,
+                        packet.hex(" "),
+                    )
+                return
+            if notice in (r08.TOUCH_NOTICE_SLEEP, r08.TOUCH_NOTICE_WAKE):
+                # Informational on purpose. Sleeping and waking is what an
+                # *enabled* touch does between touches; the session, the lease
+                # and the switch all stay exactly as they are, and the next
+                # touch wakes the surface by itself.
+                LOGGER.info(
+                    "Colmi ring %s touch surface %s (%s); touch control is"
+                    " still enabled and the session stays open",
+                    self._ring_address,
+                    (
+                        "went to sleep"
+                        if notice == r08.TOUCH_NOTICE_SLEEP
+                        else "woke up"
+                    ),
+                    packet.hex(" "),
+                )
+                return
+            # ``r08.TOUCH_NOTICE_OFF``: the ring disabled its own touch.
+            lived = time.monotonic() - session.started_at
+            if lived < TOUCH_ECHO_TIMEOUT_S:
+                # Too soon after opening to be news: this is the one shape a
+                # still-in-flight echo of the *previous* session's disable
+                # write could take. A genuine firmware disable that soon after
+                # arming has no known trigger, so guessing "echo" is the safe
+                # direction - the next notice answers.
+                LOGGER.debug(
+                    "Colmi ring %s touch-off frame %.1fs after opening the"
+                    " session (%s): treated as the previous teardown's echo,"
+                    " not the firmware disabling touch",
+                    self._ring_address,
+                    lived,
+                    packet.hex(" "),
+                )
+                return
+            LOGGER.warning(
+                "Colmi ring %s turned its own touch control off while this"
+                " session was open (%s); closing the session so the switch"
+                " stops claiming a touch the ring no longer has",
+                self._ring_address,
+                packet.hex(" "),
+            )
+            session.request_stop("firmware-off")
+
+        return on_touch_notice
 
     def _log_touch_session(
         self, session: TouchSession, counts: _TouchCounts, armed: str
@@ -2989,6 +3109,22 @@ class ColmiRingApiClient:
         unnamed = ", ".join(
             f"bit 0.{bit} x{num}" for bit, num in counts.unknown_usages.most_common(5)
         )
+        if reason == "firmware-off":
+            # The ring disabled its own touch mid-session (the WARNING at the
+            # notice says so). Silence since then is *explained*, so the two
+            # branches below - which both blame the firmware for never
+            # reporting touches - would be the wrong verdict here.
+            LOGGER.info(
+                "Colmi ring %s touch control closed after %s (%s): %d report(s)"
+                " before the ring disabled its own touch: %s%s",
+                self._ring_address,
+                lived,
+                reason,
+                counts.reports,
+                counts.describe(),
+                f"; unnamed usages: {unnamed}" if unnamed else "",
+            )
+            return
         if counts.reports:
             LOGGER.debug(
                 "Colmi ring %s touch control closed (%s, after %s): %d"

@@ -267,6 +267,16 @@ class TouchManager:
                 " acknowledged the write that enables its touch surface (3B 02),"
                 " so this firmware probably has no touch reports to send"
             )
+        elif reason == "firmware-off":
+            # The WARNING at the notice itself names the frame; this line ties
+            # it to the switch the user is watching, and says why the listener
+            # did not just reopen: a ring that disabled its own touch will keep
+            # it disabled, so retrying would only re-arm what it refused.
+            LOGGER.warning(
+                "Colmi ring touch control turned itself off: the ring"
+                " disabled its own touch surface while the session was open"
+                " (see the log above); turn the switch back on to re-arm it"
+            )
         elif reason not in ("user", "timeout"):
             # Worth an INFO line: a session that ends by itself (link dropped)
             # is the case a user needs help with, and without it the switch just

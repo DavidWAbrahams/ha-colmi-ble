@@ -340,6 +340,61 @@ def check_report_edge_cases() -> None:
     )
 
 
+def check_notice_parsing() -> None:
+    """
+    Unsolicited ``0x3B`` frames the ring could push by itself.
+
+    Pinned against the QRing sub-command table: sleep and wake are the two
+    states of the ``02 02`` frame, "off" is *only* the exact all-zero
+    ``02 01 00 00`` shape (an ``02 01`` with an appType/strength tail is
+    QRing's gesture-mode write and must not classify as a disable), and the
+    config echo - the one frame an open session really does send - classifies
+    as nothing.
+    """
+    print("touch notices (unsolicited 3B frames):")
+    sleep = oem_frame(0x3B, [2, 2, 1, 0])
+    wake = oem_frame(0x3B, [2, 2, 1, 1])
+    off = oem_frame(0x3B, [2, 1, 0, 0])
+    check("02 02 appType 00 is a sleep", r08.parse_touch_notice(sleep) == r08.TOUCH_NOTICE_SLEEP, hexed(sleep))
+    check("02 02 appType 01 is a wake", r08.parse_touch_notice(wake) == r08.TOUCH_NOTICE_WAKE, hexed(wake))
+    check(
+        "02 02 appType 02 (unknown state) is no notice",
+        r08.parse_touch_notice(oem_frame(0x3B, [2, 2, 1, 2])) is None,
+    )
+    check(
+        "the touch-off shape is an off notice",
+        r08.parse_touch_notice(off) == r08.TOUCH_NOTICE_OFF,
+        hexed(off),
+    )
+    check(
+        "a wake frame is not read as off",
+        r08.parse_touch_notice(wake) != r08.TOUCH_NOTICE_OFF,
+    )
+    check(
+        "02 01 with a tail is no notice (gesture write)",
+        r08.parse_touch_notice(oem_frame(0x3B, [2, 1, 1, 2])) is None,
+    )
+    check(
+        "the config echo is no notice",
+        r08.parse_touch_notice(r08.touch_config_packet()) is None,
+    )
+    check(
+        "a battery frame is no notice",
+        r08.parse_touch_notice(bytearray(16)) is None,
+    )
+    wrong_opcode = bytearray(off)
+    wrong_opcode[0] = 0x3C
+    check("rejects wrong opcode", r08.parse_touch_notice(wrong_opcode) is None)
+    check("rejects a short packet", r08.parse_touch_notice(bytearray([0x3B, 0x02, 0x01])) is None)
+
+    # The exact frame from the field log that motivated this parser:
+    # 3b 02 01 00 ... 3e, checksummed and all.
+    logged = oem_frame(0x3B, [2, 1, 0, 0])
+    logged_hex = "3B 02 01 00 00 00 00 00 00 00 00 00 00 00 00 3E"
+    check("the logged field frame is an off notice", r08.parse_touch_notice(logged) == r08.TOUCH_NOTICE_OFF, logged_hex)
+    check("the logged field frame carries a real checksum", logged[15] == 0x3E, f"{logged[15]:#04x}")
+
+
 def check_usage_table() -> None:
     """Sanity-check the table the decoder indexes by bit position."""
     bits = [bit for bit, _ in r08.TOUCH_USAGE_BITS]
@@ -385,6 +440,8 @@ def main() -> int:
     check_frames()
     print()
     check_reply_parsing()
+    print()
+    check_notice_parsing()
     print()
     check_capture()
     print()
