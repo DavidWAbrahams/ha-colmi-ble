@@ -172,7 +172,15 @@ class HeartRateLogParser:
         # need a good reason why parsing should depend on the day
         # index might be good enough to indicate how much "valid" data we've gotten
         if self.is_today():
-            m = date_utils.minutes_so_far(datetime.now(tz=UTC)) // self.range
+            # Zero only slots that have not *started* yet. minutes_so_far()
+            # is "minutes + 1", so subtract it back before dividing, exactly
+            # like api.py's slots_now clamp: the in-progress slot started at
+            # grid * floor(minutes / grid) and may already hold the newest
+            # sample (R08 lands samples at the slot's opening boundary), so
+            # zeroing from ``minutes // range`` erased that sample until the
+            # slot's last minute - delaying the HR sensor by a whole grid.
+            minutes = date_utils.minutes_so_far(datetime.now(tz=UTC)) - 1
+            m = minutes // self.range + 1
             hr[m:] = [0] * len(hr[m:])
 
         return hr
