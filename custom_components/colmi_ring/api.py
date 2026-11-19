@@ -19,6 +19,7 @@ library does -- but it additionally works when the ring is reached via a proxy.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
@@ -38,6 +39,7 @@ from .colmi_codec import (
     hr_settings,
     hrv_history,
     motion,
+    packet,
     r08,
     real_time,
     reboot,
@@ -73,6 +75,31 @@ if TYPE_CHECKING:
 UART_SERVICE_UUID = "6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+# Second vendor service family seen on newer Colmi firmware (R09 and some
+# R08 builds). It carries the same 16-byte command protocol, but the write
+# and notify characteristics live under their own service; some units publish
+# *only* this service, others answer on its notify characteristic even while
+# also publishing the UART service above, so both must be monitored.
+VENDOR_SERVICE_V2_UUID = "DE5BF728-D711-4E47-AF26-65E3012A5DC7"
+VENDOR_COMMAND_CHAR_V2_UUID = "DE5BF72A-D711-4E47-AF26-65E3012A5DC7"
+VENDOR_NOTIFY_CHAR_V2_UUID = "DE5BF729-D711-4E47-AF26-65E3012A5DC7"
+
+# Command byte for the host introduction: the firmware of rings that carry
+# the second vendor service ignores every other command until the host has
+# introduced itself with a version + short name greeting.
+CMD_HOST_INTRO = 0x04
+
+# Version this integration declares in that introduction frame, plus its own
+# short host name in the name slot the frame reserves for it. The firmware
+# only checks that an introduction arrived, so these identify us rather than
+# claim any particular vendor app.
+_HOST_INTRO_VERSION = (0x01, 0x00)
+_HOST_INTRO_NAME = b"HA"
+
+# How long a fresh link sits idle before the first command, matching what
+# these firmwares need after the notification descriptors are written.
+INIT_SETTLE_S = 2.0
 
 # The Bluetooth HID Service, SIG 16-bit UUIDs in the same 128-bit form bleak
 # reports. The R08's touch input is a HID *Consumer Control* report, so reaching
@@ -403,18 +430,100 @@ class _RingConnection:
                 disconnected_callback=self._on_disconnect,
             )
 
+            # Newer Colmi firmware (R09 and some R08 builds) carries the
+            # vendor channel on the second service family, and some units
+            # publish *only* that one, so neither family alone may be
+            # required: resolve both up front and accept either.
             service = self._client.services.get_service(UART_SERVICE_UUID)
-            if service is None:
+            v2_service = self._client.services.get_service(VENDOR_SERVICE_V2_UUID)
+            if service is None and v2_service is None:
+                # Dump the GATT table the ring *does* expose: without this
+                # line we cannot tell "wrong service family" from "ring
+                # simply not talking" - both surface to the user as the
+                # same "Unable to reach the ring" setup error. WARNING on
+                # purpose: this is the only trace in a failing user's log.
+                LOGGER.warning(
+                    "Colmi ring %s GATT table (no vendor service): %s",
+                    self._address,
+                    " | ".join(self.debug_gatt_table()),
+                )
                 msg = f"Ring {self._address} does not expose the Colmi UART service"
                 raise ColmiRingApiClientCommunicationError(msg)
-            rx_char = service.get_characteristic(UART_RX_CHAR_UUID)
+
+            rx_char = (
+                service.get_characteristic(UART_RX_CHAR_UUID) if service else None
+            )
+            if rx_char is None and v2_service is not None:
+                # No UART RX (or no UART service at all): fall back to the
+                # second service's command characteristic, which carries the
+                # same 16-byte frames on these firmwares.
+                rx_char = v2_service.get_characteristic(VENDOR_COMMAND_CHAR_V2_UUID)
+                if rx_char is not None:
+                    LOGGER.info(
+                        "Colmi ring %s has no UART RX; using %s for commands",
+                        self._address,
+                        VENDOR_COMMAND_CHAR_V2_UUID,
+                    )
             if rx_char is None:
+                LOGGER.warning(
+                    "Colmi ring %s GATT table (no writable command char): %s",
+                    self._address,
+                    " | ".join(self.debug_gatt_table()),
+                )
                 msg = f"Ring {self._address} is missing the UART RX characteristic"
                 raise ColmiRingApiClientCommunicationError(msg)
             self._rx_char = rx_char
 
-            await self._client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
+            # Subscribe *every* notify characteristic the ring offers: rings
+            # that publish both services answer on either one, so missing a
+            # subscription reads to the caller as a silent ring.
+            subscribed: list[str] = []
+            for uuid, owner in (
+                (UART_TX_CHAR_UUID, service),
+                (VENDOR_NOTIFY_CHAR_V2_UUID, v2_service),
+            ):
+                if owner is None or owner.get_characteristic(uuid) is None:
+                    continue
+                await self._client.start_notify(uuid, self._handle_tx)
+                subscribed.append(uuid)
+            if not subscribed:
+                LOGGER.warning(
+                    "Colmi ring %s GATT table (no notify char): %s",
+                    self._address,
+                    " | ".join(self.debug_gatt_table()),
+                )
+                msg = f"Ring {self._address} is missing the UART TX characteristic"
+                raise ColmiRingApiClientCommunicationError(msg)
+
+            # DEBUG table for every successful link: proves which vendor
+            # services a ring exposes, and lists the command char's write
+            # properties (write vs write-without-response) that _send assumes.
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "Colmi ring %s GATT table: %s",
+                    self._address,
+                    " | ".join(self.debug_gatt_table()),
+                )
             self.linked_at = time.monotonic()
+
+            # Some firmware ignores every command until the host introduces
+            # itself, and needs a moment after the subscription writes before
+            # it accepts anything. Mirror what the vendor apps do: settle, then
+            # a fire-and-forget host-introduction frame. Silence here is fine
+            # (no reply is expected); a dropped write just means the ring was
+            # already gone and the first real command will report it.
+            await asyncio.sleep(INIT_SETTLE_S)
+            intro = packet.make_packet(
+                CMD_HOST_INTRO,
+                bytearray([*_HOST_INTRO_VERSION, *_HOST_INTRO_NAME]),
+            )
+            try:
+                await self._send(intro)
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not take the host-introduction write",
+                    self._address,
+                )
         except ColmiRingApiClientError:
             await self.close()
             raise
@@ -822,7 +931,16 @@ class _RingConnection:
         # retryable client error so the coordinator reports a plain one-line
         # update failure instead of logging a raw traceback.
         try:
-            await self._client.write_gatt_char(self._rx_char, packet, response=False)
+            await self._client.write_gatt_char(
+                self._rx_char,
+                packet,
+                # Which command characteristic this link resolved to depends on
+                # the firmware, so the write style follows the advertised
+                # properties rather than a hardcoded assumption: the UART RX
+                # is write-without-response, while a ring that only offers an
+                # acknowledged write on its alternate channel would reject it.
+                response=_write_needs_response(self._rx_char),
+            )
         except (TimeoutError, BleakError, OSError) as err:
             raise ColmiRingApiClientCommunicationError(
                 f"Lost connection to Colmi ring {self._address}"
@@ -2124,7 +2242,18 @@ class ColmiRingApiClient:
             if isinstance(caps, dict) and isinstance(caps.get("mSupportHrv"), bool):
                 supports_hrv = caps["mSupportHrv"]
             await asyncio.sleep(0.5)
-            log = await conn.get_heart_rate_log()
+            # A ring that does not answer the HR log must not fail the whole
+            # poll: every query above tolerates silence, and a firmware that
+            # stays quiet on 0x15 only costs the heart-rate sensor until it
+            # starts answering. The debug line below carries the evidence.
+            log: Any = None
+            try:
+                log = await conn.get_heart_rate_log()
+            except ColmiRingApiClientError:
+                LOGGER.debug(
+                    "Colmi ring %s did not answer heart-rate log query",
+                    self._ring_address,
+                )
             if isinstance(log, hr.HeartRateLog):
                 # Heart rate is logged on the ring's own slot grid (5-min
                 # slots on R02-class firmware; the sampling interval itself
