@@ -170,6 +170,17 @@ async def async_setup_entry(
             hass=hass,
             ring_address=ring_address,
             on_seen=coordinator.async_note_ring_seen,
+            # The ring pushes notifications on its own (0x73); the
+            # coordinator folds each kind into what it already shows.
+            # Battery: the Charging sensor reacts to the charger without
+            # waiting for a poll. Live activity: the day's steps/distance/
+            # calories repaint between polls. New-data doorbells (heart
+            # rate, SpO2): one poll fetches the samples the ring just
+            # logged, sliding the regular schedule along with it. (YCBT
+            # rings have no such notification channel.)
+            on_battery=coordinator.async_note_battery,
+            on_activity=coordinator.async_note_activity,
+            on_new_data=coordinator.async_note_new_data,
         )
 
     # Passive presence: every raw advertisement the ring emits lands here

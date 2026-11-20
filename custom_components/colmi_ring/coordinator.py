@@ -18,7 +18,7 @@ from .api import (
     ColmiRingApiClientBusyError,
     ColmiRingApiClientError,
 )
-from .colmi_codec import date_utils
+from .colmi_codec import battery, date_utils, notifications
 from .colmi_codec.hr_settings import HeartRateLogSettings
 from .const import (
     CONF_BACKFILL_ON_RECONNECT,
@@ -149,6 +149,14 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # for the age/size limits).
         self._sightings: deque[_Sighting] = deque()
         self._seen_listeners: list[Callable[[datetime], None]] = []
+        # Monotonic time of the last doorbell-triggered poll request, so a
+        # burst of new-data announcements causes at most one extra poll (see
+        # async_note_new_data).
+        self._notice_poll_at: float | None = None
+        # Monotonic time of the last live-activity plausibility warning, to
+        # rate-limit it while async_note_activity keeps dropping pushes (see
+        # that method).
+        self._activity_warn_at: float | None = None
 
     # Throttle for the seen signal: the timestamp is floored to whole
     # seconds, so every advertisement/notification within the same second is
@@ -310,6 +318,162 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
     def _remove_seen_listener(self, listener: Callable[[datetime], None]) -> None:
         if listener in self._seen_listeners:
             self._seen_listeners.remove(listener)
+
+    @callback
+    def async_note_battery(self, info: battery.BatteryInfo) -> None:
+        """
+        Adopt an unsolicited battery report the ring pushed (0x73).
+
+        Called synchronously from the client's notification callback when the
+        ring announces its battery without being asked - typically charger on
+        or off. The polled 0x03 read stays the primary source; this only
+        overwrites the two battery keys in the last poll's data and repaints
+        the existing Battery sensor and Charging binary sensor immediately,
+        instead of letting them sit on a stale value for a whole poll
+        interval. The next successful poll re-reads the battery anyway, so
+        nothing here needs to be aged out.
+
+        Silent by design, like a poll: a new value is visible on the entities
+        themselves, and a ring that re-announces (or re-announces the same
+        value) would otherwise write a log line every time it moves.
+        """
+        if self.data is None:
+            # No poll yet: the first poll reads the battery anyway, so a push
+            # that lands during setup has nothing to improve on.
+            return
+        if (
+            self.data.get("battery_level") == info.battery_level
+            and bool(self.data.get("battery_charging")) == info.charging
+        ):
+            return
+        self.data["battery_level"] = info.battery_level
+        self.data["battery_charging"] = info.charging
+        self.async_update_listeners()
+
+    # The ring's live-activity push (0x73 sub 0x12) carries the day-so-far
+    # counters inline, so they can repaint the activity entities between
+    # polls exactly like the battery push above.
+    _ACTIVITY_WARN_COOLDOWN_S = 3600.0
+
+    @callback
+    def async_note_activity(self, info: notifications.ActivityInfo) -> None:
+        """
+        Adopt a live activity report the ring pushed (0x73 sub 0x12).
+
+        Same overlay idea as :meth:`async_note_battery`: patch the existing
+        poll data's steps/distance/calories keys and repaint, with the next
+        successful poll re-reading everything anyway.
+
+        Two guards, because this channel is less studied than battery and a
+        wrong overlay is user-visible as a spike or a time warp:
+
+        * **Monotonic**: the three fields are day counters, so a value below
+          what is stored is dropped rather than written - it is either the
+          ring's midnight counter reset (the first poll of the new day fixes
+          the entities) or a frame we are misreading. Either way the next
+          poll, which reads the authoritative day log, wins.
+        * **Calorie scale**: this integration's verified convention is that
+          a ring calorie field counts thousandths of a kilocalorie (see
+          ``api.ColmiRingApiClient.async_get_data``), but the pushed field's
+          scaling on this channel has not been confirmed against that
+          evidence. A pushed value far above the stored one therefore looks
+          like a unit mismatch rather than a heroic hour, so it is dropped
+          and named in a warning (rate-limited: the ring re-pushes).
+
+        Silent otherwise, like the battery overlay: the new value is visible
+        on the entities, and a ring that re-announces would log each time.
+        """
+        if self.data is None:
+            # No poll yet: nothing to overlay onto; the first poll reads the
+            # day log anyway.
+            return
+        changed = False
+        for key, pushed in (
+            ("steps", info.steps),
+            ("distance", info.distance_m),
+        ):
+            stored = self.data.get(key) or 0
+            if pushed >= stored and self.data.get(key) != pushed:
+                self.data[key] = pushed
+                changed = True
+        calories = round(info.calories_raw / 1000)
+        stored = self.data.get("calories") or 0
+        if calories >= stored:
+            if calories > stored * 10 and stored >= 20:
+                # More than a 10x jump while the stored value is big enough
+                # for the ratio to mean something: almost certainly the
+                # pushed field counts a different unit than we assume.
+                # Next poll re-reads the day log, so the entity is correct
+                # within a poll interval either way.
+                now = time.monotonic()
+                if (
+                    self._activity_warn_at is None
+                    or now - self._activity_warn_at >= self._ACTIVITY_WARN_COOLDOWN_S
+                ):
+                    self._activity_warn_at = now
+                    LOGGER.warning(
+                        "Colmi ring pushed a live-activity calorie value of"
+                        " %s kcal against a polled %s kcal; dropping the"
+                        " overlay (suspected unit mismatch on the 0x73"
+                        " live-activity channel, raw was %d)",
+                        calories,
+                        stored,
+                        info.calories_raw,
+                    )
+            elif self.data.get("calories") != calories:
+                self.data["calories"] = calories
+                changed = True
+        if changed:
+            self.async_update_listeners()
+
+    # Floor between doorbell-triggered polls: the ring announces a new
+    # heart-rate and SpO2 sample back to back, and each announcement is
+    # worth at most one poll - the poll reads every log, so it always
+    # catches up with whatever the ring has logged.
+    _NOTICE_POLL_COOLDOWN_S = 60.0
+
+    @callback
+    def async_note_new_data(self, metric: str) -> None:
+        """
+        Poll once because the ring doorbell-announced a new sample (0x73).
+
+        The 0x73 sub-commands for heart rate and SpO2 carry no values, only
+        "I just logged something" - the data has to be read with the usual
+        poll commands, so request a coordinator refresh here. This is
+        opportunistic, not required: the regular schedule would fetch the
+        same sample on its next tick; the doorbell just shortens the wait.
+
+        The clock reset the user asked for comes for free. Verified against
+        the pinned HA (requirements.txt) DataUpdateCoordinator: every
+        refresh - scheduled or requested - ends by rescheduling the next
+        tick a full ``update_interval`` after it *completes*, so the
+        doorbell poll pushes the regular schedule out by a whole interval
+        instead of stacking a second poll on top of it.
+
+        Skipped while an on-demand measurement or the RAW motion stream owns
+        the ring: the measurement's own result already updates the sensors,
+        and a poll would only bounce off the busy link. The cooldown coalesces
+        the announce bursts the periodic monitoring produces.
+        """
+        if self.ring_busy is not None:
+            return
+        if self.motion is not None and self.motion.holds_link:
+            return
+        now = time.monotonic()
+        if (
+            self._notice_poll_at is not None
+            and now - self._notice_poll_at < self._NOTICE_POLL_COOLDOWN_S
+        ):
+            return
+        self._notice_poll_at = now
+        # Called from bleak's notification callback, i.e. synchronously: hand
+        # the refresh to the loop rather than merely creating the coroutine.
+        # HA's debouncer inside async_request_refresh batches concurrent
+        # requests anyway; the cooldown above is the coarse backstop.
+        self.hass.async_create_task(
+            self.async_request_refresh(),
+            f"colmi_ring_{metric.replace(' ', '_')}_notice_poll",
+        )
 
     def add_busy_listener(
         self, listener: Callable[[str | None], None]

@@ -60,7 +60,7 @@ if "custom_components.colmi_ring" not in sys.modules:  # pragma: no cover
         REPO_ROOT / "custom_components" / "colmi_ring",
     )
 
-from custom_components.colmi_ring.colmi_codec import r08  # noqa: E402
+from custom_components.colmi_ring.colmi_codec import notifications, r08  # noqa: E402
 
 _FAILURES: list[str] = []
 _CHECKS = 0
@@ -395,6 +395,94 @@ def check_notice_parsing() -> None:
     check("the logged field frame carries a real checksum", logged[15] == 0x3E, f"{logged[15]:#04x}")
 
 
+def check_notifications() -> None:
+    """Pin the 0x73 notification channel: battery push, live activity, doorbells."""
+    print("notifications (0x73):")
+    # The frame captured from a user's HA log, byte for byte: 100 % charging.
+    push = oem_frame(0x73, [0x0C, 0x64, 0x01])
+    info = notifications.parse_battery_push(push)
+    check(
+        "field frame decodes",
+        info is not None and info.battery_level == 100 and info.charging,
+        show("100% charging", push),
+    )
+    off = notifications.parse_battery_push(oem_frame(0x73, [0x0C, 42, 0x00]))
+    check(
+        "charging flag off",
+        off is not None and off.battery_level == 42 and not off.charging,
+    )
+    check(
+        "wrong opcode is no battery",
+        notifications.parse_battery_push(oem_frame(0x03, [0x0C, 64, 0x01])) is None,
+    )
+    check(
+        "unknown sub-command is no battery",
+        notifications.parse_battery_push(oem_frame(0x73, [0x0D, 64, 0x01])) is None,
+    )
+    check(
+        "short frame is no battery",
+        notifications.parse_battery_push(bytearray(b"\x73\x0c")) is None,
+    )
+    check(
+        "all-zero frame is no battery",
+        notifications.parse_battery_push(bytearray(16)) is None,
+    )
+
+    # Live activity (sub 0x12): three 24-bit little-endian day counters.
+    # Synthesise a day-so-far frame: 10 000 steps, 450 000 raw calories
+    # (450 kcal after the integration's /1000), 8 123 m.
+    activity = oem_frame(
+        0x73,
+        [
+            0x12,
+            0x10 & 0xFF, (10_000 >> 8) & 0xFF, (10_000 >> 16) & 0xFF,
+            450_000 & 0xFF, (450_000 >> 8) & 0xFF, (450_000 >> 16) & 0xFF,
+            8_123 & 0xFF, (8_123 >> 8) & 0xFF, (8_123 >> 16) & 0xFF,
+        ],
+    )
+    act = notifications.parse_live_activity(activity)
+    check(
+        "live activity decodes",
+        act is not None
+        and act.steps == 10_000
+        and act.calories_raw == 450_000
+        and act.distance_m == 8_123,
+        show("10000 steps 450kcal 8123m", activity),
+    )
+    tiny = notifications.parse_live_activity(bytearray(b"\x73\x12\x01\x00\x00\x0a"))
+    check(
+        "short live activity frame is None",
+        tiny is None,
+        "fewer than bytes 2..10 present",
+    )
+    check(
+        "wrong sub is no live activity",
+        notifications.parse_live_activity(oem_frame(0x73, [0x13, 1, 2, 3, 4, 5, 6, 7, 8, 9])) is None,
+    )
+    check(
+        "wrong opcode is no live activity",
+        notifications.parse_live_activity(oem_frame(0x74, [0x12, 1, 2, 3, 4, 5, 6, 7, 8, 9])) is None,
+    )
+    check("all-zero frame is no live activity", notifications.parse_live_activity(bytearray(16)) is None)
+
+    # Sub dispatch: every observed kind classifies, foreign opcodes do not.
+    check(
+        "subs classify",
+        all(
+            notifications.notification_sub(oem_frame(0x73, [sub, 0, 0])) == sub
+            for sub in (0x01, 0x03, 0x04, 0x0C, 0x12)
+        ),
+    )
+    check(
+        "doorbells carry no values anyone could mistake",
+        notifications.notification_sub(oem_frame(0x73, [0x01, 0, 0])) == notifications.SUB_NEW_HR
+        and notifications.notification_sub(oem_frame(0x73, [0x03, 0, 0])) == notifications.SUB_NEW_SPO2
+        and notifications.notification_sub(oem_frame(0x73, [0x04, 0, 0])) == notifications.SUB_NEW_STEPS,
+    )
+    check("foreign opcode is no notification", notifications.notification_sub(bytearray([0x03] + [0] * 15)) is None)
+    check("notification channel constant", notifications.CMD_NOTIFICATION == 0x73)
+
+
 def check_usage_table() -> None:
     """Sanity-check the table the decoder indexes by bit position."""
     bits = [bit for bit, _ in r08.TOUCH_USAGE_BITS]
@@ -442,6 +530,8 @@ def main() -> int:
     check_reply_parsing()
     print()
     check_notice_parsing()
+    print()
+    check_notifications()
     print()
     check_capture()
     print()

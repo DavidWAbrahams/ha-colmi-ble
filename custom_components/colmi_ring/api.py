@@ -39,6 +39,7 @@ from .colmi_codec import (
     hr_settings,
     hrv_history,
     motion,
+    notifications,
     packet,
     r08,
     real_time,
@@ -323,11 +324,15 @@ class _RingConnection:
     between the users of one long-lived link.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one bundle of per-connection callbacks
         self,
         hass: HomeAssistant,
         address: str,
         on_seen: Callable[[], None] | None = None,
+        *,
+        on_battery: Callable[[battery.BatteryInfo], None] | None = None,
+        on_activity: Callable[[notifications.ActivityInfo], None] | None = None,
+        on_new_data: Callable[[str], None] | None = None,
     ) -> None:
         """
         Store the resolved HA instance and the ring MAC address.
@@ -335,10 +340,29 @@ class _RingConnection:
         ``on_seen`` (if given) is invoked on every inbound GATT notification,
         feeding the coordinator's last-seen tracker. Synchronous and cheap by
         contract: it runs inside bleak's notification callback.
+
+        The 0x73 notification channel pushes several kinds of announcement;
+        each gets its own callback (see :mod:`colmi_codec.notifications`):
+
+        ``on_battery`` receives the unsolicited battery reports (sub 0x0C),
+        for the coordinator to overlay onto the existing battery entities
+        without waiting for a poll.
+
+        ``on_activity`` receives the live activity reports (sub 0x12): the
+        ring's day-so-far steps, raw calories and distance, for the
+        coordinator to overlay onto the activity entities the same way.
+
+        ``on_new_data`` is called with a metric's display name ("heart
+        rate", "SpO2") when the ring doorbells (subs 0x01/0x03) that it just
+        logged a fresh sample. The doorbell frames carry no values, so the
+        callback decides whether to poll for them.
         """
         self._hass = hass
         self._address = address
         self._on_seen = on_seen
+        self._on_battery = on_battery
+        self._on_activity = on_activity
+        self._on_new_data = on_new_data
         # What the link is being used for right now, for log lines only; the
         # shared link restamps it as each user takes the transaction lock.
         self.purpose = "link"
@@ -351,6 +375,13 @@ class _RingConnection:
         # Open-ended streams (the RAW accelerometer) need every packet for a
         # command byte, not one reply per command, so they register here.
         self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
+        # The ring's notifications are announcements, not replies, so they
+        # have no per-transaction handler; this one listener for the whole
+        # 0x73 channel lives for the whole link and dispatches by sub-command
+        # (see ``_on_notification_frame``). Registering it also marks the
+        # opcode as expected traffic in ``_handle_tx``, so a push no longer
+        # surfaces as an "Unexpected packet type 115 (0x73)" warning.
+        self.add_listener(notifications.CMD_NOTIFICATION, self._on_notification_frame)
         # Command bytes already reported as unexpected on this link. An
         # unfamiliar byte is a diagnosis the first time and a flood afterwards,
         # since a stream repeats its frames every second, so each one is named
@@ -612,6 +643,45 @@ class _RingConnection:
         listeners = self._listeners.get(cmd)
         if listeners and listener in listeners:
             listeners.remove(listener)
+
+    def _on_notification_frame(self, packet: bytearray) -> None:
+        """Route one 0x73 notification frame to whoever asked for its kind."""
+        sub = notifications.notification_sub(packet)
+        if sub == notifications.SUB_BATTERY:
+            info = notifications.parse_battery_push(packet)
+            if info is not None and self._on_battery is not None:
+                self._on_battery(info)
+                return
+        elif sub == notifications.SUB_LIVE_ACTIVITY:
+            activity = notifications.parse_live_activity(packet)
+            if activity is not None and self._on_activity is not None:
+                self._on_activity(activity)
+                return
+        elif sub in (notifications.SUB_NEW_HR, notifications.SUB_NEW_SPO2):
+            # Doorbell: the frame carries no values, only "the ring has
+            # logged a new sample of this metric"; the callback polls.
+            if self._on_new_data is not None:
+                self._on_new_data(
+                    MEASURE_HEART_RATE
+                    if sub == notifications.SUB_NEW_HR
+                    else MEASURE_SPO2
+                )
+                return
+        elif sub == notifications.SUB_NEW_STEPS:
+            # Doorbell for a step log the ring just wrote; the same day
+            # counters arrive inline on the live-activity sub anyway, so
+            # a poll chasing this one would duplicate work for free.
+            return
+        # Anything else on this channel (including a known sub-command whose
+        # payload was too short to decode) stays unacknowledged. At debug
+        # because the ring may repeat it.
+        LOGGER.debug(
+            "Colmi ring %s sent a 0x%02X notification we do not"
+            " interpret yet: %s",
+            self._address,
+            notifications.CMD_NOTIFICATION,
+            packet.hex(" "),
+        )
 
     def touch_motion(self) -> None:
         """Record that motion data just arrived (feeds the stream watchdog)."""
@@ -1633,17 +1703,27 @@ class SharedLink:
     # lock held forever.
     _LOCK_POLL_S = 0.25
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one bundle of per-connection callbacks
         self,
         hass: HomeAssistant,
         address: str,
         on_seen: Callable[[], None] | None = None,
+        *,
+        on_battery: Callable[[battery.BatteryInfo], None] | None = None,
+        on_activity: Callable[[notifications.ActivityInfo], None] | None = None,
+        on_new_data: Callable[[str], None] | None = None,
     ) -> None:
         self._hass = hass
         self._address = address
         # Forwarded to every connection this link opens, so each inbound
         # notification can feed the coordinator's last-seen tracker.
         self._on_seen = on_seen
+        # Likewise forwarded: the ring pushes its notifications (battery,
+        # live activity, new-data doorbells) on its own, so the callbacks
+        # must outlive any one transaction.
+        self._on_battery = on_battery
+        self._on_activity = on_activity
+        self._on_new_data = on_new_data
         self._conn: _RingConnection | None = None
         # Guards connect/disconnect/idle-disconnect so two callers never open
         # two links to a one-central ring.
@@ -1671,7 +1751,14 @@ class SharedLink:
                 await conn.close()
                 conn = None
             if conn is None:
-                conn = _RingConnection(self._hass, self._address, self._on_seen)
+                conn = _RingConnection(
+                    self._hass,
+                    self._address,
+                    self._on_seen,
+                    on_battery=self._on_battery,
+                    on_activity=self._on_activity,
+                    on_new_data=self._on_new_data,
+                )
                 await conn.connect()
                 self._conn = conn
             conn.purpose = purpose
@@ -2083,18 +2170,27 @@ class _DaySeries:
 class ColmiRingApiClient:
     """High level client for a Colmi ring, using HA-managed BLE connections."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one bundle of per-connection callbacks
         self,
         hass: HomeAssistant,
         ring_address: str,
         on_seen: Callable[[], None] | None = None,
+        *,
+        on_battery: Callable[[battery.BatteryInfo], None] | None = None,
+        on_activity: Callable[[notifications.ActivityInfo], None] | None = None,
+        on_new_data: Callable[[str], None] | None = None,
     ) -> None:
         """
         Store the HA instance and ring address (no connection yet).
 
         ``on_seen`` reaches every inbound notification (see
         :class:`_RingConnection`); the setup passes the coordinator's
-        throttled last-seen tracker.
+        throttled last-seen tracker. ``on_battery``, ``on_activity`` and
+        ``on_new_data`` receive the three kinds of push on the ring's 0x73
+        notification channel (see :mod:`colmi_codec.notifications`), so the
+        coordinator can refresh the battery and activity entities between
+        polls and poll once when a new-data doorbell announces fresh
+        heart-rate or SpO2 samples.
         """
         self._hass = hass
         self._ring_address = ring_address
@@ -2102,7 +2198,14 @@ class ColmiRingApiClient:
         # central, so this client keeps one shared connection and serialises
         # command exchanges on it (see :class:`SharedLink`); long-lived
         # sessions hold it as a lease instead of owning it outright.
-        self._link = SharedLink(hass, ring_address, on_seen=on_seen)
+        self._link = SharedLink(
+            hass,
+            ring_address,
+            on_seen=on_seen,
+            on_battery=on_battery,
+            on_activity=on_activity,
+            on_new_data=on_new_data,
+        )
         # Name of the on-demand measurement in progress, or None. The
         # optical sensor lights different LEDs per reading type, so the ring
         # cannot take two at once; refuse the second press immediately rather
