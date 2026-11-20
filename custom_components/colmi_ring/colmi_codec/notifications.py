@@ -47,6 +47,10 @@ class ActivityInfo:
     steps: int
     calories_raw: int
     distance_m: int
+    # The frame verbatim, so a consumer can log or correlate the exact
+    # bytes later: this channel's field units are not settled enough to
+    # throw the raw evidence away.
+    frame: bytes
 
 
 def notification_sub(packet: bytes | bytearray) -> int | None:
@@ -108,6 +112,7 @@ def parse_live_activity(packet: bytes | bytearray) -> ActivityInfo | None:
         steps=_u24le(packet, 2),
         calories_raw=_u24le(packet, 5),
         distance_m=_u24le(packet, 8),
+        frame=bytes(packet),
     )
 
 

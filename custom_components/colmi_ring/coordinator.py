@@ -153,10 +153,6 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         # burst of new-data announcements causes at most one extra poll (see
         # async_note_new_data).
         self._notice_poll_at: float | None = None
-        # Monotonic time of the last live-activity plausibility warning, to
-        # rate-limit it while async_note_activity keeps dropping pushes (see
-        # that method).
-        self._activity_warn_at: float | None = None
 
     # Throttle for the seen signal: the timestamp is floored to whole
     # seconds, so every advertisement/notification within the same second is
@@ -350,81 +346,48 @@ class ColmiRingDataUpdateCoordinator(DataUpdateCoordinator):
         self.data["battery_charging"] = info.charging
         self.async_update_listeners()
 
-    # The ring's live-activity push (0x73 sub 0x12) carries the day-so-far
-    # counters inline, so they can repaint the activity entities between
-    # polls exactly like the battery push above.
-    _ACTIVITY_WARN_COOLDOWN_S = 3600.0
-
     @callback
     def async_note_activity(self, info: notifications.ActivityInfo) -> None:
         """
-        Adopt a live activity report the ring pushed (0x73 sub 0x12).
+        Log a live activity report the ring pushed (0x73 sub 0x12).
 
-        Same overlay idea as :meth:`async_note_battery`: patch the existing
-        poll data's steps/distance/calories keys and repaint, with the next
-        successful poll re-reading everything anyway.
+        Deliberately NOT overlaid onto the entities. The three fields
+        behave like day counters, but the one of them we can cross-check
+        against the polled day log says otherwise: a real push carried
+        5 998 082 raw calories against a polled 158 kcal for the same
+        period - 5998 kcal under this integration's verified
+        thousandths-of-kcal convention, 599 808 under the upstream
+        tenth-kcal reading, and a plausible ~1434 only if the field were
+        joules. The window is unsettled too: the ring's "day" appears to
+        roll over around 8 PM local rather than midnight, so even the
+        steps and distance (whose only guard was monotonicity, which a
+        longer-window counter always passes) can be trusted only as
+        evidence, not as values.
 
-        Two guards, because this channel is less studied than battery and a
-        wrong overlay is user-visible as a spike or a time warp:
-
-        * **Monotonic**: the three fields are day counters, so a value below
-          what is stored is dropped rather than written - it is either the
-          ring's midnight counter reset (the first poll of the new day fixes
-          the entities) or a frame we are misreading. Either way the next
-          poll, which reads the authoritative day log, wins.
-        * **Calorie scale**: this integration's verified convention is that
-          a ring calorie field counts thousandths of a kilocalorie (see
-          ``api.ColmiRingApiClient.async_get_data``), but the pushed field's
-          scaling on this channel has not been confirmed against that
-          evidence. A pushed value far above the stored one therefore looks
-          like a unit mismatch rather than a heroic hour, so it is dropped
-          and named in a warning (rate-limited: the ring re-pushes).
-
-        Silent otherwise, like the battery overlay: the new value is visible
-        on the entities, and a ring that re-announces would log each time.
+        Until both questions are pinned down, the polled day log stays
+        the sole source for the activity entities, and each push is
+        logged at debug with both sides and the frame verbatim: anyone
+        running the integration with debug on accumulates the data
+        needed to decode the channel instead of the integration guessing
+        from it.
         """
-        if self.data is None:
-            # No poll yet: nothing to overlay onto; the first poll reads the
-            # day log anyway.
-            return
-        changed = False
-        for key, pushed in (
-            ("steps", info.steps),
-            ("distance", info.distance_m),
-        ):
-            stored = self.data.get(key) or 0
-            if pushed >= stored and self.data.get(key) != pushed:
-                self.data[key] = pushed
-                changed = True
-        calories = round(info.calories_raw / 1000)
-        stored = self.data.get("calories") or 0
-        if calories >= stored:
-            if calories > stored * 10 and stored >= 20:
-                # More than a 10x jump while the stored value is big enough
-                # for the ratio to mean something: almost certainly the
-                # pushed field counts a different unit than we assume.
-                # Next poll re-reads the day log, so the entity is correct
-                # within a poll interval either way.
-                now = time.monotonic()
-                if (
-                    self._activity_warn_at is None
-                    or now - self._activity_warn_at >= self._ACTIVITY_WARN_COOLDOWN_S
-                ):
-                    self._activity_warn_at = now
-                    LOGGER.warning(
-                        "Colmi ring pushed a live-activity calorie value of"
-                        " %s kcal against a polled %s kcal; dropping the"
-                        " overlay (suspected unit mismatch on the 0x73"
-                        " live-activity channel, raw was %d)",
-                        calories,
-                        stored,
-                        info.calories_raw,
-                    )
-            elif self.data.get("calories") != calories:
-                self.data["calories"] = calories
-                changed = True
-        if changed:
-            self.async_update_listeners()
+        polled = self.data if self.data is not None else {}
+        LOGGER.debug(
+            "Colmi ring live-activity push: steps=%d distance=%dm"
+            " calories_raw=%d (reads as %.3f kcal if thousandths,"
+            " %.1f kcal if tenths, %.1f kcal if joules);"
+            " last poll: steps=%s distance=%s calories=%s; frame %s",
+            info.steps,
+            info.distance_m,
+            info.calories_raw,
+            info.calories_raw / 1000,
+            info.calories_raw / 10,
+            info.calories_raw / 4184,
+            polled.get("steps"),
+            polled.get("distance"),
+            polled.get("calories"),
+            info.frame.hex(" "),
+        )
 
     # Floor between doorbell-triggered polls: the ring announces a new
     # heart-rate and SpO2 sample back to back, and each announcement is

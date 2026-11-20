@@ -349,8 +349,9 @@ class _RingConnection:
         without waiting for a poll.
 
         ``on_activity`` receives the live activity reports (sub 0x12): the
-        ring's day-so-far steps, raw calories and distance, for the
-        coordinator to overlay onto the activity entities the same way.
+        ring's step, raw-calorie and distance counters, which the
+        coordinator currently only logs - the channel's units are not
+        settled (see ``coordinator.async_note_activity``).
 
         ``on_new_data`` is called with a metric's display name ("heart
         rate", "SpO2") when the ring doorbells (subs 0x01/0x03) that it just
@@ -1015,7 +1016,7 @@ class _RingConnection:
             # is named once per link. Hex as well as decimal, plus the whole
             # payload: the command bytes this integration knows are a small
             # table, so an unfamiliar one is easier to recognise (and look up)
-            # as 0x2F than as 47, and the body is the only evidence available
+            # as 0x5E than as 94, and the body is the only evidence available
             # when the ring invents a notification type we have no parser for.
             # The purpose says *what* the link was being used for when it
             # arrived - the deciding detail when a stream and a poll overlap.

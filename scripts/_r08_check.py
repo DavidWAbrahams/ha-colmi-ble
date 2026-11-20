@@ -449,6 +449,13 @@ def check_notifications() -> None:
         and act.distance_m == 8_123,
         show("10000 steps 450kcal 8123m", activity),
     )
+    # The frame travels with the decode: the coordinator logs pushes
+    # verbatim while the channel's units stay unsettled, so the decoder
+    # has to keep the exact bytes.
+    check(
+        "live activity keeps the frame verbatim",
+        act is not None and act.frame == bytes(activity),
+    )
     tiny = notifications.parse_live_activity(bytearray(b"\x73\x12\x01\x00\x00\x0a"))
     check(
         "short live activity frame is None",

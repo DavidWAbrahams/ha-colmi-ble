@@ -173,8 +173,9 @@ async def async_setup_entry(
             # The ring pushes notifications on its own (0x73); the
             # coordinator folds each kind into what it already shows.
             # Battery: the Charging sensor reacts to the charger without
-            # waiting for a poll. Live activity: the day's steps/distance/
-            # calories repaint between polls. New-data doorbells (heart
+            # waiting for a poll. Live activity: logged for now, not
+            # overlaid - the pushed counters' units are unsettled (see
+            # coordinator.async_note_activity). New-data doorbells (heart
             # rate, SpO2): one poll fetches the samples the ring just
             # logged, sliding the regular schedule along with it. (YCBT
             # rings have no such notification channel.)
