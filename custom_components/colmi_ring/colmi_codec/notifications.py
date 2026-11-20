@@ -14,6 +14,11 @@ picks which kind of announcement. Observed sub-commands:
 
 The doorbell frames carry no metric values at all; they only say the ring has
 logged something new, to be fetched later with the usual read commands.
+
+Command byte 0x2F sits outside that channel but belongs to the same idea: an
+announcement no command provoked. It names how many bytes the ring packs into
+one notification on the V2 bulk-transfer channel - a channel this integration
+listens to but never asks anything of, so the announcement is informational.
 """
 
 from dataclasses import dataclass
@@ -27,6 +32,14 @@ SUB_NEW_SPO2 = 0x03
 SUB_NEW_STEPS = 0x04
 SUB_BATTERY = 0x0C
 SUB_LIVE_ACTIVITY = 0x12
+
+CMD_PACKET_SIZE = 0x2F
+
+# Bulk-transfer sizes rings have actually announced, as observed on an R08:
+# ``2f f4 ...`` and ``2f f1 ...``. Both are ordinary ATT payloads for a
+# 247-byte MTU counted at one of its usual depths (247 - 3 = 244; the ring
+# also reports 241). Anything else is a link geometry we have not seen.
+EXPECTED_PACKET_SIZES: frozenset[int] = frozenset({0xF4, 0xF1})
 
 
 @dataclass
@@ -101,3 +114,18 @@ def parse_live_activity(packet: bytes | bytearray) -> ActivityInfo | None:
 def _u24le(packet: bytes | bytearray, offset: int) -> int:
     """Little-endian 24-bit unsigned integer starting at *offset*."""
     return packet[offset] | (packet[offset + 1] << 8) | (packet[offset + 2] << 16)
+
+
+def parse_packet_size(packet: bytes | bytearray) -> int | None:
+    """
+    The bulk-transfer size a 0x2F announcement carries, or None if not one.
+
+    The announced byte is the ring's notification payload size for the V2
+    bulk channel, whose history blobs are then concatenated up to that size
+    plus a 6-byte header. This integration never requests a bulk transfer,
+    so the value is only ever worth reading to decide whether the ring
+    considers a size we would know what to do with.
+    """
+    if len(packet) < 2 or packet[0] != CMD_PACKET_SIZE:
+        return None
+    return packet[1]

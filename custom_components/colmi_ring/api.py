@@ -376,17 +376,24 @@ class _RingConnection:
         # command byte, not one reply per command, so they register here.
         self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
         # The ring's notifications are announcements, not replies, so they
-        # have no per-transaction handler; this one listener for the whole
-        # 0x73 channel lives for the whole link and dispatches by sub-command
-        # (see ``_on_notification_frame``). Registering it also marks the
-        # opcode as expected traffic in ``_handle_tx``, so a push no longer
-        # surfaces as an "Unexpected packet type 115 (0x73)" warning.
+        # have no per-transaction handler; these listeners live for the whole
+        # link. The 0x73 one dispatches the notification channel by
+        # sub-command (see ``_on_notification_frame``); the 0x2F one swallows
+        # the bulk-transfer size announcement (see
+        # ``_on_packet_size_frame``). Registering each also marks its opcode
+        # as expected traffic in ``_handle_tx``, so a push no longer surfaces
+        # as an "Unexpected packet type ..." warning.
         self.add_listener(notifications.CMD_NOTIFICATION, self._on_notification_frame)
+        self.add_listener(notifications.CMD_PACKET_SIZE, self._on_packet_size_frame)
         # Command bytes already reported as unexpected on this link. An
         # unfamiliar byte is a diagnosis the first time and a flood afterwards,
         # since a stream repeats its frames every second, so each one is named
         # at most once per connection.
         self._logged_unexpected: set[int] = set()
+        # Bulk-transfer sizes already complained about on this link, same
+        # once-per-connection rationale as above, keyed by size rather than
+        # opcode because a ring may announce more than one.
+        self._logged_packet_sizes: set[int] = set()
         # Monotonic time the link came up, so a disconnect can be reported with
         # how long it lasted: "the stream died 29 ms after opening" and "the
         # stream died after 20 minutes" are completely different bugs, and
@@ -682,6 +689,31 @@ class _RingConnection:
             notifications.CMD_NOTIFICATION,
             packet.hex(" "),
         )
+
+    def _on_packet_size_frame(self, packet: bytearray) -> None:
+        """
+        Swallow the ring's bulk-transfer size announcement (0x2F).
+
+        The announced size describes how much the ring packs into one
+        notification on the V2 big-data channel, which this transport
+        subscribes to but never asks anything of - every history read we
+        issue is answered in plain 16-byte frames. So an expected size is
+        pure information and logs nothing. An unexpected size changes
+        nothing we do either, but it says the ring sits on a link geometry
+        we have not seen, which is worth naming once per size per link.
+        """
+        size = notifications.parse_packet_size(packet)
+        if size is None or size in notifications.EXPECTED_PACKET_SIZES:
+            return
+        if size not in self._logged_packet_sizes:
+            self._logged_packet_sizes.add(size)
+            LOGGER.warning(
+                "Colmi ring %s announced a bulk-transfer payload size of %d"
+                " bytes, which no ring has announced before: %s",
+                self._address,
+                size,
+                packet.hex(" "),
+            )
 
     def touch_motion(self) -> None:
         """Record that motion data just arrived (feeds the stream watchdog)."""

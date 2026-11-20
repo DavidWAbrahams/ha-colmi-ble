@@ -483,6 +483,43 @@ def check_notifications() -> None:
     check("notification channel constant", notifications.CMD_NOTIFICATION == 0x73)
 
 
+def check_packet_size() -> None:
+    """Pin the 0x2F bulk-transfer size announcement the ring pushes unasked."""
+    print("packet size (0x2F):")
+    # Both frames captured from a user's HA log, byte for byte: the checksum
+    # byte oem_frame computes lands exactly on the observed 0x23 / 0x20.
+    big = oem_frame(0x2F, [0xF4])
+    small = oem_frame(0x2F, [0xF1])
+    check(
+        "log frame decodes to 244",
+        notifications.parse_packet_size(big) == 244,
+        show("2f f4 frame", big),
+    )
+    check(
+        "log frame decodes to 241",
+        notifications.parse_packet_size(small) == 241,
+        show("2f f1 frame", small),
+    )
+    check(
+        "observed sizes are expected",
+        notifications.EXPECTED_PACKET_SIZES == frozenset({244, 241}),
+    )
+    odd = notifications.parse_packet_size(oem_frame(0x2F, [0x10]))
+    check(
+        "unseen size still decodes, and is unexpected",
+        odd == 16 and odd not in notifications.EXPECTED_PACKET_SIZES,
+    )
+    check(
+        "wrong opcode is no size",
+        notifications.parse_packet_size(oem_frame(0x73, [0x2F, 0xF4])) is None,
+    )
+    check(
+        "short frame is no size",
+        notifications.parse_packet_size(bytearray(b"\x2f")) is None,
+    )
+    check("packet size constant", notifications.CMD_PACKET_SIZE == 0x2F)
+
+
 def check_usage_table() -> None:
     """Sanity-check the table the decoder indexes by bit position."""
     bits = [bit for bit, _ in r08.TOUCH_USAGE_BITS]
@@ -532,6 +569,8 @@ def main() -> int:
     check_notice_parsing()
     print()
     check_notifications()
+    print()
+    check_packet_size()
     print()
     check_capture()
     print()
