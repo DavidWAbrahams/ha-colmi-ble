@@ -143,6 +143,9 @@ to automate but will consume battery faster.
 it may be some mash up of heart rate and variability. The ring reports it in 30
 minute increments through the day.
 
-# TODO
+# Omitted sensors
 
-1. Consider dubious metrics like blood pressure, blood sugar, ECG. The protocol can technically provide these, but on a $20 optical ring they are probably nonsense, so I don't expose them.
+Some of these rings emit dubious metrics like blood pressure, blood sugar, ECG, etc. On a $20 optical ring there is no hardware sensor for them. They are probably correlational nonsense, so I don't expose them.
+
+# Related projects
+If you find that the accuracy or frequency of these sensors is not good enough for you, consider using my [Sensor Fusion integration](https://github.com/DavidWAbrahams/hass-sensor-fusion) to combine readings from multiple cheap rings. Wear 4 rings to get updates 4x as frequently, with less bias.
