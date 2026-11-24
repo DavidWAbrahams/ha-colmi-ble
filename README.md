@@ -111,11 +111,7 @@ Y: in the plane of the ring, roughly through the charging port
 x: in the plane of the ring, roughly through the red LED
 
 In the stock firmware, these messages are sent once per second. You can easily flash a modified firmware
-from your browser that increases an R02 to 4 messages per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using [ATC RF03 Ring OTA Flasher](https://atc1441.github.io/ATC_RF03_Writer.html). If you do this, you may want to alter this integrations "motion_sensor_update_s" to a lower value, like 0.25s.
-
-Even with a flashed firmware, Home Assistant updates are published about once a second
-rather than at the full stream rate - every state change is a recorder row, and a higher rate could
-swamp your database. Automations that need a sharp signal could use the gesture event(s).
+from your browser that increases an R02 to 4 messages per second. See [R02_3.00.06_FasterRawValuesMOD.bin](https://github.com/atc1441/ATC_RF03_Ring/blob/main/R02_3.00.06_FasterRawValuesMOD.bin) which can be flashed using [ATC RF03 Ring OTA Flasher](https://atc1441.github.io/ATC_RF03_Writer.html). Then you may adjust this integration's "motion_sensor_update_s" setting to a lower value, like 0.25s, understanding that it will create a lot of data in your Home Assistant database.
 
 ## Vertical angle
 
