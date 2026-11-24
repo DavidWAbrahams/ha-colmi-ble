@@ -206,15 +206,26 @@ CAPABILITY_REPLY_TIMEOUT_S = 2.0
 # "this firmware accepted the enable and no gesture has been made" from "this
 # firmware ignored the enable and nothing will ever arrive".
 TOUCH_ECHO_TIMEOUT_S = 5.0
-# Command bytes whose frames the ring echo-ACKs, so an echo can legally arrive
-# with no one waiting: the touch-off teardown write is deliberately not
-# awaited (see ``set_touch_control``), and a config echo can turn up after
-# its :data:`TOUCH_ECHO_TIMEOUT_S` wait lapsed on a slow ring. Those frames are
-# known traffic (the ring confirming a frame we ourselves sent), not an
+# Command bytes whose inbound frames are explained traffic rather than an
 # unknown protocol, so ``_handle_tx`` names them at debug level rather than
-# WARNING. Verified in the Phase 0 probe and upstream: QRing's R08 driver
-# sends the same ``3B 02`` frames and treats the echo as the only ACK.
-EXPECTED_ECHO_COMMANDS: frozenset[int] = frozenset({r08.CMD_TOUCH_CONTROL})
+# WARNING. Two kinds qualify:
+# - Echo-ACKs of a frame *we* sent, which can legally arrive with no one
+#   waiting: the touch-off teardown write is deliberately not awaited (see
+#   ``set_touch_control``), and a config echo can turn up after its
+#   :data:`TOUCH_ECHO_TIMEOUT_S` wait lapsed on a slow ring. Verified in the
+#   Phase 0 probe and upstream: QRing's R08 driver sends the same ``3B 02``
+#   frames and treats the echo as the only ACK. Likewise the ring answers
+#   the connect-time :data:`CMD_HOST_INTRO` greeting (which its firmware
+#   demands before it honours any command) with the same opcode and a
+#   zeroed payload.
+# - The ring's own connect-handshake chatter: an unsolicited ``02 02 ...``
+#   frame seen alongside the introduction reply on freshly opened links.
+#   No known driver decodes it - the opcode is absent from the vendor
+#   command table - and it carries no data anything consumes, so warning
+#   once per link would only train everyone to ignore warnings.
+BENIGN_COMMANDS: frozenset[int] = frozenset(
+    {r08.CMD_TOUCH_CONTROL, CMD_HOST_INTRO, 0x02}
+)
 
 # How long each kind of caller will wait for the ring's shared link.
 #
@@ -557,9 +568,11 @@ class _RingConnection:
             # Some firmware ignores every command until the host introduces
             # itself, and needs a moment after the subscription writes before
             # it accepts anything. Mirror what the vendor apps do: settle, then
-            # a fire-and-forget host-introduction frame. Silence here is fine
-            # (no reply is expected); a dropped write just means the ring was
-            # already gone and the first real command will report it.
+            # a fire-and-forget host-introduction frame. Nothing waits for the
+            # reply the ring may send (the firmware acknowledges the greeting
+            # with a zeroed 0x04 frame, itself logged at debug); a dropped
+            # write just means the ring was already gone and the first real
+            # command will report it.
             await asyncio.sleep(INIT_SETTLE_S)
             intro = packet.make_packet(
                 CMD_HOST_INTRO,
@@ -1024,13 +1037,14 @@ class _RingConnection:
                 self._logged_unexpected.add(cmd)
                 # WARNING on purpose: if the ring answers a query under a
                 # command byte we do not parse, this is the only trace of it.
-                # Echo-ACKed commands are the exception: a late echo of a
-                # frame *we* sent (see EXPECTED_ECHO_COMMANDS) is explained
-                # traffic, and naming it at WARNING just trains everyone to
-                # ignore warnings - it is logged at debug instead.
-                if cmd in EXPECTED_ECHO_COMMANDS:
+                # Benign commands are the exception: an echo-ACK of a frame
+                # *we* sent, or the ring's own connect-handshake chatter (see
+                # BENIGN_COMMANDS), is explained traffic, and naming it at
+                # WARNING just trains everyone to ignore warnings - it is
+                # logged at debug instead.
+                if cmd in BENIGN_COMMANDS:
                     LOGGER.debug(
-                        "Ignoring echo-ACK packet type %s (0x%02X) from ring"
+                        "Ignoring benign packet type %s (0x%02X) from ring"
                         " during %s: %s",
                         cmd,
                         cmd,
