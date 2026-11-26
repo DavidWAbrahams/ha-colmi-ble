@@ -98,10 +98,22 @@ def get_stop_packet(reading_type: RealTimeReading) -> bytearray:
     return make_packet(CMD_STOP_REAL_TIME, bytearray([reading_type, 0, 0]))
 
 
-def parse_real_time_reading(packet: bytearray) -> Reading | ReadingError:
+def parse_real_time_reading(packet: bytearray) -> Reading | ReadingError | None:
+    """
+    Decode one ``0x69`` real-time progress frame.
+
+    Returns ``None`` (packet ignored) if the kind byte names a reading this
+    enum does not know, so a frame some firmware streams under an unmodelled
+    kind cannot raise out of the dispatch path: the caller treats a dropped
+    frame exactly like a frame of the wrong kind, ignoring it while it waits
+    for the readings it actually asked for.
+    """
     assert packet[0] == CMD_START_REAL_TIME
 
-    kind = RealTimeReading(packet[1])
+    try:
+        kind = RealTimeReading(packet[1])
+    except ValueError:
+        return None
     error_code = packet[2]
     if error_code != 0:
         return ReadingError(kind=kind, code=error_code)

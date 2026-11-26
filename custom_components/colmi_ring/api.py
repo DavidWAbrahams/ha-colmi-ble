@@ -649,6 +649,7 @@ class _RingConnection:
                 hr_settings.parse_heart_rate_log_settings
             ),
             hrv_history.CMD_AUTO_HRV_PREF: hrv_history.parse_hrv_pref_reply,
+            temperature.CMD_AUTO_TEMP_PREF: temperature.parse_temp_pref_reply,
             real_time.CMD_START_REAL_TIME: real_time.parse_real_time_reading,
             real_time.CMD_STOP_REAL_TIME: real_time.parse_stop_reading,
             set_time_mod.CMD_SET_TIME: set_time_mod.parse_set_time_packet,
