@@ -26,7 +26,7 @@ All three report the state of their session rather than the last request, so if
 the ring refuses to connect, or an auto-off timer fires, or a reload shuts a
 session down, the switch settles back to off instead of lying.
 
-``Heart Rate Monitoring`` is different: it holds nothing and costs nothing. It
+``Monitor Heart Rate`` is different: it holds nothing and costs nothing. It
 is the UI for the ``enabled`` byte of the ring's ``0x16`` heart-rate logging
 settings - the flag that decides whether the ring samples heart rate at all.
 A ring can sit with it off (its own firmware default, an OEM app, or an old
@@ -36,7 +36,7 @@ integration could read it back *and* change it. It is offered to every Colmi
 family ring - the ``0x16`` command predates the R08 - and its state comes from
 the settings answer on the last poll.
 
-``HRV Monitoring`` is its ``0x38`` twin for rings that have HRV: the flag that
+``Monitor HRV`` is its ``0x38`` twin for rings that have HRV: the flag that
 decides whether the ring records an HRV value every 30 minutes at all, which
 is what decides whether any ``0x39`` history (and so any backfill) exists. It
 is deliberately *not* offered an interval knob: unlike the ``0x16`` settings,
@@ -45,7 +45,7 @@ grid is fixed at the firmware's 30-minute slot. Its state comes from the
 preference answer on the last poll, so a change made in a vendor app shows up
 here too.
 
-``Temperature Monitoring`` is the same idea on ``0x3A`` for rings whose
+``Monitor Temperature`` is the same idea on ``0x3A`` for rings whose
 capability bit reports skin temperature (R09/R10/R12): it decides whether the
 ring samples a skin-temperature value into each 30-minute slot at all, which is
 what decides whether any ``0x25`` big-data history exists for the Skin
@@ -373,7 +373,7 @@ class ColmiRingHrMonitoringSwitch(ColmiRingEntity, SwitchEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Heart Rate Monitoring"
+    _attr_name = "Monitor Heart Rate"
     _attr_icon = "mdi:heart-plus"
     # Deliberately not entity_category=CONFIG, unlike it might seem: CONFIG
     # pushes the entity into a collapsed "Configuration" section on the device
@@ -461,7 +461,7 @@ class ColmiRingHrvMonitoringSwitch(ColmiRingEntity, SwitchEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "HRV Monitoring"
+    _attr_name = "Monitor HRV"
     _attr_icon = "mdi:heart-multiple"
     # Same reasoning as the HR monitoring switch: this is the entity whose
     # state explains an empty HRV history, so it belongs under Controls, not in
@@ -543,7 +543,7 @@ class ColmiRingTemperatureMonitoringSwitch(ColmiRingEntity, SwitchEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Temperature Monitoring"
+    _attr_name = "Monitor Temperature"
     _attr_icon = "mdi:thermometer-lines"
     # Same reasoning as the HR/HRV monitoring switches: this entity explains an
     # empty Skin Temperature sensor, so it belongs under Controls, not in a

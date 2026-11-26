@@ -2495,13 +2495,13 @@ class ColmiRingApiClient:
         supports_hrv: bool | None = None
         # The ring's all-day HRV monitoring preference (0x38): what decides
         # whether any 0x39 history exists at all. None = not asked (ring has no
-        # HRV) or it did not answer; the HRV Monitoring switch shows state only
+        # HRV) or it did not answer; the Monitor HRV switch shows state only
         # when this is a definite bool.
         hrv_monitoring: bool | None = None
         # Capability + all-day preference for skin temperature, mirroring the
         # HRV pair above: supports_temperature gates whether the 0x25 history
         # and the 0x3A preference are probed at all, and temperature_monitoring
-        # is the ring's answer that the Temperature Monitoring switch shows.
+        # is the ring's answer that the Monitor Temperature switch shows.
         supports_temperature: bool | None = None
         temperature_monitoring: bool | None = None
         async with self._link.acquire("poll", POLL_LOCK_WAIT_S) as conn:
@@ -2637,7 +2637,7 @@ class ColmiRingApiClient:
                     )
 
             # And likewise for skin temperature (0x3A): its state drives the
-            # Temperature Monitoring switch and explains an empty 0x25 history.
+            # Monitor Temperature switch and explains an empty 0x25 history.
             # Rings whose capability bit rules out temperature are never asked.
             if supports_temperature is not False:
                 try:
