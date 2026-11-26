@@ -2856,6 +2856,27 @@ class ColmiRingApiClient:
     _STREAM_RETRY_MIN_S = 1.0
     _STREAM_RETRY_MAX_S = 30.0
 
+    # How long the RAW stream is given to fall silent after the stop request
+    # before the teardown escalates. Measured on an R09 (field probe,
+    # 2026-11): some firmware accepts the ``A1 02`` frame over the link and
+    # then ignores it entirely, streaming - and blinking its LEDs - until the
+    # ring is reset, and a latched stream stops the ring advertising, so
+    # reconnecting later to ask again is not an escape either. The stop is
+    # therefore confirmed by silence rather than trusted, and a stream still
+    # reporting when this window expires is ended with a reboot over the
+    # still-held lease.
+    _MOTION_STOP_GRACE_S = 5.0
+    # A stream with a packet stamp this fresh at the window's end was still
+    # reporting into the last breath of the grace period and counts as having
+    # ignored the stop; both measured firmwares deliver RAW packets at least
+    # a few times a second, so a live stream is always this recent.
+    _MOTION_STOP_ALIVE_S = 1.0
+    # Silence this long, with the session's listener still attached, confirms
+    # the stop early instead of holding the link out the whole grace window.
+    # Comfortably above the inter-packet gaps of both firmwares (~3/s on the
+    # R02, ~4/s on the R09) so a live stream is never misread as stopped.
+    _MOTION_STOP_SILENCE_S = 2.0
+
     @asynccontextmanager
     async def _motion_stream(
         self, on_packet: Callable[[bytearray], None]
@@ -2906,10 +2927,77 @@ class ColmiRingApiClient:
                 watchdog.cancel()
                 with suppress(asyncio.CancelledError):
                     await watchdog
+                # The stop request and its confirmation run before anything
+                # else here because both need what the rest of this teardown
+                # gives back: the listener still attached (the confirmation
+                # reads the packet stamps the listener makes) and the lease
+                # still holding the link (the escalation reboots over it).
+                await self._confirm_motion_stopped(conn)
                 conn.remove_listener(motion.CMD_RAW_MODE, listener)
                 conn.observer = None
                 self._log_stream_session(session, tally)
-                await conn.stop_motion_stream()
+
+    async def _confirm_motion_stopped(self, conn: _RingConnection) -> None:
+        """
+        Send the RAW-stop request and make sure the stream actually ended.
+
+        ``A1 02`` is a request this firmware may ignore: measured on an R09
+        (field probe, 2026-11) the frame was delivered over the live link
+        while the stream - and the ring's LEDs - kept running indefinitely,
+        and the only software escape confirmed working over that link is the
+        ``08 01`` reboot. So the stop is confirmed rather than trusted: the
+        session's own listener stamps ``last_motion`` on every RAW packet,
+        silence confirms the stop early, and traffic still arriving when the
+        grace window expires ends the ring with a reboot through the
+        still-held lease. A stream that goes quiet logs nothing; only the
+        escalation logs.
+
+        A link that dies during the wait ends the whole question early: the
+        stream died with it, and there is no link left to reboot through.
+        """
+        await conn.stop_motion_stream()
+        deadline = time.monotonic() + self._MOTION_STOP_GRACE_S
+        while not conn.dead.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            last = conn.last_motion
+            if last is not None and (
+                time.monotonic() - last >= self._MOTION_STOP_SILENCE_S
+            ):
+                # Sustained silence with the listener still attached: the
+                # stream is stopped; no need to hold the link any longer.
+                break
+            waiter = asyncio.ensure_future(conn.dead.wait())
+            try:
+                # A short poll rather than sleeping out ``remaining``: the
+                # silence verdict above needs re-checking as packets stop.
+                await asyncio.wait({waiter}, timeout=min(remaining, 0.5))
+            finally:
+                # ``asyncio.wait`` leaves the waiter running on timeout; tidy
+                # it up so no task outlives this loop (see ``_watch_stream``).
+                if not waiter.done():
+                    waiter.cancel()
+        if conn.dead.is_set():
+            return
+        last = conn.last_motion
+        if last is not None and last > time.monotonic() - self._MOTION_STOP_ALIVE_S:
+            LOGGER.warning(
+                "Colmi ring %s was still streaming %.0fs after the RAW-stop"
+                " request (this firmware ignores it); rebooting the ring over"
+                " the open link to end the stream",
+                self._ring_address,
+                self._MOTION_STOP_GRACE_S,
+            )
+            try:
+                await conn.reboot()
+            except ColmiRingApiClientError:
+                LOGGER.warning(
+                    "Colmi ring %s motion stream is stuck and the reboot write"
+                    " did not reach the ring; the stream may run until the"
+                    " ring is reset",
+                    self._ring_address,
+                )
 
     @asynccontextmanager
     async def _wave_session(

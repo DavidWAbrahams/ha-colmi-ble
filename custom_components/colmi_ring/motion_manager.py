@@ -106,7 +106,9 @@ _MAX_UNKNOWN_KINDS = 6
 # nothing we decode: measured over a 77 s session to arrive exactly once per
 # second next to the 0xA1/3 sample, always near-identical in content. They are
 # per-tick status echoes, not a codec problem, so they must not be warned about.
-_BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02)})
+# 0xA1/5 is the R09's extra echo: an R09 field capture streamed four subtypes
+# per tick (1, 2, 3, 5) where the R02 sent three.
+_BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02), (0xA1, 0x05)})
 
 
 class MotionManager:
