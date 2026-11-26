@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -95,18 +95,17 @@ ENTITY_DESCRIPTIONS = (
     ),
 )
 
-# Skin temperature comes from the Yucheng all-metrics history stream (and
-# the on-demand temperature session), neither of which the Colmi protocol
-# client implements, so the sensor is created for YCBT entries only.
-YCBT_ENTITY_DESCRIPTIONS = (
-    SensorEntityDescription(
-        key="skin_temperature",
-        name="Skin Temperature",
-        device_class=SensorDeviceClass.TEMPERATURE,
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        state_class=SensorStateClass.MEASUREMENT,
-        suggested_display_precision=1,
-    ),
+# Skin temperature is common to both protocol families, sourced differently:
+# the Yucheng all-metrics history stream (and the on-demand temperature
+# session) for YCBT, and the Colmi big-data 0x25 daily log for the Colmi
+# family (gated on the ring's temperature capability, see available below).
+SKIN_TEMPERATURE_DESCRIPTION = SensorEntityDescription(
+    key="skin_temperature",
+    name="Skin Temperature",
+    device_class=SensorDeviceClass.TEMPERATURE,
+    native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+    state_class=SensorStateClass.MEASUREMENT,
+    suggested_display_precision=1,
 )
 
 # Stress comes from the Colmi daily stress ("pressure") history log, which the
@@ -213,10 +212,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up the sensor platform."""
     coordinator: ColmiRingDataUpdateCoordinator = entry.runtime_data.coordinator
-    descriptions = list(ENTITY_DESCRIPTIONS)
-    if entry.data.get(CONF_DEVICE_FAMILY) == FAMILY_YCBT:
-        descriptions.extend(YCBT_ENTITY_DESCRIPTIONS)
-    else:
+    descriptions = [*ENTITY_DESCRIPTIONS, SKIN_TEMPERATURE_DESCRIPTION]
+    if entry.data.get(CONF_DEVICE_FAMILY) != FAMILY_YCBT:
         descriptions.extend(COLMI_ENTITY_DESCRIPTIONS)
     async_add_entities(
         ColmiRingSensor(
@@ -281,19 +278,29 @@ class ColmiRingSensor(ColmiRingEntity, SensorEntity):
             return None
         return data.get(self.entity_description.key)
 
+    # Sensors whose presence depends on a capability the Colmi firmware reports
+    # at connect time: key on the entity, value on the coordinator data key that
+    # carries that capability.
+    _CAPABILITY_KEY_BY_SENSOR: ClassVar[dict[str, str]] = {
+        "hrv": "supports_hrv",
+        "skin_temperature": "supports_temperature",
+    }
+
     @property
     def available(self) -> bool:
         """
-        HRV is unavailable on Colmi firmware that reports no HRV support.
+        Gate capability-dependent sensors (HRV, skin temperature) on the ring.
 
-        Only a definite ``supports_hrv`` of ``False`` hides the sensor: Yucheng
-        rings source HRV from their history stream and never report the
-        capability, and a Colmi ring that has not answered the capability
-        query yet leaves the key ``None``.
+        Only a definite ``False`` from the matching ``supports_*`` flag hides the
+        sensor. A Yucheng ring sources these from its own history stream and never
+        reports the Colmi capability, and a Colmi ring that has not answered the
+        capability query yet leaves the key ``None``; both cases keep the sensor
+        available so its history is preserved.
         """
+        capability = self._CAPABILITY_KEY_BY_SENSOR.get(self.entity_description.key)
         if (
-            self.entity_description.key == "hrv"
-            and (self.coordinator.data or {}).get("supports_hrv") is False
+            capability is not None
+            and (self.coordinator.data or {}).get(capability) is False
         ):
             return False
         return super().available

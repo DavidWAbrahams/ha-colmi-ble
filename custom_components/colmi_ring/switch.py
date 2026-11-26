@@ -44,6 +44,16 @@ every verified ``0x38`` frame carries only the enable byte - the HRV sampling
 grid is fixed at the firmware's 30-minute slot. Its state comes from the
 preference answer on the last poll, so a change made in a vendor app shows up
 here too.
+
+``Temperature Monitoring`` is the same idea on ``0x3A`` for rings whose
+capability bit reports skin temperature (R09/R10/R12): it decides whether the
+ring samples a skin-temperature value into each 30-minute slot at all, which is
+what decides whether any ``0x25`` big-data history exists for the Skin
+Temperature sensor to read. Like the HRV switch it has no interval knob - every
+verified ``0x3A`` frame carries only the enable byte - and its state is the
+ring's answer on the last poll. Rings without the capability are never queried,
+so the switch stays greyed out rather than pretending to control a feature the
+firmware lacks.
 """
 
 from __future__ import annotations
@@ -73,6 +83,7 @@ WAVE_UNIQUE_ID_SUFFIX = "colmi_ring_wave_detection"
 TOUCH_UNIQUE_ID_SUFFIX = "colmi_ring_touch_control"
 HR_LOGGING_UNIQUE_ID_SUFFIX = "colmi_ring_hr_logging"
 HRV_MONITORING_UNIQUE_ID_SUFFIX = "colmi_ring_hrv_monitoring"
+TEMP_MONITORING_UNIQUE_ID_SUFFIX = "colmi_ring_temp_monitoring"
 
 # Kept as the stream's suffix so existing entities keep their unique ids.
 UNIQUE_ID_SUFFIX = STREAM_UNIQUE_ID_SUFFIX
@@ -102,6 +113,12 @@ async def async_setup_entry(
         # self-grades to unavailable on rings whose capability bit rules out
         # HRV (they are never queried, so the state stays unknown).
         ColmiRingHrvMonitoringSwitch(coordinator=entry.runtime_data.coordinator),
+        # Same pattern for skin temperature: offered to every Colmi ring but
+        # unavailable unless the ring answered the 0x3A capability/preference
+        # query, which only rings with the temperature capability do.
+        ColmiRingTemperatureMonitoringSwitch(
+            coordinator=entry.runtime_data.coordinator
+        ),
     ]
     # The touch switch follows the manager rather than the model name, so there
     # is one source for "this ring has a touch surface" (see __init__).
@@ -510,4 +527,86 @@ class ColmiRingHrvMonitoringSwitch(ColmiRingEntity, SwitchEntity):
 
     async def async_turn_off(self, **_kwargs: object) -> None:
         """Tell the ring to stop recording HRV all day."""
+        await self._async_set_monitoring(False)
+
+
+class ColmiRingTemperatureMonitoringSwitch(ColmiRingEntity, SwitchEntity):
+    """
+    Turn the ring's all-day skin-temperature monitoring on and off.
+
+    This is the ``0x3A`` preference: with it off the ring never samples skin
+    temperature and answers every ``0x25`` big-data history query empty, so the
+    Skin Temperature sensor has nothing to graph. Like the ``0x38`` HRV switch
+    there is no interval to expose - the temperature grid is fixed at one value
+    per 30 minutes - and the state shown is the ring's answer on the last poll,
+    not the last request.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Temperature Monitoring"
+    _attr_icon = "mdi:thermometer-lines"
+    # Same reasoning as the HR/HRV monitoring switches: this entity explains an
+    # empty Skin Temperature sensor, so it belongs under Controls, not in a
+    # collapsed Configuration section.
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(self, coordinator: ColmiRingDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{TEMP_MONITORING_UNIQUE_ID_SUFFIX}"
+        )
+
+    def _current_state(self) -> bool | None:
+        """The ring's last reported preference, or None when unknown."""
+        data = self.coordinator.data
+        if not data:
+            return None
+        value = data.get("temperature_monitoring")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def is_on(self) -> bool:
+        """Whether the ring reported all-day temperature monitoring enabled."""
+        return self._current_state() is True
+
+    @property
+    def available(self) -> bool:
+        """
+        Available when the ring has answered the 0x3A query.
+
+        Rings whose capability bit rules out temperature are never asked, so
+        their state stays unknown and the switch stays greyed out rather than
+        pretending to control something the firmware does not have.
+        """
+        return super().available and self._current_state() is not None
+
+    async def _async_set_monitoring(self, enabled: bool) -> None:
+        """Write the preference and refresh so the state shows the ring's."""
+        self._assert_ring_free()
+        client = self.coordinator.config_entry.runtime_data.client
+        try:
+            result = await client.async_set_temperature_monitoring(enabled)
+        except ColmiRingApiClientError as err:
+            LOGGER.warning(
+                "Failed to set Colmi ring temperature monitoring to %s: %s",
+                "on" if enabled else "off",
+                err,
+            )
+            raise HomeAssistantError(
+                f"Could not change temperature monitoring on the ring: {err}"
+            ) from err
+        LOGGER.debug(
+            "Colmi ring temperature monitoring set to %s, ring now reports: %s",
+            "on" if enabled else "off",
+            result,
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **_kwargs: object) -> None:
+        """Tell the ring to start recording skin temperature all day."""
+        await self._async_set_monitoring(True)
+
+    async def async_turn_off(self, **_kwargs: object) -> None:
+        """Tell the ring to stop recording skin temperature all day."""
         await self._async_set_monitoring(False)

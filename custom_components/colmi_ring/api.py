@@ -33,6 +33,7 @@ from bleak_retry_connector import establish_connection
 
 from .colmi_codec import (
     battery,
+    big_data,
     blink_twice,
     date_utils,
     hr,
@@ -46,10 +47,12 @@ from .colmi_codec import (
     reboot,
     steps,
     stress,
+    temperature,
 )
 from .colmi_codec import (
     set_time as set_time_mod,
 )
+from .colmi_codec.big_data import BigDataReassembler
 from .colmi_codec.hr import HeartRateLogParser
 from .colmi_codec.hrv_history import HrvLogParser
 from .colmi_codec.steps import SportDetailParser
@@ -152,6 +155,13 @@ def _write_needs_response(char: BleakGATTCharacteristic) -> bool:
 # The upstream library uses a fixed 2s which is too tight over a Bluetooth
 # proxy, so we raise it.
 REPLY_TIMEOUT = 10.0
+# How long to wait for the FIRST big-data (``bc``) reply frame, then the brief
+# extra window to drain the rest of a multi-frame burst. Big-data answers come
+# back-to-back, so a short post-first drain is enough for a day's blocks, and
+# a ring that answers nothing (unsupported metric, or monitoring off) is
+# bounded by the first-frame timeout rather than the longer command timeout.
+BIGDATA_FIRST_FRAME_S = 6.0
+BIGDATA_DRAIN_S = 1.0
 
 # How long a real-time measurement waits for its FIRST usable sample. Silence
 # alone is bounded by REALTIME_EMPTY_WAITS_MAX timeouts, but a zero-valued
@@ -260,6 +270,9 @@ STRESS_SLOT_S = 30 * 60
 # The HRV history log (command 0x39) fills one 30-minute slot the same way,
 # so its re-read cadence follows the same slot boundary.
 HRV_SLOT_S = 30 * 60
+# The skin-temperature history (big-data 0x25) is a 30-minute slot grid too,
+# so it follows the same re-read cadence.
+TEMPERATURE_SLOT_S = 30 * 60
 
 
 def _latest_sample_is_zero(
@@ -384,6 +397,19 @@ class _RingConnection:
         # leak between users of the same link (see begin_transaction).
         self._handlers: dict[int, Callable[[bytearray], Any]] = {}
         self._queues: dict[int, asyncio.Queue] = {}
+        # The big-data channel (de5bf72a/729) carries the per-day histories the
+        # 16-byte command frame cannot fit (skin temperature, sleep, SpO2). Its
+        # ``bc <type> ...`` frames arrive fragmented across notifications on the
+        # same notify characteristic as command replies, so they are collected by
+        # a dedicated reassembler that is fed only while a big-data read is in
+        # progress (``_bigdata_active``): that keeps a concurrent RAW motion
+        # stream, whose packets would confuse the buffer, from reaching it. The
+        # write characteristic is the V2 command char, resolved in ``connect``.
+        self._bd_rx_char: BleakGATTCharacteristic | None = None
+        self._bigdata = BigDataReassembler()
+        self._bigdata_active = False
+        self._bigdata_frames: list[tuple[int, bytes]] = []
+        self._bigdata_event = asyncio.Event()
         # Open-ended streams (the RAW accelerometer) need every packet for a
         # command byte, not one reply per command, so they register here.
         self._listeners: dict[int, list[Callable[[bytearray], None]]] = {}
@@ -509,9 +535,7 @@ class _RingConnection:
                 msg = f"Ring {self._address} does not expose the Colmi UART service"
                 raise ColmiRingApiClientCommunicationError(msg)
 
-            rx_char = (
-                service.get_characteristic(UART_RX_CHAR_UUID) if service else None
-            )
+            rx_char = service.get_characteristic(UART_RX_CHAR_UUID) if service else None
             if rx_char is None and v2_service is not None:
                 # No UART RX (or no UART service at all): fall back to the
                 # second service's command characteristic, which carries the
@@ -532,6 +556,16 @@ class _RingConnection:
                 msg = f"Ring {self._address} is missing the UART RX characteristic"
                 raise ColmiRingApiClientCommunicationError(msg)
             self._rx_char = rx_char
+
+            # The big-data histories are written to the second service's command
+            # characteristic (the same ``de5bf72a`` that doubles as the command
+            # char on rings without a UART service). A ring exposing neither that
+            # characteristic nor the UART service cannot answer a big-data read,
+            # so leave the channel unset and let a read report it.
+            if v2_service is not None:
+                self._bd_rx_char = v2_service.get_characteristic(
+                    VENDOR_COMMAND_CHAR_V2_UUID
+                )
 
             # Subscribe *every* notify characteristic the ring offers: rings
             # that publish both services answer on either one, so missing a
@@ -697,8 +731,7 @@ class _RingConnection:
         # payload was too short to decode) stays unacknowledged. At debug
         # because the ring may repeat it.
         LOGGER.debug(
-            "Colmi ring %s sent a 0x%02X notification we do not"
-            " interpret yet: %s",
+            "Colmi ring %s sent a 0x%02X notification we do not interpret yet: %s",
             self._address,
             notifications.CMD_NOTIFICATION,
             packet.hex(" "),
@@ -990,6 +1023,13 @@ class _RingConnection:
         what tells the two streams of traffic apart rather than the callback.
         """
         self._notify_observers(packet)
+        # Big-data ``bc`` frames are neither 16 bytes nor command-keyed, so the
+        # length/dispatch logic below would drop them as an unexpected length.
+        # While a big-data read owns the channel, hand every notification to the
+        # reassembler and consume it here, whether or not it is a complete frame.
+        if self._bigdata_active:
+            self._feed_bigdata(packet)
+            return
         if len(packet) != 16:
             # HID touch reports are 3 bytes by design (the Consumer Control
             # report is 24 one-bit fields), so a session that is listening for
@@ -1161,6 +1201,107 @@ class _RingConnection:
         return await self._command(
             hrv_history.write_hrv_pref_packet(enabled), hrv_history.CMD_AUTO_HRV_PREF
         )
+
+    async def get_temp_pref(self) -> bool:
+        """Read whether the ring's all-day temperature monitoring is enabled."""
+        return await self._command(
+            temperature.read_temp_pref_packet(), temperature.CMD_AUTO_TEMP_PREF
+        )
+
+    async def set_temp_pref(self, enabled: bool) -> bool:
+        """
+        Write the all-day temperature monitoring flag; returns the ring's echo.
+
+        The ring answers the ``3a 03 02`` write with the same frame as a read,
+        so the return value is the ring's own confirmation of the new state.
+        """
+        return await self._command(
+            temperature.write_temp_pref_packet(enabled),
+            temperature.CMD_AUTO_TEMP_PREF,
+        )
+
+    def _feed_bigdata(self, packet: bytearray) -> None:
+        """Push one notification into the big-data reassembler; flag frames."""
+        frames = self._bigdata.feed(packet)
+        if frames:
+            self._bigdata_frames.extend(frames)
+            self._bigdata_event.set()
+
+    async def _bigdata_request(
+        self, frame: bytearray, want_type: int
+    ) -> list[tuple[int, bytes]]:
+        """
+        Send one big-data request and collect every well-formed reply frame.
+
+        Big-data replies arrive fragmented across notifications, so unlike the
+        16-byte ``_command`` path this races a completion event the dispatch
+        sets whenever the reassembler produces a CRC-valid frame. A reply burst
+        is one back-to-back run of frames, so once the first frame lands we keep
+        waiting only briefly for stragglers, then take what we have; a ring that
+        answers nothing is bounded by the first-frame timeout. The caller
+        filters the returned frames by ``want_type`` (the channel multiplexes
+        temperature/sleep/SpO2).
+        """
+        if self._bd_rx_char is None:
+            raise ColmiRingApiClientCommunicationError(
+                f"Ring {self._address} exposes no big-data command characteristic"
+            )
+        self._bigdata.reset()
+        self._bigdata_frames = []
+        self._bigdata_event.clear()
+        self._bigdata_active = True
+        try:
+            assert self._client is not None
+            await self._client.write_gatt_char(
+                self._bd_rx_char,
+                frame,
+                response=_write_needs_response(self._bd_rx_char),
+            )
+            frames = await self._collect_bigdata(want_type)
+        finally:
+            self._bigdata_active = False
+            self._bigdata.reset()
+        return frames
+
+    async def _collect_bigdata(self, want_type: int) -> list[tuple[int, bytes]]:
+        """Wait for the first reply frame, then a short drain of the rest."""
+        first = asyncio.ensure_future(self._bigdata_event.wait())
+        dropped = asyncio.ensure_future(self.dead.wait())
+        got_first = False
+        try:
+            done, _ = await asyncio.wait(
+                {first, dropped}, timeout=BIGDATA_FIRST_FRAME_S
+            )
+            if dropped in done:
+                raise ColmiRingApiClientCommunicationError(
+                    f"Link to Colmi ring {self._address} dropped during"
+                    f" big-data read 0x{want_type:02X}"
+                )
+            got_first = first in done
+            if not got_first:
+                # No frame at all: an unsupported metric, or monitoring off.
+                return []
+            # Let the tail of the burst arrive. Frames come back-to-back, so a
+            # short post-first drain collects a multi-day reply without
+            # stalling a single-frame one.
+            await asyncio.sleep(BIGDATA_DRAIN_S)
+        finally:
+            for waiter in (first, dropped):
+                if not waiter.done():
+                    waiter.cancel()
+        # Only frames of the requested type, in arrival order.
+        return [f for f in self._bigdata_frames if f[0] == want_type]
+
+    async def get_temperature_log(
+        self, days_ago: int = 0
+    ) -> list[temperature.TemperatureLog]:
+        """Read a day's skin-temperature history (big-data 0x25)."""
+        frame = temperature.read_temperature_packet(days_ago)
+        frames = await self._bigdata_request(frame, big_data.TYPE_TEMPERATURE)
+        logs: list[temperature.TemperatureLog] = []
+        for _type, payload in frames:
+            logs.extend(temperature.parse_temperature_blocks(payload))
+        return logs
 
     async def get_steps(
         self, target: datetime, today: datetime | None = None
@@ -2275,6 +2416,12 @@ class ColmiRingApiClient:
         # on every poll in between.
         self._hrv_log: hrv_history.HrvLog | None = None
         self._hrv_slot: int | None = None
+        # Today's skin-temperature history log (big-data 0x25) and the 30-min
+        # slot it was read for. Filled one slot per 30 minutes when the ring's
+        # all-day temperature monitoring is on, so the log is re-read at most
+        # once per slot and the cached day feeds the sensor in between.
+        self._temp_log: temperature.TemperatureLog | None = None
+        self._temp_slot: int | None = None
         # The ``3B 02`` enable the most recent touch session armed with, as
         # ``(app_type, sleep_minutes)``, or None if none ever went out. The
         # watchdog may need to re-send that same frame after the ring's own
@@ -2312,8 +2459,9 @@ class ColmiRingApiClient:
             raise ColmiRingApiClientBusyError(measurement_busy_message(self._measuring))
         self._measuring = name
 
-    async def async_get_data(  # noqa: PLR0915 - one straight-line poll of
-        # every capability; the length comes from the per-query try/excepts
+    async def async_get_data(  # noqa: PLR0915, PLR0912 - one straight-line poll
+        # of every capability; the length and branch count come from the
+        # per-query try/excepts, each guarding one independent feature
         self,
         include_previous_day: bool = False,
     ) -> dict[str, Any]:
@@ -2349,6 +2497,12 @@ class ColmiRingApiClient:
         # HRV) or it did not answer; the HRV Monitoring switch shows state only
         # when this is a definite bool.
         hrv_monitoring: bool | None = None
+        # Capability + all-day preference for skin temperature, mirroring the
+        # HRV pair above: supports_temperature gates whether the 0x25 history
+        # and the 0x3A preference are probed at all, and temperature_monitoring
+        # is the ring's answer that the Temperature Monitoring switch shows.
+        supports_temperature: bool | None = None
+        temperature_monitoring: bool | None = None
         async with self._link.acquire("poll", POLL_LOCK_WAIT_S) as conn:
             try:
                 settings = await conn.get_hr_log_settings()
@@ -2418,6 +2572,10 @@ class ColmiRingApiClient:
             caps = await conn.set_time(date_utils.now())
             if isinstance(caps, dict) and isinstance(caps.get("mSupportHrv"), bool):
                 supports_hrv = caps["mSupportHrv"]
+            if isinstance(caps, dict) and isinstance(
+                caps.get("mSupportTemperature"), bool
+            ):
+                supports_temperature = caps["mSupportTemperature"]
             await asyncio.sleep(0.5)
             # A ring that does not answer the HR log must not fail the whole
             # poll: every query above tolerates silence, and a firmware that
@@ -2477,6 +2635,18 @@ class ColmiRingApiClient:
                         self._ring_address,
                     )
 
+            # And likewise for skin temperature (0x3A): its state drives the
+            # Temperature Monitoring switch and explains an empty 0x25 history.
+            # Rings whose capability bit rules out temperature are never asked.
+            if supports_temperature is not False:
+                try:
+                    temperature_monitoring = await conn.get_temp_pref()
+                except ColmiRingApiClientError:
+                    LOGGER.debug(
+                        "Colmi ring %s did not answer temperature preference query",
+                        self._ring_address,
+                    )
+
             # Stress is logged one value per 30-min slot of the ring's day,
             # so the log is re-read only when that slot changes and the
             # cached newest sample is reported in between. This stays after
@@ -2492,6 +2662,17 @@ class ColmiRingApiClient:
             # capability bit says they have no HRV are never probed.
             hrv_value, hrv_timestamp, hrv_entries = await self._async_hrv_reading(
                 conn, enabled=supports_hrv is not False
+            )
+
+            # Skin temperature rides the big-data channel on the same 30-min
+            # slot grid, so it is re-read at most once per slot; its newest
+            # sample feeds the skin-temperature sensor. Rings whose capability
+            # bit rules out temperature are never probed.
+            (
+                temperature_value,
+                temperature_timestamp,
+            ) = await self._async_temperature_reading(
+                conn, enabled=supports_temperature is not False
             )
 
             # Yesterday's ring logs extend the backfill time series only;
@@ -2526,6 +2707,10 @@ class ColmiRingApiClient:
             "hrv": hrv_value,
             "hrv_timestamp": hrv_timestamp,
             "hrv_monitoring": hrv_monitoring,
+            "supports_temperature": supports_temperature,
+            "skin_temperature": temperature_value,
+            "skin_temperature_timestamp": temperature_timestamp,
+            "temperature_monitoring": temperature_monitoring,
             # Whole-day (timestamp, ms) series for the backfill manager.
             "hrv_entries": hrv_entries,
             "hr_entries": hr_entries,
@@ -2618,6 +2803,66 @@ class ColmiRingApiClient:
             return None, None, []
         return entries[-1][1], entries[-1][0], entries
 
+    async def _async_temperature_reading(
+        self, conn: _RingConnection, *, enabled: bool
+    ) -> tuple[float | None, datetime | None]:
+        """
+        Return (newest skin temperature degC, timestamp), refetched per slot.
+
+        The ring fills one temperature slot per 30 minutes (when its all-day
+        temperature monitoring is on), so the 0x25 history is re-read only when
+        the slot number changes; between slots the cached day feeds the sensor.
+        Rings whose capability bitmap rules out temperature are never probed.
+        """
+        if not enabled:
+            return None, None
+        slot = int(date_utils.now().timestamp()) // TEMPERATURE_SLOT_S
+        if slot != self._temp_slot:
+            self._temp_slot = slot
+            self._temp_log = await self._async_read_temperature(conn)
+        log = self._temp_log
+        if log is None:
+            return None, None
+        now = date_utils.now()
+        # Same future-slot guard as stress/HRV: anchor to the real UTC day and
+        # drop anything the ring clock could place after now.
+        samples = [s for s in log.samples_with_times() if s[1] <= now]
+        if not samples:
+            return None, None
+        degc, ts = max(samples, key=lambda s: s[1])
+        return degc, ts
+
+    async def _async_read_temperature(
+        self, conn: _RingConnection
+    ) -> temperature.TemperatureLog | None:
+        """
+        Read today's temperature history (big-data 0x25), or None when empty.
+
+        A ring with all-day temperature monitoring off answers with a short
+        no-block payload (or nothing); that clears the cached day, and the next
+        attempt waits for the next 30-minute slot rather than re-probing every
+        poll. ``days_ago=0`` is what returns the current day's in-progress
+        block (the ring omits today for a non-zero request).
+        """
+        try:
+            logs = await conn.get_temperature_log()
+        except ColmiRingApiClientError:
+            LOGGER.debug(
+                "Colmi ring %s did not answer temperature history query",
+                self._ring_address,
+            )
+            return self._temp_log  # a failed fetch keeps the cached day
+        # ``days_ago=0`` yields at most one block; keep the newest that has any
+        # sample so a ring that returns several does not surface a stale day.
+        for log in sorted(logs, key=lambda lg: lg.timestamp, reverse=True):
+            if any(log.values):
+                return log
+        LOGGER.debug(
+            "Colmi ring %s reported an empty temperature history",
+            self._ring_address,
+        )
+        return None
+
     async def _async_read_hrv(self, conn: _RingConnection) -> hrv_history.HrvLog | None:
         """
         Read today's HRV history log, or None when the ring has nothing.
@@ -2643,6 +2888,22 @@ class ColmiRingApiClient:
             )
             return None
         return log
+
+    async def async_set_temperature_monitoring(self, enabled: bool) -> bool:
+        """
+        Write the all-day temperature monitoring preference, then read it back.
+
+        Mirrors the HRV path: the ring answers the ``3a 03 02`` write with the
+        preference frame itself, so the write doubles as the confirmation, and
+        the read after it is the check. Returns the state the ring reports.
+        """
+        async with self._link.acquire("settings", USER_LOCK_WAIT_S) as conn:
+            echoed = await conn.set_temp_pref(enabled)
+            await asyncio.sleep(0.5)
+            try:
+                return await conn.get_temp_pref()
+            except ColmiRingApiClientError:
+                return echoed
 
     async def _async_extend_previous_day(
         self,
