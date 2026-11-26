@@ -2028,6 +2028,10 @@ class _StreamTally:
         self.count += 1
         self._by_type[f"0x{packet[0]:02X}/{packet[1] if len(packet) > 1 else 0}"] += 1
 
+    def saw(self, cmd: int, sub: int) -> bool:
+        """Whether a packet with this command byte and subtype arrived."""
+        return f"0x{cmd:02X}/{sub}" in self._by_type
+
     def count_for(self, cmd: int) -> int:
         """How many notifications carried command byte ``cmd``."""
         prefix = f"0x{cmd:02X}/"
@@ -2856,15 +2860,15 @@ class ColmiRingApiClient:
     _STREAM_RETRY_MIN_S = 1.0
     _STREAM_RETRY_MAX_S = 30.0
 
-    # How long the RAW stream is given to fall silent after the stop request
-    # before the teardown escalates. Measured on an R09 (field probe,
-    # 2026-11): some firmware accepts the ``A1 02`` frame over the link and
-    # then ignores it entirely, streaming - and blinking its LEDs - until the
-    # ring is reset, and a latched stream stops the ring advertising, so
-    # reconnecting later to ask again is not an escape either. The stop is
-    # therefore confirmed by silence rather than trusted, and a stream still
-    # reporting when this window expires is ended with a reboot over the
-    # still-held lease.
+    # How long an honest stream is given to fall silent after the stop
+    # request before the teardown escalates. Measured on an R09 (field probe
+    # 2026-11, field log 2026-11-25): that firmware accepts the ``A1 02``
+    # frame, goes quiet for it, and then keeps streaming - and blinking its
+    # LEDs - until the ring is reset, while staying perfectly connectable
+    # (it polled fine the whole time it was latched). Silence therefore
+    # confirms a stop only on firmware that stops when it goes quiet; the
+    # echo firmware is identified by its stream shape and always ends with a
+    # reboot (see ``_confirm_motion_stopped``).
     _MOTION_STOP_GRACE_S = 5.0
     # A stream with a packet stamp this fresh at the window's end was still
     # reporting into the last breath of the grace period and counts as having
@@ -2876,6 +2880,10 @@ class ColmiRingApiClient:
     # Comfortably above the inter-packet gaps of both firmwares (~3/s on the
     # R02, ~4/s on the R09) so a live stream is never misread as stopped.
     _MOTION_STOP_SILENCE_S = 2.0
+    # How long the stop frame is given to settle into the ring before the
+    # echo firmware's guaranteed reboot follows it, so the two writes do not
+    # race each other into the ring's parser.
+    _MOTION_STOP_SETTLE_S = 0.5
 
     @asynccontextmanager
     async def _motion_stream(
@@ -2930,32 +2938,64 @@ class ColmiRingApiClient:
                 # The stop request and its confirmation run before anything
                 # else here because both need what the rest of this teardown
                 # gives back: the listener still attached (the confirmation
-                # reads the packet stamps the listener makes) and the lease
-                # still holding the link (the escalation reboots over it).
-                await self._confirm_motion_stopped(conn)
+                # reads the packet stamps the listener makes), the tally
+                # still counting (the confirmation tells the firmware's
+                # character from what the stream sent) and the lease still
+                # holding the link (the escalation reboots over it).
+                await self._confirm_motion_stopped(conn, tally)
                 conn.remove_listener(motion.CMD_RAW_MODE, listener)
                 conn.observer = None
                 self._log_stream_session(session, tally)
 
-    async def _confirm_motion_stopped(self, conn: _RingConnection) -> None:
+    async def _confirm_motion_stopped(
+        self, conn: _RingConnection, tally: _StreamTally
+    ) -> None:
         """
         Send the RAW-stop request and make sure the stream actually ended.
 
-        ``A1 02`` is a request this firmware may ignore: measured on an R09
-        (field probe, 2026-11) the frame was delivered over the live link
-        while the stream - and the ring's LEDs - kept running indefinitely,
-        and the only software escape confirmed working over that link is the
-        ``08 01`` reboot. So the stop is confirmed rather than trusted: the
-        session's own listener stamps ``last_motion`` on every RAW packet,
-        silence confirms the stop early, and traffic still arriving when the
-        grace window expires ends the ring with a reboot through the
-        still-held lease. A stream that goes quiet logs nothing; only the
-        escalation logs.
+        The stop request is a request, never a result, and what counts as
+        confirming it depends on the firmware - which the stream itself
+        identifies, by whether it echoes a fourth packet kind (``0xA1/5``)
+        alongside the three every other stream sends per tick:
 
-        A link that dies during the wait ends the whole question early: the
-        stream died with it, and there is no link left to reboot through.
+        - Firmware that streams three kinds per tick (measured on an R02)
+          stops sending when it stops streaming. Silence from the session's
+          own listener - it stamps ``last_motion`` on every RAW packet -
+          therefore confirms the stop early; traffic still arriving when the
+          grace window expires is a stream that ignored the request, and is
+          ended with a reboot over the still-held lease.
+
+        - Firmware that streams four (measured on an R09) goes quiet for the
+          ``A1 02`` frame without honouring it: the field log of 2026-11-25
+          shows its notification stream falling silent inside the grace
+          window while the LEDs ran on until the ring was reset. Nothing
+          readable over the link - battery queries keep answering, the ring
+          stays connectable - tells that silenced latch apart from a real
+          stop, so on this firmware silence confirms nothing and the stream
+          ends with the reboot unconditionally.
+
+        A session that never delivered packets matches no fingerprint and
+        earns no reboot. A link that died during the wait ends the question
+        early: there is nothing left to confirm, or to reboot through. A
+        stopped stream logs nothing; the echo firmware's routine reboot logs
+        at DEBUG; only a reboot write that fails to reach the ring logs
+        above that.
         """
         await conn.stop_motion_stream()
+        if tally.saw(motion.CMD_RAW_MODE, 0x05):
+            # The 0xA1/5 echo: this firmware's silence is the one thing it
+            # cannot be trusted for, so there is no verdict to wait for -
+            # let the stop frame settle onto the wire, then reboot anyway.
+            if not conn.dead.is_set():
+                LOGGER.debug(
+                    "Colmi ring %s falls silent for the RAW-stop request"
+                    " without honouring it (the 0xA1/5 echo firmware); ending"
+                    " the stream with a reboot",
+                    self._ring_address,
+                )
+                await asyncio.sleep(self._MOTION_STOP_SETTLE_S)
+                await self._reboot_to_end_stream(conn)
+            return
         deadline = time.monotonic() + self._MOTION_STOP_GRACE_S
         while not conn.dead.is_set():
             remaining = deadline - time.monotonic()
@@ -2989,15 +3029,29 @@ class ColmiRingApiClient:
                 self._ring_address,
                 self._MOTION_STOP_GRACE_S,
             )
-            try:
-                await conn.reboot()
-            except ColmiRingApiClientError:
-                LOGGER.warning(
-                    "Colmi ring %s motion stream is stuck and the reboot write"
-                    " did not reach the ring; the stream may run until the"
-                    " ring is reset",
-                    self._ring_address,
-                )
+            await self._reboot_to_end_stream(conn)
+
+    async def _reboot_to_end_stream(self, conn: _RingConnection) -> None:
+        """
+        End a stream the ring will not stop by rebooting over the open lease.
+
+        The one software teardown confirmed to survive a latched stream. A
+        link that died first leaves nothing to write through; a write that
+        does not reach the ring is the only outcome worth telling the user
+        about, since the stream - and the blinking - then outlive the
+        session.
+        """
+        if conn.dead.is_set():
+            return
+        try:
+            await conn.reboot()
+        except ColmiRingApiClientError:
+            LOGGER.warning(
+                "Colmi ring %s motion stream is stuck and the reboot write"
+                " did not reach the ring; the stream may run until the"
+                " ring is reset",
+                self._ring_address,
+            )
 
     @asynccontextmanager
     async def _wave_session(
