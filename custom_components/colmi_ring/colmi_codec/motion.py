@@ -164,3 +164,116 @@ def parse_gesture_packet(packet: bytearray) -> Gesture | None:
     if packet[1] not in GESTURE_REPORT_TYPES:
         return None
     return Gesture.CAMERA
+
+
+# --- Timed raw stream (0x69 type 13, R09 family) -----------------------------
+#
+# Newer Colmi firmware (verified on an R09, FW RT09CR2_3.00.03_260929, per the
+# ring0 protocol notes of 2026-11-11) answers the real-time command with a
+# *timed* raw sensor session: ``69 0D <duration u16 LE>`` streams fourteen
+# payload bytes at about 25 Hz for ``duration`` seconds, then the ring stops
+# by itself. The payload carries two optical channels and three s16 LE
+# accelerometer axes - the same information RAW mode carries, but on a
+# command whose stop this firmware actually honours (see
+# :func:`get_realtime_stream_stop_packet`), where the 0xA1 path latches
+# (field log 2026-11-25).
+#
+# Type 14 is the same session on the SpO2 LED pair and is deliberately not
+# used: its red sensor light survives even the verified stop.
+#
+# The accelerometer's unit is not documented. At-rest captures show the
+# three values "small and near zero", which pins down nothing useful, so
+# ``REALTIME_ACCEL_LSB_PER_G`` stays at 1.0 (raw units) until a field
+# capture pins the scale; ``MotionManager._async_check_rate`` logs the
+# at-rest median magnitude, and that figure is what calibrates this.
+
+#: Command byte of the real-time session channel - the same byte the
+#: heart-rate/SpO2 real-time codec listens on (see ``real_time.py``), so a
+#: stream listener on it must filter by session type.
+CMD_REALTIME_STREAM = 0x69
+
+#: Session type (``packet[1]``) whose packets carry the timed raw stream.
+REALTIME_STREAM_TYPE = 0x0D
+
+#: The stop for a type-13 session is not ``6A 0D 00 00`` (measured not to
+#: work): starting any other real-time type shuts the previous session's
+#: sensor and timer down, so the stop is "start type 6, action stop". This
+#: payload was verified on the ring on 2026-11-11.
+_REALTIME_STOP_PAYLOAD = bytearray([0x06, 0x04])
+
+#: The firmware rejects durations below 10 s, and its 500 ms session counter
+#: is 16-bit, so durations saturate at 65535 s.
+REALTIME_STREAM_MIN_DURATION_S = 10
+REALTIME_STREAM_MAX_DURATION_S = 65535
+
+#: Division applied to the raw s16 axes to turn them into g. Unknown until
+#: calibrated from a field capture; 1.0 keeps samples in raw units, and the
+#: at-rest magnitude that ``MotionManager`` logs names the number to set
+#: here (a ring at rest must read a median magnitude of ~1 g).
+REALTIME_ACCEL_LSB_PER_G = 1.0
+
+
+def get_realtime_stream_start_packet(duration_s: int) -> bytearray:
+    """
+    Start the R09-family timed raw stream, self-stopping after ``duration_s``.
+
+    The duration is clamped into the range the firmware itself enforces
+    (10..65535 s). It is a failsafe rather than the session's intended life:
+    the integration always sends the stop frame first, and the ring's
+    self-stop only matters when that frame never reaches it.
+    """
+    duration = max(
+        REALTIME_STREAM_MIN_DURATION_S,
+        min(int(duration_s), REALTIME_STREAM_MAX_DURATION_S),
+    )
+    return make_packet(
+        CMD_REALTIME_STREAM,
+        bytearray([REALTIME_STREAM_TYPE, duration & 0xFF, duration >> 8]),
+    )
+
+
+def get_realtime_stream_stop_packet() -> bytearray:
+    """
+    Stop the timed raw stream by starting (and stopping) another session.
+
+    ``6A 0D 00 00`` leaves a type-13 session streaming; starting any other
+    real-time type shuts the previous session's sensor and timer down, so
+    the stop is "start type 6, action stop" - the frame verified on the
+    ring on 2026-11-11, after the plain stop frame was measured not to work.
+    """
+    return make_packet(CMD_REALTIME_STREAM, bytearray(_REALTIME_STOP_PAYLOAD))
+
+
+def _s16le(packet: bytearray, offset: int) -> int:
+    """Decode the little-endian signed 16-bit value starting at ``offset``."""
+    value = packet[offset] | (packet[offset + 1] << 8)
+    return value - 0x10000 if value > 0x7FFF else value
+
+
+def parse_realtime_accel_packet(packet: bytearray) -> AccelSample | None:
+    """
+    Return the accelerometer sample in a type-13 stream packet, or ``None``.
+
+    Payload layout (payload index ``n`` is ``packet[1 + n]``): ``[0]=type
+    [1]=error [2]=sequence (wraps at 256) [3]=status/gain [4..5]=u16 LE
+    optical A [6..7]=u16 LE optical B [8..9], [10..11], [12..13]=s16 LE
+    accelerometer``. Which physical axis each of the three carries is not
+    documented, so they are named x, y, z in wire order; like the RAW
+    stream's axis mapping, the hole-axis option is the calibration hook.
+    The error byte is not consulted: nonzero values have never been
+    observed, and dropping samples on an unverified assumption would starve
+    the gesture detector on a stream where roughly 4.5% of packets are
+    already lost.
+    """
+    if (
+        len(packet) < 15
+        or packet[0] != CMD_REALTIME_STREAM
+        or packet[1] != REALTIME_STREAM_TYPE
+    ):
+        return None
+    scale = REALTIME_ACCEL_LSB_PER_G
+    return AccelSample(
+        x=_s16le(packet, 9) / scale,
+        y=_s16le(packet, 11) / scale,
+        z=_s16le(packet, 13) / scale,
+    )

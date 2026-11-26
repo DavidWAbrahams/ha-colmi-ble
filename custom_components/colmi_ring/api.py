@@ -102,6 +102,15 @@ _HOST_INTRO_NAME = b"HA"
 # these firmwares need after the notification descriptors are written.
 INIT_SETTLE_S = 2.0
 
+# How long the ring's own session timer is armed for on the R09-family timed
+# raw stream (0x69 type 13). A failsafe, not the session's intended life: the
+# integration always sends the stop frame first, and this only bounds how long
+# the ring keeps streaming (LED on, battery draining) when that frame never
+# reaches it - a lost stop used to latch until a physical reset. Long enough
+# that ordinary stream sessions never hit the ring's self-stop; short enough
+# that a missed stop is survivable.
+_REALTIME_STREAM_DURATION_S = 3600
+
 # The Bluetooth HID Service, SIG 16-bit UUIDs in the same 128-bit form bleak
 # reports. The R08's touch input is a HID *Consumer Control* report, so reaching
 # it means talking to the HID service as well as the Colmi UART service above.
@@ -1215,26 +1224,47 @@ class _RingConnection:
         """Write the ring's heart-rate logging settings (no reply expected)."""
         await self._send(hr_settings.hr_log_settings_packet(settings))
 
-    async def start_motion_stream(self) -> None:
-        """Ask the ring to start streaming RAW accelerometer data."""
-        self.touch_motion()
-        packet = motion.get_raw_start_packet()
-        LOGGER.debug(
-            "Colmi ring %s RAW-stream start packet: %s",
-            self._address,
-            packet.hex(),
-        )
-        await self._send(packet)
+    async def start_motion_stream(self, *, realtime: bool = False) -> None:
+        """
+        Ask the ring to start streaming accelerometer data.
 
-    async def stop_motion_stream(self) -> None:
+        Two generations of firmware answer this. ``realtime=False`` (the
+        default) enables the classic RAW mode on ``0xA1``; ``realtime=True``
+        starts the timed raw stream on ``0x69`` instead, for the firmware
+        that honours its stop there but latches on the RAW stop (see
+        :mod:`colmi_codec.motion` for both layouts).
+        """
+        self.touch_motion()
+        if realtime:
+            start = motion.get_realtime_stream_start_packet(
+                _REALTIME_STREAM_DURATION_S
+            )
+        else:
+            start = motion.get_raw_start_packet()
+        LOGGER.debug(
+            "Colmi ring %s %s-stream start packet: %s",
+            self._address,
+            "timed-raw" if realtime else "RAW",
+            start.hex(),
+        )
+        await self._send(start)
+
+    async def stop_motion_stream(self, *, realtime: bool = False) -> None:
         """
         Ask the ring to stop streaming; errors are best-effort ignored.
 
         Called while tearing a session down, including after the link has
-        already dropped, where the write would raise.
+        already dropped, where the write would raise. ``realtime`` must
+        match what :meth:`start_motion_stream` started: the two generations
+        answer different stop frames, and neither reacts to the other's.
         """
+        stop = (
+            motion.get_realtime_stream_stop_packet()
+            if realtime
+            else motion.get_raw_stop_packet()
+        )
         try:
-            await self._send(motion.get_raw_stop_packet())
+            await self._send(stop)
         except ColmiRingApiClientError:
             LOGGER.debug(
                 "Could not tell ring %s to stop streaming (already gone?)",
@@ -2230,6 +2260,7 @@ class ColmiRingApiClient:
         on_battery: Callable[[battery.BatteryInfo], None] | None = None,
         on_activity: Callable[[notifications.ActivityInfo], None] | None = None,
         on_new_data: Callable[[str], None] | None = None,
+        supports_realtime_motion: bool = False,
     ) -> None:
         """
         Store the HA instance and ring address (no connection yet).
@@ -2241,10 +2272,18 @@ class ColmiRingApiClient:
         notification channel (see :mod:`colmi_codec.notifications`), so the
         coordinator can refresh the battery and activity entities between
         polls and poll once when a new-data doorbell announces fresh
-        heart-rate or SpO2 samples.
+        heart-rate or SpO2 samples. ``supports_realtime_motion`` says this
+        ring's model streams motion through 0x69 rather than 0xA1 (see
+        :func:`const.supports_realtime_motion_stream`); the caller decides
+        it from the ring's model name, because the client never sees the
+        config entry.
         """
         self._hass = hass
         self._ring_address = ring_address
+        # Which of the two stream generations every motion session uses.
+        # Fixed per client: the capability is a property of the model, so it
+        # cannot change while the entry is set up.
+        self._motion_stream_realtime = supports_realtime_motion
         # Every session to this ring goes through here. The firmware serves one
         # central, so this client keeps one shared connection and serialises
         # command exchanges on it (see :class:`SharedLink`); long-lived
@@ -2900,6 +2939,12 @@ class ColmiRingApiClient:
         lock for its whole life, which is also what lets the start/stop writes
         below go out directly without interleaving with anyone's packets.
 
+        On a ring whose model is flagged ``supports_realtime_motion``, the
+        session drives the timed raw stream on ``0x69`` instead of RAW mode
+        on ``0xA1`` - same lease, watchdog and teardown, different frames,
+        chosen once at client construction from the ring's model name (see
+        :func:`const.supports_realtime_motion_stream`).
+
         The RAW stream deliberately does *not* also arm the ring's on-device
         wave detector. Measured on an R02 with the ATC RF03 Writer web tool,
         camera mode (``02 04``) runs on its own with no stream and reports one
@@ -2908,22 +2953,32 @@ class ColmiRingApiClient:
         one firmware appears to serve only at a time. So arming it here bought
         nothing; it has its own session now, see :meth:`_wave_session`.
         """
+        realtime = self._motion_stream_realtime
+        # Which command byte carries this ring's stream: the session listens
+        # on it, and the closing log line counts the stream by it.
+        stream_cmd = (
+            motion.CMD_REALTIME_STREAM if realtime else motion.CMD_RAW_MODE
+        )
         async with self._link.hold(
             "motion stream", exclusive=True, wait_s=STREAM_LOCK_WAIT_S
         ) as conn:
             session = MotionSession(conn)
             tally = _StreamTally()
             # Observe the whole link, not just the command bytes we listen for:
-            # if the firmware streams on a byte other than the guessed 0xA1,
+            # if the firmware streams on a byte other than the one we chose,
             # the tally still shows packets arriving, which is a different
             # diagnosis and a different fix. Cleared on the way out because the
             # shared link outlives this session and must not keep counting for
             # a tally that is already logged.
             conn.observer = tally.add
-            listener = self._make_packet_listener(session, on_packet)
-            conn.add_listener(motion.CMD_RAW_MODE, listener)
+            listener = (
+                self._make_realtime_stream_listener(session, on_packet)
+                if realtime
+                else self._make_packet_listener(session, on_packet)
+            )
+            conn.add_listener(stream_cmd, listener)
             conn.touch_motion()
-            await conn.start_motion_stream()
+            await conn.start_motion_stream(realtime=realtime)
             watchdog = asyncio.create_task(self._watch_stream(session))
             try:
                 # Every exit path (including an exception raised inside the
@@ -2942,13 +2997,13 @@ class ColmiRingApiClient:
                 # still counting (the confirmation tells the firmware's
                 # character from what the stream sent) and the lease still
                 # holding the link (the escalation reboots over it).
-                await self._confirm_motion_stopped(conn, tally)
-                conn.remove_listener(motion.CMD_RAW_MODE, listener)
+                await self._confirm_motion_stopped(conn, tally, realtime=realtime)
+                conn.remove_listener(stream_cmd, listener)
                 conn.observer = None
                 self._log_stream_session(session, tally)
 
     async def _confirm_motion_stopped(
-        self, conn: _RingConnection, tally: _StreamTally
+        self, conn: _RingConnection, tally: _StreamTally, *, realtime: bool = False
     ) -> None:
         """
         Send the RAW-stop request and make sure the stream actually ended.
@@ -2980,8 +3035,15 @@ class ColmiRingApiClient:
         stopped stream logs nothing; the echo firmware's routine reboot logs
         at DEBUG; only a reboot write that fails to reach the ring logs
         above that.
+
+        ``realtime`` sends the timed stream's stop frame instead - ``69 06
+        04``, measured on the ring to honour it where the RAW stop latches -
+        and keeps the same verdict logic: the ``0xA1/5`` fingerprint above
+        cannot match a session that streamed on ``0x69``, so that path falls
+        straight into the silence-or-reboot loop, which is what a
+        25 Hz stream with a firmware-honoured stop needs anyway.
         """
-        await conn.stop_motion_stream()
+        await conn.stop_motion_stream(realtime=realtime)
         if tally.saw(motion.CMD_RAW_MODE, 0x05):
             # The 0xA1/5 echo: this firmware's silence is the one thing it
             # cannot be trusted for, so there is no verdict to wait for -
@@ -3476,27 +3538,32 @@ class ColmiRingApiClient:
         # caused ourselves, which is exactly how a 2 ms session read as "the ring
         # refuses to stream".
         reason = session.reason or "ABORTED (never stopped by anyone)"
-        raw_count = tally.count_for(motion.CMD_RAW_MODE)
-        if raw_count:
+        stream_cmd = (
+            motion.CMD_REALTIME_STREAM
+            if self._motion_stream_realtime
+            else motion.CMD_RAW_MODE
+        )
+        stream_count = tally.count_for(stream_cmd)
+        if stream_count:
             LOGGER.debug(
                 "Colmi ring %s motion stream closed (%s, after %s): %d"
-                " RAW notification(s), %d notification(s) total: %s",
+                " stream notification(s), %d notification(s) total: %s",
                 self._ring_address,
                 reason,
                 lived,
-                raw_count,
+                stream_count,
                 tally.count,
                 tally.describe(),
             )
             return
         LOGGER.info(
             "Colmi ring %s motion stream closed after %s (%s) with %d"
-            " notification(s) of which none were RAW (0x%02X): %s",
+            " notification(s) of which none were stream packets (0x%02X): %s",
             self._ring_address,
             lived,
             reason,
             tally.count,
-            motion.CMD_RAW_MODE,
+            stream_cmd,
             tally.describe(),
         )
 
@@ -3508,6 +3575,33 @@ class ColmiRingApiClient:
         """Wrap the caller's callback so the link is marked active on traffic."""
 
         def listener(packet: bytearray) -> None:
+            session.conn.touch_motion()
+            on_packet(packet)
+
+        return listener
+
+    def _make_realtime_stream_listener(
+        self,
+        session: _LinkSession,
+        on_packet: Callable[[bytearray], None],
+    ) -> Callable[[bytearray], None]:
+        """
+        Like :meth:`_make_packet_listener`, for a listener registered on 0x69.
+
+        The timed raw stream shares its command byte with the heart-rate and
+        SpO2 real-time replies (see :mod:`colmi_codec.real_time`), so only
+        type-13 packets count as stream traffic. That filtering is not
+        cosmetic: the stop confirmation watches how recently the listener
+        last stamped the link, and a stray non-stream packet on 0x69 would
+        keep a stream the ring already stopped looking alive. (The stream
+        holds the link exclusively, so real measurements cannot actually
+        overlap a session; this guards the teardown, where the stop frame's
+        own reply traffic arrives.)
+        """
+
+        def listener(packet: bytearray) -> None:
+            if len(packet) < 2 or packet[1] != motion.REALTIME_STREAM_TYPE:
+                return
             session.conn.touch_motion()
             on_packet(packet)
 

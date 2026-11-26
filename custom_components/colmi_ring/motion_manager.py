@@ -39,6 +39,7 @@ from .colmi_codec.motion import (
     AccelSample,
     parse_accel_packet,
     parse_gesture_packet,
+    parse_realtime_accel_packet,
 )
 from .const import (
     CONF_GESTURE_HOLD_CHOP_S,
@@ -107,8 +108,13 @@ _MAX_UNKNOWN_KINDS = 6
 # second next to the 0xA1/3 sample, always near-identical in content. They are
 # per-tick status echoes, not a codec problem, so they must not be warned about.
 # 0xA1/5 is the R09's extra echo: an R09 field capture streamed four subtypes
-# per tick (1, 2, 3, 5) where the R02 sent three.
-_BENIGN_STREAM_FRAMES = frozenset({(0xA1, 0x01), (0xA1, 0x02), (0xA1, 0x05)})
+# per tick (1, 2, 3, 5) where the R02 sent three. 0x69/6 is our own stop
+# request for the timed stream (see motion.get_realtime_stream_stop_packet);
+# if the ring echoes it while the session is still listening, that is our own
+# frame coming back, not a decoder gap.
+_BENIGN_STREAM_FRAMES = frozenset(
+    {(0xA1, 0x01), (0xA1, 0x02), (0xA1, 0x05), (0x69, 0x06)}
+)
 
 
 class MotionManager:
@@ -553,7 +559,7 @@ class MotionManager:
     # -- session callbacks --------------------------------------------------
 
     def _on_session(self, session: MotionSession) -> None:
-        """A connection is open with RAW on: arm the session."""
+        """A connection is open with the stream on: arm the session."""
         if not self._want_stream:
             # Turned off while we were connecting.
             session.request_stop("user")
@@ -649,7 +655,13 @@ class MotionManager:
             )
             return
 
-        sample = parse_accel_packet(packet)
+        # Either stream shape may be feeding this callback: the timed
+        # stream's packets carry the 0x69 command byte and the RAW ones the
+        # position subtype, so the parsers are mutually exclusive and one
+        # pass over both costs nothing.
+        sample = parse_realtime_accel_packet(packet)
+        if sample is None:
+            sample = parse_accel_packet(packet)
         if sample is None:
             self._log_unknown_packet(packet)
             return

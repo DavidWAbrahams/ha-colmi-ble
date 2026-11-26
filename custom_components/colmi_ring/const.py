@@ -545,6 +545,41 @@ def supports_touch(model_name: object) -> bool:
     return bool(_R08_NAME_RE.search(name))
 
 
+# --- R09+ motion-stream generation gate --------------------------------------
+#
+# One capability divides the Colmi models this integration supports, and it
+# is the motion stream. R09 firmware honours the 0x69 type-13 timed raw
+# stream, including its stop (field-verified 2026-11-11, ring0 protocol
+# notes), while its 0xA1 RAW mode latches on stop until the ring is reset
+# (field log 2026-11-25). Older models (R02/R06/R07) are only measured on
+# the 0xA1 path. The ring answers no capability query for this, so - like
+# touch above - the gate is the advertisement name's model prefix.
+_MODEL_NUMBER_RE = re.compile(r"^R(\d{1,3})", re.IGNORECASE)
+
+# Model number from which the timed raw stream is offered. Verified on an
+# R09; R10/R12 sit in the same firmware family and are presumed to match.
+# If one of them turns out never to stream, the session simply delivers no
+# samples and the stream loop turns the switch off once its retry budget
+# runs out - the same honest failure a broken ring produces today - rather
+# than leaving anything latched.
+_REALTIME_STREAM_MIN_MODEL = 9
+
+
+def supports_realtime_motion_stream(model_name: object) -> bool:
+    """
+    True if this ring should stream motion through 0x69 rather than 0xA1.
+
+    Takes a model name (sourced for an entry by
+    ``ring_identity.ring_model_name``) exactly like :func:`supports_touch`.
+    Anything that does not carry a model-shaped name - ``None``, garbage, a
+    ring that advertises no name at all - gets the old RAW path, the one
+    every model this integration has been measured on.
+    """
+    name = model_name if isinstance(model_name, str) else ""
+    match = _MODEL_NUMBER_RE.match(name)
+    return match is not None and int(match.group(1)) >= _REALTIME_STREAM_MIN_MODEL
+
+
 # Minutes the touch listener holds the ring's link before switching itself off.
 # Same convention as CONF_WAVE_TIMEOUT, and the same cost: the listener does not
 # stream, so it is meant to be left on, but while it is on the ring's single

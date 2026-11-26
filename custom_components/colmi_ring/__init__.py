@@ -33,12 +33,17 @@ from .const import (
     FAMILY_YCBT,
     LOGGER,
     clamp_ycbt_monitor_interval,
+    supports_realtime_motion_stream,
 )
 from .coordinator import ColmiRingDataUpdateCoordinator
 from .data import ColmiRingData
 from .debug_probe import cancel_probe, register_probe_service, remove_probe_service
 from .motion_manager import MotionManager
-from .ring_identity import remember_advertisement_name, ring_has_touch
+from .ring_identity import (
+    remember_advertisement_name,
+    ring_has_touch,
+    ring_model_name,
+)
 from .touch_manager import TouchManager
 from .ycbt_api import YcbtRingApiClient
 
@@ -153,6 +158,14 @@ async def async_setup_entry(
     )
     family = entry.data.get(CONF_DEVICE_FAMILY, FAMILY_COLMI)
     ring_address = entry.data[CONF_ADDRESS]
+    # Model-gated features (the motion-stream generation below, the R08 touch
+    # surface, the R08 hole axis) key off the advertisement name, which the
+    # entry title only holds when discovery named the entry. Stamp the name
+    # into entry data - no UI edits data - while the ring is in range, so no
+    # later rename can take a capability away. Runs before every gate below,
+    # including the client construction, so even the first setup reads the
+    # model name from durable storage.
+    remember_advertisement_name(hass, entry)
     if family == FAMILY_YCBT:
         client = YcbtRingApiClient(
             hass=hass,
@@ -182,6 +195,12 @@ async def async_setup_entry(
             on_battery=coordinator.async_note_battery,
             on_activity=coordinator.async_note_activity,
             on_new_data=coordinator.async_note_new_data,
+            # Which motion-stream generation this ring's model answers: the
+            # timed 0x69 raw stream from R09 up (its stop is honoured), the
+            # 0xA1 RAW mode for every model measured before it.
+            supports_realtime_motion=supports_realtime_motion_stream(
+                ring_model_name(hass, entry)
+            ),
         )
 
     # Passive presence: every raw advertisement the ring emits lands here
@@ -222,13 +241,6 @@ async def async_setup_entry(
             ring_address_key,
         ),
     )
-    # Model-gated features (the R08 touch surface below, the R08 hole axis in
-    # the motion manager) key off the advertisement name, which the entry
-    # title only holds when discovery named the entry. Stamp the name into
-    # entry data - no UI edits data - while the ring is in range, so no later
-    # rename can take a capability away. Runs before the gate below so even
-    # the first setup reads the model name from durable storage.
-    remember_advertisement_name(hass, entry)
     # The motion manager is Colmi-protocol-only (the RAW accelerometer stream
     # is a Colmi command): YCBT rings have no equivalent, so the family gate
     # leaves it None and every "is the stream busy" check no-ops. For Colmi
