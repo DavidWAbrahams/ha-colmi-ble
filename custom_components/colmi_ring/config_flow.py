@@ -35,7 +35,6 @@ from .const import (
     CONF_PROXIMITY_TOP_K,
     CONF_PROXIMITY_VOTE_MARGIN,
     CONF_TOUCH_MULTI_TAP_WINDOW,
-    CONF_TOUCH_SLEEP_MINUTES,
     CONF_TOUCH_TIMEOUT,
     CONF_VERTICAL_FLAT_DEG,
     CONF_VERTICAL_UPRIGHT_DEG,
@@ -52,7 +51,6 @@ from .const import (
     DEFAULT_PROXIMITY_TOP_K,
     DEFAULT_PROXIMITY_VOTE_MARGIN,
     DEFAULT_TOUCH_MULTI_TAP_WINDOW,
-    DEFAULT_TOUCH_SLEEP_MINUTES,
     DEFAULT_TOUCH_TIMEOUT,
     DEFAULT_VERTICAL_FLAT_DEG,
     DEFAULT_VERTICAL_UPRIGHT_DEG,
@@ -64,8 +62,8 @@ from .const import (
     MOTION_HOLE_AXIS_CHOICES,
     MULTI_TAP_WINDOW_MAX,
     MULTI_TAP_WINDOW_MIN,
-    TOUCH_SLEEP_MINUTES_MAX,
-    TOUCH_SLEEP_MINUTES_MIN,
+    TOUCH_TIMEOUT_MAX,
+    TOUCH_TIMEOUT_MIN,
     VERTICAL_FLAT_ANCHOR_MAX_DEG,
     VERTICAL_UPRIGHT_ANCHOR_MIN_DEG,
 )
@@ -125,8 +123,9 @@ class BlueprintFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     # Version 3 added the device family; see async_migrate_entry in
     # __init__.py, which stamps pre-v3 entries as ``colmi``. Version 4 merged
     # the hr/steps backfill options into one flag; version 5 split the gesture
-    # hold option into a per-gesture pair (see async_migrate_entry).
-    VERSION = 5
+    # hold option into a per-gesture pair; version 6 unified the touch timeout
+    # and firmware sleep into one 1-255 option (see async_migrate_entry).
+    VERSION = 6
 
     # Ring we were started from (Bluetooth discovery), if any: used to
     # pre-populate the address field, default the family picker, and name
@@ -525,22 +524,11 @@ class ColmiRingOptionsFlowHandler(config_entries.OptionsFlow):
                 ),
             ): selector.NumberSelector(
                 selector.NumberSelectorConfig(
-                    # 0 means "stay on until switched off".
-                    min=0,
-                    max=1440,
-                    step=15,
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            ),
-            vol.Optional(
-                CONF_TOUCH_SLEEP_MINUTES,
-                default=self.config_entry.options.get(
-                    CONF_TOUCH_SLEEP_MINUTES, DEFAULT_TOUCH_SLEEP_MINUTES
-                ),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=TOUCH_SLEEP_MINUTES_MIN,
-                    max=TOUCH_SLEEP_MINUTES_MAX,
+                    # One value, two matched behaviours: the firmware sleep byte
+                    # and our idle auto-off. The firmware byte has no "never", so
+                    # the range is its own 1-255 with no unlimited option.
+                    min=TOUCH_TIMEOUT_MIN,
+                    max=TOUCH_TIMEOUT_MAX,
                     step=1,
                     mode=selector.NumberSelectorMode.BOX,
                 )

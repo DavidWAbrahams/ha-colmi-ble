@@ -545,23 +545,22 @@ def supports_touch(model_name: object) -> bool:
     return bool(_R08_NAME_RE.search(name))
 
 
-# Minutes the touch listener holds the ring's link before switching itself off.
-# Same convention as CONF_WAVE_TIMEOUT, and the same cost: the listener does not
-# stream, so it is meant to be left on, but while it is on the ring's single
-# link is taken and heart rate, battery and steps stop updating. So it defaults
-# to 0 ("leave it on until I say otherwise").
+# The touch session's lifetime, in minutes - one value, two matched behaviours.
+# It is BOTH the sleep byte written into the touch-config frame (how long the
+# firmware keeps the capacitive surface powered between touches) AND the
+# integration's own auto-off: the touch listener turns itself off this many
+# minutes after the LAST touch, so the integration and the firmware expire on the
+# same idle clock rather than the session counting down from the moment it was
+# armed. The old separate ``touch_sleep_minutes`` option was unified into this
+# one so a user can never ask the firmware and the integration for different
+# lifetimes. The floor/ceiling are the firmware byte's own: it is a single minute
+# count, and 0 has never been observed to mean "never", so there is no unlimited
+# setting - the range is 1-255. 60 is a generous default that still bounds the
+# battery cost of a surface left powered overnight.
 CONF_TOUCH_TIMEOUT = "touch_timeout"
-DEFAULT_TOUCH_TIMEOUT = 0
-
-# Minutes the ring's touch surface stays awake between touches, sent as the
-# sleep byte of the touch config frame. The firmware default is 5 (the OEM app's
-# ``touchMusicKeys`` frame); after that the surface sleeps and the next tap may
-# need a re-arm, which is why it is an option rather than a constant.
-# ``colmi_codec.r08.DEFAULT_TOUCH_SLEEP_MINUTES`` is the wire-side twin.
-CONF_TOUCH_SLEEP_MINUTES = "touch_sleep_minutes"
-DEFAULT_TOUCH_SLEEP_MINUTES = 5
-TOUCH_SLEEP_MINUTES_MIN = 1
-TOUCH_SLEEP_MINUTES_MAX = 255
+DEFAULT_TOUCH_TIMEOUT = 60
+TOUCH_TIMEOUT_MIN = 1
+TOUCH_TIMEOUT_MAX = 255
 
 # Which HID usage profile the firmware lights up. 1 is the documented media-key
 # profile and the only one touch reports have been captured under; 4 is the OEM

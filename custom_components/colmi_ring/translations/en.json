@@ -41,8 +41,7 @@
                     "vertical_flat_deg": "Angle calibration: raw angle that means flat (reported as 0°). Set 0 if a flat hand already reads ~0; raise it (20 max) if it reads high.",
                     "vertical_upright_deg": "Angle calibration: raw angle that means upright (reported as 90°). Set 90 if a fully vertical hand already reads ~90; lower it (70 min) if it reads low.",
                     "motion_log_samples": "Accelerometer debug logging",
-                    "touch_timeout": "Touch control timeout minutes, to save battery (0 = unlimited)",
-                    "touch_sleep_minutes": "How long the ring's touch surface stays awake between touches (minutes)",
+                    "touch_timeout": "Touch control idle timeout (minutes): the surface stays powered, and the listener turns itself off, this long after the last touch (1-255). Sent to the firmware as the sleep byte.",
                     "touch_multi_tap_window": "Multi-tap: seconds between taps that still count as one gesture (the Tap event fires once, with tap_count set); 0 fires every tap immediately as a single tap"
                 }
             }

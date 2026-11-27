@@ -42,19 +42,17 @@ from .colmi_codec import r08
 from .const import (
     CONF_TOUCH_APP_TYPE,
     CONF_TOUCH_MULTI_TAP_WINDOW,
-    CONF_TOUCH_SLEEP_MINUTES,
     CONF_TOUCH_TIMEOUT,
     DEFAULT_TOUCH_APP_TYPE,
     DEFAULT_TOUCH_MULTI_TAP_WINDOW,
-    DEFAULT_TOUCH_SLEEP_MINUTES,
     DEFAULT_TOUCH_TIMEOUT,
     LOGGER,
     MULTI_TAP_WINDOW_MAX,
     MULTI_TAP_WINDOW_MIN,
     STREAM_BUSY_MESSAGE,
     TOUCH_EVENT_TYPE,
-    TOUCH_SLEEP_MINUTES_MAX,
-    TOUCH_SLEEP_MINUTES_MIN,
+    TOUCH_TIMEOUT_MAX,
+    TOUCH_TIMEOUT_MIN,
 )
 
 if TYPE_CHECKING:
@@ -85,9 +83,11 @@ class TouchManager:
 
         # Wire options, read once per manager like the hole axis: changing any
         # option reloads the entry and rebuilds us, so nothing can switch
-        # profile mid-session.
+        # profile mid-session. ``CONF_TOUCH_TIMEOUT`` is now a single value that
+        # is BOTH the firmware sleep byte and our idle auto-off, so there is one
+        # reader (``_timeout_minutes``) rather than a sleep reader and a timeout
+        # reader that could disagree.
         self._app_type = self._read_app_type()
-        self._sleep_minutes = self._read_sleep_minutes()
 
         self._session: TouchSession | None = None
         self._task: asyncio.Task[None] | None = None
@@ -133,31 +133,24 @@ class TouchManager:
         # The byte goes on the wire masked; keep the stored value honest.
         return value & 0xFF
 
-    def _read_sleep_minutes(self) -> int:
+    def _timeout_minutes(self) -> int:
         """
-        How long the surface stays awake between touches, in minutes.
+        The session's lifetime in minutes, on both clocks.
 
-        Clamped to the range the firmware byte is documented to accept: 0 has
-        never been observed to mean "never", so nonsense falls back to the OEM
+        One value drives two matched behaviours: it is the sleep byte written
+        into the touch-config frame (how long the firmware powers the surface
+        between touches) and it is the idle auto-off (we turn the listener off
+        this many minutes after the last touch). The firmware byte is a whole
+        minute count with no "never" encoding, so the range is clamped to its
+        own 1-255 and there is no unlimited option; nonsense falls back to the
         default rather than to a surface that sleeps instantly.
         """
-        raw = self._entry.options.get(
-            CONF_TOUCH_SLEEP_MINUTES, DEFAULT_TOUCH_SLEEP_MINUTES
-        )
+        raw = self._entry.options.get(CONF_TOUCH_TIMEOUT, DEFAULT_TOUCH_TIMEOUT)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            value = int(DEFAULT_TOUCH_SLEEP_MINUTES)
-        return max(TOUCH_SLEEP_MINUTES_MIN, min(TOUCH_SLEEP_MINUTES_MAX, value))
-
-    def _timeout_minutes(self) -> float:
-        """Minutes before touch control turns itself off; 0 means never."""
-        raw = self._entry.options.get(CONF_TOUCH_TIMEOUT, DEFAULT_TOUCH_TIMEOUT)
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            value = float(DEFAULT_TOUCH_TIMEOUT)
-        return value if value > 0 else 0.0
+            value = int(DEFAULT_TOUCH_TIMEOUT)
+        return max(TOUCH_TIMEOUT_MIN, min(TOUCH_TIMEOUT_MAX, value))
 
     def _multi_tap_window(self) -> float:
         """
@@ -240,7 +233,7 @@ class TouchManager:
                 lambda: self._want_touch,
                 self._on_touch_session,
                 app_type=self._app_type,
-                sleep_minutes=self._sleep_minutes,
+                sleep_minutes=self._timeout_minutes(),
             )
         except Exception:  # noqa: BLE001
             # Report a fault on *this* logger. Left alone, the traceback is
@@ -380,6 +373,11 @@ class TouchManager:
         event = r08.parse_touch_report(packet)
         if event is None:
             return
+        # Any real press (not the all-zero release frame) resets the idle clock,
+        # matching the firmware: the surface stays powered for ``_timeout_minutes``
+        # after the last touch, so our auto-off expires on the same idle timer the
+        # firmware's sleep byte drives rather than on a fixed countdown from arming.
+        self._schedule_auto_off()
         if not event.gestures:
             self._log_unnamed_usages(event)
             return
@@ -487,19 +485,16 @@ class TouchManager:
 
     def _schedule_auto_off(self) -> None:
         """
-        Arm the auto-off timer, once, when the session opens.
+        (Re)arm the idle auto-off timer for one more timeout's worth of silence.
 
-        Never rearmed by a touch - the wave listener's deliberate choice, kept
-        here for the same reason in a different currency: a listener restarted by
-        every tap would hold the ring's touch surface powered indefinitely, and
-        unlike the wave case nothing even frees the link in between. The option
-        exists to bound the battery cost, so it should mean "N minutes from now"
-        even for someone who taps every few seconds.
+        Rearmed on every touch as well as when the session opens, so the listener
+        turns itself off a fixed span after the *last* touch - the same idle clock
+        the firmware's sleep byte runs on - rather than a countdown from arming
+        that would cut a session short mid-use. The value is always positive (the
+        firmware byte has no "never"), so there is no "stay on forever" branch.
         """
         self._cancel_auto_off()
         minutes = self._timeout_minutes()
-        if minutes <= 0:
-            return
         self._timer = async_call_later(self._hass, minutes * 60.0, self._auto_off)
 
     @callback

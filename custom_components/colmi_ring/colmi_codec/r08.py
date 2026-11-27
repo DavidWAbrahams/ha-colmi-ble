@@ -70,10 +70,12 @@ TOUCH_APP_TYPE_MEDIA = 1
 # captured here, and not needed: the media profile already emits the reports.
 TOUCH_APP_TYPE_TOUCH_FALLBACK = 4
 
-# The OEM app's default touch sleep, in minutes (its ``touchMusicKeys`` frame
-# sends 0x05). After this long the touch surface sleeps; whether notifications
-# resume on the next tap or need a re-arm is an open question (plan Phase 0.5).
-DEFAULT_TOUCH_SLEEP_MINUTES = 5
+# The fallback touch sleep, in minutes, used only when a caller does not pass a
+# value (the integration's ``CONF_TOUCH_TIMEOUT`` is now the single source that
+# always supplies one). Kept consistent with that option's default of 60 rather
+# than the OEM app's 0x05, so the wire-level fallback and the user-facing default
+# agree. The range floor/ceiling are the firmware byte's own (1-255).
+DEFAULT_TOUCH_SLEEP_MINUTES = 60
 
 # How long a configured ring keeps reporting for, as a floor: the sleep byte is
 # in minutes and 0 has never been observed to mean "never".

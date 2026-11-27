@@ -26,8 +26,10 @@ from .const import (
     CONF_DEVICE_FAMILY,
     CONF_GESTURE_HOLD_FLIP_S,
     CONF_GESTURE_HOLD_STILL_S,
+    CONF_TOUCH_TIMEOUT,
     CONF_WAVE_TIMEOUT,
     CONF_YCBT_MONITOR_INTERVAL,
+    DEFAULT_TOUCH_TIMEOUT,
     DOMAIN,
     FAMILY_COLMI,
     FAMILY_YCBT,
@@ -86,8 +88,16 @@ async def async_migrate_entry(
     (``gesture_hold_still_s`` and ``gesture_hold_flip_s``). An explicit
     legacy value carries over to both so the user's tuning survives; when
     none was stored, the new per-gesture defaults apply instead.
+
+    Version 6 unifies the touch session's auto-off and the firmware sleep byte
+    into one option (``touch_timeout``) whose valid range is 1-255 minutes; the
+    old ``0`` meant "stay on forever", which no longer exists. A stored value
+    below 1 (the old unlimited sentinel) is remapped to the new default rather
+    than silently collapsing to the floor of 1 minute, which would have turned
+    "leave it on" into "time out almost immediately". Any explicit 1-255 setting
+    a user already chose is left untouched.
     """
-    if entry.version > 5:
+    if entry.version > 6:
         # Downgrade or already current: nothing to do.
         return True
 
@@ -121,14 +131,27 @@ async def async_migrate_entry(
             new_options.setdefault(CONF_GESTURE_HOLD_FLIP_S, legacy_hold)
         migrated.append("gesture_hold_s split into per-gesture hold options")
 
+    if entry.version <= 5 and CONF_TOUCH_TIMEOUT in new_options:
+        # The old 0 meant "never time out"; the unified option has no such
+        # sentinel, so remap it to the new default instead of letting the
+        # runtime clamp land it on the 1-minute floor. Valid values are kept.
+        stored = new_options[CONF_TOUCH_TIMEOUT]
+        try:
+            is_invalid = int(stored) < 1
+        except (TypeError, ValueError):
+            is_invalid = True
+        if is_invalid:
+            new_options[CONF_TOUCH_TIMEOUT] = DEFAULT_TOUCH_TIMEOUT
+            migrated.append("touch_timeout 0 remapped to the new default")
+
     hass.config_entries.async_update_entry(
         entry,
         data=new_data,
         options=new_options,
-        version=5,
+        version=6,
     )
     LOGGER.info(
-        "Config entry %s migrated to version 5 (%s)",
+        "Config entry %s migrated to version 6 (%s)",
         entry.entry_id,
         "; ".join(migrated),
     )
