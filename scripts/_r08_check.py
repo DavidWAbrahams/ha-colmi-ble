@@ -355,8 +355,16 @@ def check_notice_parsing() -> None:
     sleep = oem_frame(0x3B, [2, 2, 1, 0])
     wake = oem_frame(0x3B, [2, 2, 1, 1])
     off = oem_frame(0x3B, [2, 1, 0, 0])
-    check("02 02 appType 00 is a sleep", r08.parse_touch_notice(sleep) == r08.TOUCH_NOTICE_SLEEP, hexed(sleep))
-    check("02 02 appType 01 is a wake", r08.parse_touch_notice(wake) == r08.TOUCH_NOTICE_WAKE, hexed(wake))
+    check(
+        "02 02 appType 00 is a sleep",
+        r08.parse_touch_notice(sleep) == r08.TOUCH_NOTICE_SLEEP,
+        hexed(sleep),
+    )
+    check(
+        "02 02 appType 01 is a wake",
+        r08.parse_touch_notice(wake) == r08.TOUCH_NOTICE_WAKE,
+        hexed(wake),
+    )
     check(
         "02 02 appType 02 (unknown state) is no notice",
         r08.parse_touch_notice(oem_frame(0x3B, [2, 2, 1, 2])) is None,
@@ -385,14 +393,25 @@ def check_notice_parsing() -> None:
     wrong_opcode = bytearray(off)
     wrong_opcode[0] = 0x3C
     check("rejects wrong opcode", r08.parse_touch_notice(wrong_opcode) is None)
-    check("rejects a short packet", r08.parse_touch_notice(bytearray([0x3B, 0x02, 0x01])) is None)
+    check(
+        "rejects a short packet",
+        r08.parse_touch_notice(bytearray([0x3B, 0x02, 0x01])) is None,
+    )
 
     # The exact frame from the field log that motivated this parser:
     # 3b 02 01 00 ... 3e, checksummed and all.
     logged = oem_frame(0x3B, [2, 1, 0, 0])
     logged_hex = "3B 02 01 00 00 00 00 00 00 00 00 00 00 00 00 3E"
-    check("the logged field frame is an off notice", r08.parse_touch_notice(logged) == r08.TOUCH_NOTICE_OFF, logged_hex)
-    check("the logged field frame carries a real checksum", logged[15] == 0x3E, f"{logged[15]:#04x}")
+    check(
+        "the logged field frame is an off notice",
+        r08.parse_touch_notice(logged) == r08.TOUCH_NOTICE_OFF,
+        logged_hex,
+    )
+    check(
+        "the logged field frame carries a real checksum",
+        logged[15] == 0x3E,
+        f"{logged[15]:#04x}",
+    )
 
 
 def check_notifications() -> None:
@@ -435,9 +454,15 @@ def check_notifications() -> None:
         0x73,
         [
             0x12,
-            0x10 & 0xFF, (10_000 >> 8) & 0xFF, (10_000 >> 16) & 0xFF,
-            450_000 & 0xFF, (450_000 >> 8) & 0xFF, (450_000 >> 16) & 0xFF,
-            8_123 & 0xFF, (8_123 >> 8) & 0xFF, (8_123 >> 16) & 0xFF,
+            0x10 & 0xFF,
+            (10_000 >> 8) & 0xFF,
+            (10_000 >> 16) & 0xFF,
+            450_000 & 0xFF,
+            (450_000 >> 8) & 0xFF,
+            (450_000 >> 16) & 0xFF,
+            8_123 & 0xFF,
+            (8_123 >> 8) & 0xFF,
+            (8_123 >> 16) & 0xFF,
         ],
     )
     act = notifications.parse_live_activity(activity)
@@ -464,13 +489,22 @@ def check_notifications() -> None:
     )
     check(
         "wrong sub is no live activity",
-        notifications.parse_live_activity(oem_frame(0x73, [0x13, 1, 2, 3, 4, 5, 6, 7, 8, 9])) is None,
+        notifications.parse_live_activity(
+            oem_frame(0x73, [0x13, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        )
+        is None,
     )
     check(
         "wrong opcode is no live activity",
-        notifications.parse_live_activity(oem_frame(0x74, [0x12, 1, 2, 3, 4, 5, 6, 7, 8, 9])) is None,
+        notifications.parse_live_activity(
+            oem_frame(0x74, [0x12, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        )
+        is None,
     )
-    check("all-zero frame is no live activity", notifications.parse_live_activity(bytearray(16)) is None)
+    check(
+        "all-zero frame is no live activity",
+        notifications.parse_live_activity(bytearray(16)) is None,
+    )
 
     # Sub dispatch: every observed kind classifies, foreign opcodes do not.
     check(
@@ -482,11 +516,17 @@ def check_notifications() -> None:
     )
     check(
         "doorbells carry no values anyone could mistake",
-        notifications.notification_sub(oem_frame(0x73, [0x01, 0, 0])) == notifications.SUB_NEW_HR
-        and notifications.notification_sub(oem_frame(0x73, [0x03, 0, 0])) == notifications.SUB_NEW_SPO2
-        and notifications.notification_sub(oem_frame(0x73, [0x04, 0, 0])) == notifications.SUB_NEW_STEPS,
+        notifications.notification_sub(oem_frame(0x73, [0x01, 0, 0]))
+        == notifications.SUB_NEW_HR
+        and notifications.notification_sub(oem_frame(0x73, [0x03, 0, 0]))
+        == notifications.SUB_NEW_SPO2
+        and notifications.notification_sub(oem_frame(0x73, [0x04, 0, 0]))
+        == notifications.SUB_NEW_STEPS,
     )
-    check("foreign opcode is no notification", notifications.notification_sub(bytearray([0x03] + [0] * 15)) is None)
+    check(
+        "foreign opcode is no notification",
+        notifications.notification_sub(bytearray([0x03] + [0] * 15)) is None,
+    )
     check("notification channel constant", notifications.CMD_NOTIFICATION == 0x73)
 
 
