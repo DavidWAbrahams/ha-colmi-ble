@@ -35,11 +35,13 @@
     },
     {
       "connectable": true,
-      "manufacturer_id": 30768
+      "manufacturer_id": 30768,
+      "service_uuid": "0000fee7-0000-1000-8000-00805f9b34fb"
     },
     {
       "connectable": true,
-      "manufacturer_id": 30736
+      "manufacturer_id": 30736,
+      "service_uuid": "0000fee7-0000-1000-8000-00805f9b34fb"
     },
     {
       "connectable": true,

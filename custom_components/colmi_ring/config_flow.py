@@ -90,6 +90,28 @@ _YCBT_MFG_IDS = frozenset({0x7830, 0x7810})
 _COLMI_NAME_RE = re.compile(r"^R\d\d_", re.IGNORECASE)
 
 
+def _ycbt_mfg_data_is_ring(info: BluetoothServiceInfo) -> bool:
+    """
+    True if the adv's Yucheng company IDs carry a genuine ring payload.
+
+    The company IDs 0x7810/0x7830 alone are not a reliable ring signal:
+    unrelated devices can broadcast records keyed by colliding company IDs
+    (observed: a fibre ONT flooding hundreds of such records whose payloads
+    are unrelated telemetry). A real Yucheng ring (R20/R99/R88 family) ends
+    the manufacturer-data payload under those IDs with its own MAC address,
+    so requiring that trailing-MAC signature rejects the impostors while
+    matching every genuine ring.
+    """
+    try:
+        mac = bytes.fromhex(info.address.replace(":", ""))
+    except ValueError:
+        return False
+    for mfg_id, data in (info.manufacturer_data or {}).items():
+        if mfg_id in _YCBT_MFG_IDS and len(data) >= 6 and data[-6:] == mac:
+            return True
+    return False
+
+
 def _family_hint_from_discovery(info: BluetoothServiceInfo) -> str:
     """
     Best guess at the ring's protocol family from its advertisement.
@@ -101,12 +123,14 @@ def _family_hint_from_discovery(info: BluetoothServiceInfo) -> str:
     if _COLMI_SERVICE in services:
         return FAMILY_COLMI
     # A bare "Rnn" name is ambiguous (Colmi R02s advertise that too), so the
-    # name alone never hints YCBT; a Yucheng service or manufacturer ID does.
-    yucheng_mfg = bool(_YCBT_MFG_IDS & set(info.manufacturer_data or {}))
+    # name alone never hints YCBT. A Yucheng service UUID does, and so does
+    # manufacturer data under the company IDs carrying the ring's trailing-MAC
+    # signature (a bare company-ID key is not enough: unrelated devices such as
+    # fibre ONTs broadcast colliding company-ID records, see _ycbt_mfg_data_is_ring).
     if (
         _YCBT_SERVICE in services
         or {_YCBT_HRS_SERVICE, _YCBT_FEE7_SERVICE} <= services
-        or yucheng_mfg
+        or _ycbt_mfg_data_is_ring(info)
     ):
         return FAMILY_YCBT
     # An "Rnn_" name (R02_3090, R06_3090) is the Colmi shape: Yucheng rings
